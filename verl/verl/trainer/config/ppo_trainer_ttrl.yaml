@@ -30,6 +30,9 @@ ttrl:
   #         normal 0/1 self-consistency reward against that pseudo label.
   #   "answer_weighted_gate": start from majority vote and only let SPS override
   #         when SPS confidence is high and majority confidence is low.
+  #   "answer_conf_filter": keep the majority-vote pseudo label, but zero out
+  #         rewards for prompts where neither majority confidence nor SPS
+  #         agreement confidence is high.
   sps_enable: false
 
   # Low-temperature proposal temperature used both for sampling the K rollouts
@@ -53,3 +56,7 @@ ttrl:
   # Gate thresholds for answer_weighted_gate.
   sps_gate_confidence_threshold: 0.8
   sps_gate_majority_ratio_threshold: 0.75
+
+  # Filter thresholds for answer_conf_filter.
+  sps_filter_confidence_threshold: 0.8
+  sps_filter_majority_ratio_threshold: 0.75

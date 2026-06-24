@@ -510,3 +510,79 @@ step 1：
 1. 保留 50-step final-only 约束，改短跑学习率策略为 constant 或等效的较长 horizon cosine，避免 final 前学习率过早衰减。
 2. 保留 majority pseudo-label 主干，把 SPS 作为 prompt/rollout 的内部置信权重或过滤信号，而不是只做伪标签 override；目标是减少低共识、高截断批次的负更新，同时不破坏 MajVote 的高效学习动态。
 3. 现在 GPU 0-7 均已空闲，下一轮可用 8 卡跑 50-step final-only 实验。
+
+### 9.6 实验 v3：SPS confidence-filtered majority，8 卡，constant LR
+
+启动前设计：
+- 主干仍使用 majority vote pseudo-label，避免 v1/v2 里 SPS pseudo-label 覆盖带来的不稳定。
+- SPS 不再负责替换标签，而是作为内部置信过滤信号：
+  - 若 `majority_ratio >= sps_filter_majority_ratio_threshold`，训练该 prompt。
+  - 或者 SPS answer label 与 majority label 一致，且 `weighted_label_confidence >= sps_filter_confidence_threshold`，训练该 prompt。
+  - 否则把该 prompt 的 reward 置零，避免低共识/高截断批次产生负更新。
+- 训练反馈仍是无监督内部信号：pseudo-label、SPS confidence、majority ratio 都来自模型 rollouts 和 base/proposal logprob；真实 Math500 answer 只用于日志诊断和最终 validation。
+- 修正短跑 LR：actor `warmup_style=constant`、`lr_warmup_steps_ratio=0.0`，避免 50 step 内 cosine 衰减到 0。
+- 使用 GPU 0-7，因为 2026-06-25 03:52 CST 检查 GPU 0-7 均已空闲。
+
+代码改动：
+- `verl/trainer/ppo/ttrl_utils.py`
+  - `apply_sps_weighted_ttrl_gt(...)` 新增 confidence filter 参数：
+    - `confidence_filter`
+    - `filter_confidence_threshold`
+    - `filter_majority_ratio_threshold`
+  - 新增 `sps_train_weight_list`，按 prompt 记录是否参与训练。
+- `verl/trainer/ppo/ray_trainer.py`
+  - 新增 `ttrl.sps_reward_mode=answer_conf_filter`。
+  - 对该模式，仍走 64 vote 生成和 majority pseudo-label；在 reward 后按 `sps_train_weight_list` 把低置信 prompt reward 置零。
+  - 新增日志 `train/sps/train_weight`。
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增模式说明和 filter 阈值。
+- `examples/ttrl/run_sps_conf_filter_math_qwen3_4b_50step_8gpu.sh`
+  - 新 8 卡 v3 脚本。
+  - `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
+  - `RAY_TMPDIR=/tmp/ray_sps_conf_filter8`
+  - `trainer.val_before_train=False`
+  - `trainer.test_freq=50`
+  - `trainer.total_training_steps=50`
+  - `trainer.n_gpus_per_node=8`
+
+启动与验证：
+- 2026-06-25 03:58 CST 启动，日志：
+  `/opt/tiger/TTRL/verl/sps_conf_filter8_50step.log`
+- Ray session：
+  `/tmp/ray_sps_conf_filter8/ray/session_latest`
+- 启动前静态检查：
+  - `py_compile` 通过：
+    `python -m py_compile verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py`
+  - `bash -n examples/ttrl/run_sps_conf_filter_math_qwen3_4b_50step_8gpu.sh` 通过。
+  - Hydra 展开确认 `sps_reward_mode=answer_conf_filter`，`total_training_steps=50`，
+    `val_before_train=False`，`test_freq=50`，`warmup_style=constant`，
+    `trainer.n_gpus_per_node=8`。
+
+2026-06-25 04:45 CST final：v3 完整结束，最终验证只在 step 50 触发。
+- 训练诊断：
+  - `train/sps/reward_mode=4.000`
+  - `train/sps/effective_K` 全程基本维持在 `63.8-64.0`，确认 64-vote 路径生效。
+  - early steps 的 `train_weight` 有低谷，例如 step 4 为 `0.375`，符合 confidence filter 预期。
+  - 后半段多数 batch `train_weight=0.875-1.000`，step 50 为 `0.875`。
+  - step 50：`weighted_label_confidence=0.936`，`agreement_rate=1.000`，
+    `label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.863`，
+    `response_length/clip_ratio=0.203`。
+- Final Math500 validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.81841046277666`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8619939637826962`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.8218933601609658`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.7694144869215291`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.8340040241448692`
+- 对比：
+  - 高于 v2b `mean@4=0.7489939637826962`，绝对提升约 `+6.94pp`，满足“有提升的改动要本地 commit 记录”。
+  - 也高于同机 MajVote 长任务的 step50 `mean@4=0.813`，说明 confidence filter + constant LR 对 50-step 短跑有效。
+  - 仍低于目标 `mean@4>=0.85`，goal 不能完成。
+- 诊断：
+  - `best@4=0.86199` 已超过 0.85，说明候选答案容量已经够；当前差距主要在 aggregation/训练后采样分布上，`mean@4=0.8184` 和 `maj@4=0.8219` 仍低于目标。
+  - v3 的主要有效增益来自 constant LR 与低置信 prompt 过滤；SPS answer override 仍没有提供纠偏，因为该版本只把 SPS 用作过滤信号。
+  - 下一轮应保留 constant LR 与 8 卡配置，优先尝试提高训练信号覆盖和输出分布集中度，而不是只提高候选多样性。
+
+下一步候选：
+1. 在 v3 基础上降低过滤阈值或改成连续样本权重，让 `weighted_label_confidence` 以软权重进入 reward，避免 hard filter 丢掉中置信但正确的样本。
+2. 加入内部长度/截断惩罚，只依赖 rollout 长度与格式信号，抑制 clip-heavy 更新；v3 final 的 `format_score/mean@4=0.834` 高于 acc，但仍有截断波动。
+3. 参考 `best@4` 已达标的事实，尝试 answer-level rank/self-consistency 蒸馏，让训练奖励更偏向多数票中的高置信短答案，提高 `mean@4` 而不是只提高 `best@4`。

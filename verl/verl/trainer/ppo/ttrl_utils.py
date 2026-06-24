@@ -97,6 +97,9 @@ def apply_sps_weighted_ttrl_gt(
     use_majority_fallback=False,
     gate_confidence_threshold=0.8,
     gate_majority_ratio_threshold=0.75,
+    confidence_filter=False,
+    filter_confidence_threshold=0.8,
+    filter_majority_ratio_threshold=0.75,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -130,6 +133,7 @@ def apply_sps_weighted_ttrl_gt(
     unique_answer_count_list = []
     sps_override_list = []
     sps_agreement_list = []
+    sps_train_weight_list = []
 
     temp = max(float(weight_temperature), 1e-6)
     for i in range(num_prompts):
@@ -160,6 +164,7 @@ def apply_sps_weighted_ttrl_gt(
             unique_answer_count_list.append(0)
             sps_override_list.append(0.0)
             sps_agreement_list.append(0.0)
+            sps_train_weight_list.append(0.0)
             continue
 
         answer_scores = {
@@ -192,6 +197,14 @@ def apply_sps_weighted_ttrl_gt(
         unique_answer_count_list.append(len(answer_to_scores))
         sps_override_list.append(float(weighted_gt != majority_gt and use_sps_label))
         sps_agreement_list.append(float(weighted_gt == majority_gt))
+        if confidence_filter:
+            keep_prompt = (
+                majority_ratio >= filter_majority_ratio_threshold
+                or (weighted_gt == majority_gt and weighted_confidence >= filter_confidence_threshold)
+            )
+            sps_train_weight_list.append(float(keep_prompt))
+        else:
+            sps_train_weight_list.append(1.0)
 
     for i in range(num_prompts):
         data_item = batch[i]
@@ -207,6 +220,7 @@ def apply_sps_weighted_ttrl_gt(
     batch.non_tensor_batch["sps_unique_answer_count_list"] = np.array(unique_answer_count_list, dtype=float)
     batch.non_tensor_batch["sps_override_list"] = np.array(sps_override_list, dtype=float)
     batch.non_tensor_batch["sps_agreement_list"] = np.array(sps_agreement_list, dtype=float)
+    batch.non_tensor_batch["sps_train_weight_list"] = np.array(sps_train_weight_list, dtype=float)
     return batch
 
 
