@@ -1144,7 +1144,13 @@ class RayPPOTrainer:
                             sps_mode = self.config.ttrl.get("sps_reward_mode", "group_norm_base")
                             K = (
                                 self.config.ttrl.n_votes_per_prompt
-                                if sps_mode in ("answer_weighted_vote", "answer_weighted_gate", "answer_conf_filter")
+                                if sps_mode
+                                in (
+                                    "answer_weighted_vote",
+                                    "answer_weighted_gate",
+                                    "answer_conf_filter",
+                                    "answer_conf_weight",
+                                )
                                 else self.config.ttrl.n_samples_per_prompt
                             )
                             sps_temp = self.config.ttrl.sps_proposal_temperature
@@ -1174,7 +1180,12 @@ class RayPPOTrainer:
                                 base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
 
                             response_mask = compute_response_mask(gen_batch_output)
-                            if sps_mode in ("answer_weighted_vote", "answer_weighted_gate", "answer_conf_filter"):
+                            if sps_mode in (
+                                "answer_weighted_vote",
+                                "answer_weighted_gate",
+                                "answer_conf_filter",
+                                "answer_conf_weight",
+                            ):
                                 from verl.trainer.ppo.ttrl_utils import (
                                     apply_sps_weighted_ttrl_gt,
                                     select_top_k_per_prompt,
@@ -1195,8 +1206,11 @@ class RayPPOTrainer:
                                     gate_confidence_threshold=self.config.ttrl.get("sps_gate_confidence_threshold", 0.8),
                                     gate_majority_ratio_threshold=self.config.ttrl.get("sps_gate_majority_ratio_threshold", 0.75),
                                     confidence_filter=sps_mode == "answer_conf_filter",
+                                    confidence_weight=sps_mode == "answer_conf_weight",
                                     filter_confidence_threshold=self.config.ttrl.get("sps_filter_confidence_threshold", 0.8),
                                     filter_majority_ratio_threshold=self.config.ttrl.get("sps_filter_majority_ratio_threshold", 0.75),
+                                    weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
+                                    clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
                                 )
                                 sps_reward_tensor, sps_info = compute_sps_reward(
                                     ref_log_prob=base_lp.batch["ref_log_prob"],
@@ -1212,6 +1226,7 @@ class RayPPOTrainer:
                                     "answer_weighted_vote": 2.0,
                                     "answer_weighted_gate": 3.0,
                                     "answer_conf_filter": 4.0,
+                                    "answer_conf_weight": 5.0,
                                 }[sps_mode]
                                 sps_info["sps/reward_mode"] = mode_id
                                 sps_info["sps/weighted_label_confidence"] = float(
@@ -1396,21 +1411,24 @@ class RayPPOTrainer:
                         if (
                             self.config.get("ttrl", {}).get("enable", False)
                             and self.config.ttrl.get("sps_enable", False)
-                            and self.config.ttrl.get("sps_reward_mode", "group_norm_base") == "answer_conf_filter"
+                            and self.config.ttrl.get("sps_reward_mode", "group_norm_base")
+                            in ("answer_conf_filter", "answer_conf_weight")
                             and "sps_train_weight_list" in batch.non_tensor_batch
                         ):
                             prompt_weight = torch.as_tensor(
                                 batch.non_tensor_batch["sps_train_weight_list"],
-                                device=reward_tensor.device,
-                                dtype=reward_tensor.dtype,
+                                device=batch.batch["token_level_scores"].device,
+                                dtype=batch.batch["token_level_scores"].dtype,
                             )
                             repeat_times = self.config.ttrl.n_samples_per_prompt
-                            if prompt_weight.shape[0] == reward_tensor.shape[0]:
+                            if prompt_weight.shape[0] == batch.batch["token_level_scores"].shape[0]:
                                 sample_weight = prompt_weight
                             else:
                                 sample_weight = prompt_weight.repeat_interleave(repeat_times)
-                            assert sample_weight.shape[0] == reward_tensor.shape[0]
-                            reward_tensor = reward_tensor * sample_weight.unsqueeze(-1)
+                            assert sample_weight.shape[0] == batch.batch["token_level_scores"].shape[0]
+                            batch.batch["token_level_scores"] = (
+                                batch.batch["token_level_scores"] * sample_weight.unsqueeze(-1)
+                            )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

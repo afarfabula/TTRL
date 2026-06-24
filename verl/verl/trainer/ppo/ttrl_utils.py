@@ -98,8 +98,11 @@ def apply_sps_weighted_ttrl_gt(
     gate_confidence_threshold=0.8,
     gate_majority_ratio_threshold=0.75,
     confidence_filter=False,
+    confidence_weight=False,
     filter_confidence_threshold=0.8,
     filter_majority_ratio_threshold=0.75,
+    weight_floor=0.25,
+    clip_penalty=0.0,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -136,6 +139,7 @@ def apply_sps_weighted_ttrl_gt(
     sps_train_weight_list = []
 
     temp = max(float(weight_temperature), 1e-6)
+    max_response_len = response_mask.shape[-1]
     for i in range(num_prompts):
         answer_to_scores = {}
         answers = []
@@ -179,8 +183,12 @@ def apply_sps_weighted_ttrl_gt(
         majority_gt, majority_count = counter.most_common(1)[0]
         majority_ratio = majority_count / n
         weighted_confidence = float(probs.max().item())
+        prompt_lengths = lengths[start : start + n]
+        prompt_clip_ratio = float((prompt_lengths >= max_response_len).to(torch.float32).mean().item())
 
         use_sps_label = True
+        if confidence_filter or confidence_weight:
+            use_sps_label = False
         if use_majority_fallback:
             use_sps_label = (
                 weighted_gt != majority_gt
@@ -197,7 +205,13 @@ def apply_sps_weighted_ttrl_gt(
         unique_answer_count_list.append(len(answer_to_scores))
         sps_override_list.append(float(weighted_gt != majority_gt and use_sps_label))
         sps_agreement_list.append(float(weighted_gt == majority_gt))
-        if confidence_filter:
+        if confidence_weight:
+            agreement_confidence = weighted_confidence if weighted_gt == majority_gt else 0.0
+            prompt_weight = max(float(majority_ratio), float(agreement_confidence))
+            if clip_penalty > 0:
+                prompt_weight *= max(0.0, 1.0 - float(clip_penalty) * prompt_clip_ratio)
+            sps_train_weight_list.append(max(float(weight_floor), min(1.0, prompt_weight)))
+        elif confidence_filter:
             keep_prompt = (
                 majority_ratio >= filter_majority_ratio_threshold
                 or (weighted_gt == majority_gt and weighted_confidence >= filter_confidence_threshold)

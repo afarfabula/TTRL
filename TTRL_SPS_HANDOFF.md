@@ -586,3 +586,88 @@ step 1：
 1. 在 v3 基础上降低过滤阈值或改成连续样本权重，让 `weighted_label_confidence` 以软权重进入 reward，避免 hard filter 丢掉中置信但正确的样本。
 2. 加入内部长度/截断惩罚，只依赖 rollout 长度与格式信号，抑制 clip-heavy 更新；v3 final 的 `format_score/mean@4=0.834` 高于 acc，但仍有截断波动。
 3. 参考 `best@4` 已达标的事实，尝试 answer-level rank/self-consistency 蒸馏，让训练奖励更偏向多数票中的高置信短答案，提高 `mean@4` 而不是只提高 `best@4`。
+
+### 9.7 实验 v4：SPS confidence-weighted majority，8 卡，constant LR
+
+启动前设计：
+- 保留 v3 中有效的 8 卡、50 step、final-only validation、constant LR 和 64-vote majority 主干。
+- 修正一个 v3 后续审查发现的问题：v3 记录了 `sps_train_weight_list`，但 hard filter 乘法落在局部 `reward_tensor` 上；在无 KL 路径下实际训练使用 `batch.batch["token_level_scores"]`，因此 v3 的 hard filter 权重没有真正缩放训练 reward。v4 将 prompt weight 乘到 `batch.batch["token_level_scores"]`，使权重真实生效。
+- 把 hard filter 改为 continuous confidence weight，避免中置信但正确的 prompt 被完全丢掉：
+  - `prompt_weight=max(majority_ratio, weighted_confidence if weighted_gt == majority_gt else 0)`
+  - `prompt_weight *= (1 - sps_clip_penalty * clip_ratio)`，其中 `clip_ratio` 只由 rollout 是否达到最大响应长度计算。
+  - `prompt_weight=max(sps_weight_floor, prompt_weight)`，避免低置信 batch 完全没有训练信号。
+- 训练反馈仍是无监督内部信号：majority ratio、SPS agreement confidence、rollout clip ratio 都来自模型 rollout/logprob/长度；真实 Math500 answer 只用于日志诊断和最终 validation。
+
+代码改动：
+- `verl/trainer/ppo/ttrl_utils.py`
+  - `apply_sps_weighted_ttrl_gt(...)` 新增：
+    - `confidence_weight`
+    - `weight_floor`
+    - `clip_penalty`
+  - `sps_train_weight_list` 在 v4 中记录连续权重，而不是 0/1 hard filter。
+- `verl/trainer/ppo/ray_trainer.py`
+  - 新增 `ttrl.sps_reward_mode=answer_conf_weight`，日志 `train/sps/reward_mode=5`。
+  - `answer_conf_weight` 也使用 `n_votes_per_prompt=64`。
+  - prompt 权重现在乘到 `batch.batch["token_level_scores"]`，确保训练 reward 真实缩放。
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增 `sps_weight_floor` 与 `sps_clip_penalty`。
+- `examples/ttrl/run_sps_conf_weight_math_qwen3_4b_50step_8gpu.sh`
+  - 新 8 卡 v4 脚本。
+  - `SPS_WEIGHT_FLOOR=0.35`
+  - `SPS_CLIP_PENALTY=0.5`
+  - `trainer.val_before_train=False`
+  - `trainer.test_freq=50`
+  - `trainer.total_training_steps=50`
+
+启动前待验证：
+- `py_compile`
+- `bash -n examples/ttrl/run_sps_conf_weight_math_qwen3_4b_50step_8gpu.sh`
+- 确认 GPU 0-7 空闲后启动。
+
+启动与验证：
+- 2026-06-25 04:49 CST 启动，日志：
+  `/opt/tiger/TTRL/verl/sps_conf_weight8_50step.log`
+- Ray session：
+  `/tmp/ray_sps_conf_weight8/ray/session_latest`
+- 启动前静态检查：
+  - `python -m py_compile verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py` 通过。
+  - `bash -n examples/ttrl/run_sps_conf_weight_math_qwen3_4b_50step_8gpu.sh` 通过。
+  - `nvidia-smi --query-compute-apps=...` 启动前无 compute apps。
+- 首步检查：
+  - step 1 `train/sps/reward_mode=5.000`，确认进入 `answer_conf_weight`。
+  - step 1 `effective_K=63.897`，确认 64-vote 路径生效。
+  - step 1 `train_weight=0.569`，确认是 continuous weight，不是 0/1 hard filter。
+
+2026-06-25 05:36 CST final：v4 完整结束，最终验证只在 step 50 触发。
+- 训练诊断：
+  - `train/sps/reward_mode=5.000`
+  - `train/sps/effective_K` 全程基本维持在 `63.8-64.0`。
+  - early bad batch 被降权，例如 step 4：`train_weight=0.324`，`label_accuracy=0.375`，
+    `pass@32=0.375`，`majority_ratio=0.342`，`clip_ratio=0.723`。
+  - high-quality batch 获得较高权重，例如 step 24-26：
+    - step 24 `train_weight=0.904`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.975`，`clip_ratio=0.188`。
+    - step 25 `train_weight=0.926`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.910`，`clip_ratio=0.152`。
+    - step 26 `train_weight=0.910`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.928`，`clip_ratio=0.168`。
+  - step 50：`weighted_label_confidence=0.953`，`agreement_rate=1.000`，
+    `train_weight=0.876`，`label_accuracy=1.000`，`pass@32=1.000`，
+    `majority_ratio=0.867`，`response_length/clip_ratio=0.195`。
+- Final Math500 validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.829476861167002`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8731448692152918`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.8319597585513079`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.7824426559356137`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.8440643863179075`
+- 对比：
+  - 高于 v3 `mean@4=0.81841046277666`，绝对提升约 `+1.11pp`，满足“有提升的改动要本地 commit 记录”。
+  - `best@4` 从 v3 `0.8619939637826962` 提升到 `0.8731448692152918`。
+  - `maj@4` 从 v3 `0.8218933601609658` 提升到 `0.8319597585513079`。
+  - 仍低于目标 `mean@4>=0.85`，goal 不能完成。
+- 诊断：
+  - continuous confidence weight + clip penalty 比 v3 hard-filter 设计更有效，说明真实缩放训练 reward 是有收益的。
+  - 但 `mean@4=0.8295` 与 `maj@4=0.8320` 仍低于目标，核心差距还是采样分布/聚合稳定性，而不是候选上限；`best@4=0.8731` 已明显超过 0.85。
+  - 下一轮应减少 evaluation temperature 下的错误样本概率，或把训练 reward 更直接推向 majority/top-answer 的稳定输出。
+
+下一步候选：
+1. 在 v4 基础上保留 continuous weight，但去掉或降低 clip penalty，避免过度降低长推理正确样本；v4 的 `format_score/mean@4=0.844` 已接近目标。
+2. 降低 rollout/eval sampling entropy 或提高 self-consistency 训练强度，使 `mean@4` 追上 `maj@4/best@4`。
+3. 增加 answer-level majority reward 的权重，让训练 reward 不只依赖 SPS group z-score，而是同时奖励与 majority answer 一致的 rollout。
