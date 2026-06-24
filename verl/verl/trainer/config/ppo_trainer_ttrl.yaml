@@ -28,6 +28,8 @@ ttrl:
   #   "answer_weighted_vote": cluster rollouts by final answer, choose the
   #         pseudo label with answer-level logsumexp SPS weight, then train with
   #         normal 0/1 self-consistency reward against that pseudo label.
+  #   "answer_weighted_gate": start from majority vote and only let SPS override
+  #         when SPS confidence is high and majority confidence is low.
   sps_enable: false
 
   # Low-temperature proposal temperature used both for sampling the K rollouts
@@ -47,3 +49,7 @@ ttrl:
 
   # Temperature of the per-prompt softmax (softmax_weight mode only).
   sps_weight_temperature: 1.0
+
+  # Gate thresholds for answer_weighted_gate.
+  sps_gate_confidence_threshold: 0.8
+  sps_gate_majority_ratio_threshold: 0.75

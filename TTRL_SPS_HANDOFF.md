@@ -331,3 +331,182 @@ nohup bash examples/ttrl/run_sps_weighted_vote_math_qwen3_4b_50step.sh \
 1. **Hybrid pseudo-label fallback**：先做普通 majority vote；仅当 answer-level SPS 与 majority 冲突且 SPS confidence 足够高时替换伪标签。动机：v1 完全用 SPS 选伪标签后 `best@4` 仍偏低，说明 SPS 单独主导会覆盖掉部分稳定多数票。
 2. **Clip-aware rollout**：降低 rollout 温度到 0.8 或把 response 长度/过滤策略调到减少截断，避免高 `clip_ratio` 批次污染伪标签。
 3. **Confidence gate**：当 weighted confidence 低或 unique answer 太少时不训练该 prompt 或回退 majority label，减少 step 11/35 这类难批次的错误强化。
+
+### 9.4 实验 v2：SPS-gated majority fallback
+
+启动前判断：v1 的 `mean@4=0.7384` 虽比旧 SPS 50 step 的 `0.678` 提升，但 `best@4=0.7993` 不够，说明 SPS 全量替换 majority 伪标签仍会降低候选答案质量。v2 改为 majority-first：只有在 majority 不够强且 SPS 答案级置信度足够高时，才允许 SPS 覆盖伪标签。
+
+代码改动：
+- `verl/trainer/ppo/ttrl_utils.py`
+  - `apply_sps_weighted_ttrl_gt(...)` 新增 gate 参数：
+    - `use_majority_fallback`
+    - `gate_confidence_threshold`
+    - `gate_majority_ratio_threshold`
+  - 同时记录 `raw_majority_gt`、`sps_weighted_gt`、`sps_override_list`、`sps_agreement_list`。
+- `verl/trainer/ppo/ray_trainer.py`
+  - 新增 `ttrl.sps_reward_mode=answer_weighted_gate`。
+  - 该模式 `train/sps/reward_mode=3.0`，额外输出：
+    - `train/sps/override_rate`
+    - `train/sps/agreement_rate`
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增 gate 模式说明和阈值：
+    - `ttrl.sps_gate_confidence_threshold=0.8`
+    - `ttrl.sps_gate_majority_ratio_threshold=0.75`
+- `examples/ttrl/run_sps_weighted_gate_math_qwen3_4b_50step.sh`
+  - 新 4 卡 v2 实验脚本。
+  - `CUDA_VISIBLE_DEVICES=0,1,2,3`
+  - `RAY_TMPDIR=/tmp/ray_sps_weighted_gate`
+  - `trainer.val_before_train=False`
+  - `trainer.test_freq=50`
+  - `trainer.total_training_steps=50`
+
+启动前验证：
+- `py_compile` 通过：
+  - `verl/trainer/ppo/ttrl_utils.py`
+  - `verl/trainer/ppo/ray_trainer.py`
+- `bash -n examples/ttrl/run_sps_weighted_gate_math_qwen3_4b_50step.sh` 通过。
+- Hydra 展开确认：
+  - `trainer.total_training_steps=50`
+  - `trainer.val_before_train=false`
+  - `trainer.test_freq=50`
+  - `ttrl.n_votes_per_prompt=64`
+  - `ttrl.n_samples_per_prompt=32`
+  - `ttrl.sps_reward_mode=answer_weighted_gate`
+  - `ttrl.sps_gate_confidence_threshold=0.8`
+  - `ttrl.sps_gate_majority_ratio_threshold=0.75`
+
+计划启动命令：
+```bash
+cd /opt/tiger/TTRL/verl
+PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1 bash examples/ttrl/run_sps_weighted_gate_math_qwen3_4b_50step.sh \
+  > /opt/tiger/TTRL/verl/sps_weighted_gate_50step.log 2>&1 &
+```
+
+启动记录：
+- 2026-06-25 01:58 CST 已改用长会话前台方式启动，日志仍写入：
+  `/opt/tiger/TTRL/verl/sps_weighted_gate_50step.log`
+- Ray session：
+  `/tmp/ray_sps_weighted_gate/ray/session_latest`
+- GPU：0-3。
+- 4-7 上 MajVote 仍在运行，暂未使用。
+
+step 1：
+- `train/sps/reward_mode=3.000`（`answer_weighted_gate` 生效）
+- `train/sps/effective_K=31.949`
+- `train/sps/weighted_label_confidence=0.863`
+- `train/sps/override_rate=0.000`
+- `train/sps/agreement_rate=0.875`
+- `train/label_accuracy=0.875`
+- `train/pass@32=0.875`
+- `train/majority_ratio=0.473`
+- `actor/entropy=0.267`
+- `response_length/clip_ratio=0.609`
+- `timing_s/step=55.960`
+- 观察：首批 SPS 与 majority 多数一致，gate 没有触发覆盖；这符合“majority-first，SPS 只在高置信冲突时纠偏”的设计。`effective_K` 比 v1 的 63.9 低，需继续观察是否持续。
+
+2026-06-25 02:13 CST 进度：v2 已到 `step 13/50`，仍未出现中途 validation。
+- step 2-13 摘要：
+  - step 2：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.605`，`clip_ratio=0.496`。
+  - step 3：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.566`，`clip_ratio=0.582`。
+  - step 4：`override_rate=0.000`，`agreement_rate=0.625`，`weighted_label_confidence=0.625`，`label_accuracy=0.625`，`pass@32=0.625`，`majority_ratio=0.340`，`clip_ratio=0.738`。
+  - step 5：`override_rate=0.000`，`agreement_rate=0.750`，`weighted_label_confidence=0.699`，`label_accuracy=0.625`，`pass@32=0.750`，`majority_ratio=0.305`，`clip_ratio=0.750`。
+  - step 6：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.847`，`label_accuracy=0.500`，`pass@32=0.750`，`majority_ratio=0.520`，`clip_ratio=0.684`。
+  - step 7：`override_rate=0.000`，`agreement_rate=0.750`，`weighted_label_confidence=0.750`，`label_accuracy=0.500`，`pass@32=0.750`，`majority_ratio=0.590`，`clip_ratio=0.578`。
+  - step 8：`override_rate=0.000`，`agreement_rate=0.625`，`weighted_label_confidence=0.625`，`label_accuracy=0.625`，`pass@32=0.625`，`majority_ratio=0.574`，`clip_ratio=0.512`。
+  - step 9：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.684`，`clip_ratio=0.473`。
+  - step 10：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.770`，`clip_ratio=0.547`。
+  - step 11：`override_rate=0.000`，`agreement_rate=0.250`，`weighted_label_confidence=0.250`，`label_accuracy=0.250`，`pass@32=0.250`，`majority_ratio=0.246`，`clip_ratio=0.773`。
+  - step 12：`override_rate=0.000`，`agreement_rate=0.750`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.508`，`clip_ratio=0.504`。
+  - step 13：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.750`，`pass@32=0.875`，`majority_ratio=0.602`，`clip_ratio=0.551`。
+- 中间判断：当前阈值下 SPS 尚未覆盖 majority，v2 实际接近 majority-first 训练；安全性较好，但纠偏力度偏弱。继续跑完 50 step final validation，再决定是否需要更激进的 gate 阈值或 clip-aware 设置。
+
+2026-06-25 02:24 CST 进度：v2 已到 `step 26/50`，仍未出现中途 validation。
+- step 14-26 摘要：
+  - step 14：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=0.990`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.723`，`clip_ratio=0.480`。
+  - step 15：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.754`，`clip_ratio=0.281`。
+  - step 16：`override_rate=0.000`，`agreement_rate=0.625`，`weighted_label_confidence=0.625`，`label_accuracy=0.625`，`pass@32=0.625`，`majority_ratio=0.504`，`clip_ratio=0.500`。
+  - step 17：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.848`，`clip_ratio=0.336`。
+  - step 18：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=0.964`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.789`，`clip_ratio=0.375`。
+  - step 19：`override_rate=0.000`，`agreement_rate=0.750`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.648`，`clip_ratio=0.504`。
+  - step 20：`override_rate=0.000`，`agreement_rate=0.750`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.633`，`clip_ratio=0.477`。
+  - step 21：`override_rate=0.000`，`agreement_rate=0.750`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.508`，`clip_ratio=0.625`。
+  - step 22：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.699`，`clip_ratio=0.383`。
+  - step 23：`override_rate=0.000`，`agreement_rate=0.875`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.441`，`clip_ratio=0.797`。
+  - step 24：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.918`，`clip_ratio=0.324`。
+  - step 25：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.898`，`clip_ratio=0.191`。
+  - step 26：`override_rate=0.000`，`agreement_rate=1.000`，`weighted_label_confidence=1.000`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.863`，`clip_ratio=0.312`。
+- 中间判断：step 24-26 质量较高，但 gate 仍没有任何覆盖；如果 final 不达标，下一轮需要降低阈值或直接设计“低 majority 时启用 SPS top-answer”的更激进版本。
+
+2026-06-25 02:47 CST final：v2 完整结束，GPU 0-3 已释放，最终验证只在 step 50 触发。
+- Final Math500 validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.7278672032193159`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.7892354124748491`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7293762575452716`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.6654929577464789`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.7364185110663984`
+- 结论：
+  - 低于 v1 `mean@4=0.738430583501006`，不满足“有提升则 commit”的条件，暂不提交。
+  - 低于目标 `0.85`，goal 仍未完成。
+  - 诊断发现 v2 实现存在 K 选择问题：`answer_weighted_gate` 没有被纳入 `K=n_votes_per_prompt` 分支，实际只采了 `K=32`，因此 `effective_K≈31.9`，而非 v1 的 `≈63.9`；这也解释了 gate 实验覆盖力度不足。
+
+修复：
+- `verl/trainer/ppo/ray_trainer.py`
+  - 将 `K=n_votes_per_prompt` 条件从只识别 `answer_weighted_vote` 改成识别 `answer_weighted_vote` 和 `answer_weighted_gate`。
+- 验证：
+  - `py_compile` 通过。
+  - `bash -n examples/ttrl/run_sps_weighted_gate_math_qwen3_4b_50step.sh` 通过。
+
+下一步：重跑 v2b（同一 gate 逻辑，但正确使用 `N_VOTES=64`），仍然使用 GPU 0-3，final-only validation。
+
+### 9.5 实验 v2b：修复 K 后重跑 SPS-gated majority fallback
+
+启动记录：
+- 2026-06-25 02:48 CST 启动，日志：
+  `/opt/tiger/TTRL/verl/sps_weighted_gate64_50step.log`
+- Ray session：
+  `/tmp/ray_sps_weighted_gate64/ray/session_latest`
+- GPU：0-3。
+- 仍为 final-only validation：`val_before_train=false`，`test_freq=50`，`total_training_steps=50`。
+
+step 1：
+- `train/sps/reward_mode=3.000`
+- `train/sps/effective_K=63.884`，确认已恢复 64-vote 口径。
+- `train/sps/weighted_label_confidence=0.750`
+- `train/sps/override_rate=0.000`
+- `train/sps/agreement_rate=0.750`
+- `train/label_accuracy=0.750`
+- `train/pass@32=0.750`
+- `train/majority_ratio=0.535`
+- `actor/entropy=0.263`
+- `response_length/clip_ratio=0.605`
+- `timing_s/step=73.083`
+- 观察：K 修复生效；gate 首步没有覆盖，继续观察后续是否出现高置信冲突覆盖。
+
+2026-06-25 03:21 CST 进度：v2b 已到 `step 25/50`，仍未出现中途 validation。
+- step 2-25 摘要：
+  - `effective_K` 持续约 `63.8-63.9`，确认 64-vote 口径稳定。
+  - `override_rate` 截至 step 25 全部为 `0.000`。
+  - 高置信批次通常 `agreement_rate=1.000`，说明 SPS answer label 大多只是在确认 majority，而非提供冲突纠偏。
+  - 低共识/坏批次通常 SPS confidence 也低，例如 step 11：`weighted_label_confidence=0.375`，`label_accuracy=0.250`，`pass@32=0.250`，`clip_ratio=0.762`，gate 正确没有覆盖。
+  - 好批次集中在 step 17/24/25：`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.889/0.945/0.904`。
+- 中间判断：当前 gate 作为安全策略有效，但基本没有引入新训练信号；final 结果若不达标，下一轮应考虑把 SPS 用作 prompt 过滤/样本权重，而不是伪标签覆盖。
+
+2026-06-25 03:51 CST final：v2b 完整结束，GPU 0-3 已释放，最终验证只在 step 50 触发。
+- Final Math500 validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.7489939637826962`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8069496981891349`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7469597585513079`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.6948551307847082`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.7565392354124748`
+- 对比：
+  - 高于 v1 `mean@4=0.738430583501006`，绝对提升约 `+1.06pp`，满足“有提升的改动要本地 commit 记录”。
+  - 仍低于目标 `mean@4>=0.85`，goal 不能完成。
+  - 低于同机 MajVote 长任务的 step50 `mean@4=0.813`；该 MajVote 任务最终 step310 达到 `mean@4=0.8832997987927566`，说明训练链路和模型容量足够，但当前 50-step SPS 方案的信号效率不足。
+- 诊断：
+  - v2b 的 `override_rate` 全程为 0，说明 gate 过于保守，实际退化为 majority fallback；SPS 只提供确认信号，没有产生纠偏。
+  - 50-step SPS 脚本设置 `trainer.total_training_steps=50` 且 actor 使用 `warmup_style=cosine`、`lr_warmup_steps_ratio=0.03`，优化器学习率会在 50 step 内衰减完；而 MajVote 长任务的 step50 是按 310 总步数 cosine schedule 训练，学习率仍较高。这可能解释了 SPS 50-step 方案低于 MajVote step50 的一部分差距。
+
+下一步候选：
+1. 保留 50-step final-only 约束，改短跑学习率策略为 constant 或等效的较长 horizon cosine，避免 final 前学习率过早衰减。
+2. 保留 majority pseudo-label 主干，把 SPS 作为 prompt/rollout 的内部置信权重或过滤信号，而不是只做伪标签 override；目标是减少低共识、高截断批次的负更新，同时不破坏 MajVote 的高效学习动态。
+3. 现在 GPU 0-7 均已空闲，下一轮可用 8 卡跑 50-step final-only 实验。

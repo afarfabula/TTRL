@@ -94,6 +94,9 @@ def apply_sps_weighted_ttrl_gt(
     alpha,
     length_normalize=True,
     weight_temperature=1.0,
+    use_majority_fallback=False,
+    gate_confidence_threshold=0.8,
+    gate_majority_ratio_threshold=0.75,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -119,10 +122,14 @@ def apply_sps_weighted_ttrl_gt(
         scores = scores / lengths
     scores = scores.detach().cpu()
 
+    selected_gt_list = []
     weighted_gt_list = []
+    raw_majority_gt_list = []
     weighted_confidence_list = []
     majority_ratio_list = []
     unique_answer_count_list = []
+    sps_override_list = []
+    sps_agreement_list = []
 
     temp = max(float(weight_temperature), 1e-6)
     for i in range(num_prompts):
@@ -145,10 +152,14 @@ def apply_sps_weighted_ttrl_gt(
             answer_to_scores.setdefault(answer, []).append(scores[start + j] / temp)
 
         if not answer_to_scores:
+            selected_gt_list.append("None")
             weighted_gt_list.append("None")
+            raw_majority_gt_list.append("None")
             weighted_confidence_list.append(0.0)
             majority_ratio_list.append(0.0)
             unique_answer_count_list.append(0)
+            sps_override_list.append(0.0)
+            sps_agreement_list.append(0.0)
             continue
 
         answer_scores = {
@@ -160,24 +171,42 @@ def apply_sps_weighted_ttrl_gt(
         probs = torch.softmax(stacked - stacked.max(), dim=0)
 
         counter = Counter(answers)
-        majority_ratio = counter.most_common(1)[0][1] / n
+        majority_gt, majority_count = counter.most_common(1)[0]
+        majority_ratio = majority_count / n
+        weighted_confidence = float(probs.max().item())
 
+        use_sps_label = True
+        if use_majority_fallback:
+            use_sps_label = (
+                weighted_gt != majority_gt
+                and weighted_confidence >= gate_confidence_threshold
+                and majority_ratio <= gate_majority_ratio_threshold
+            )
+        selected_gt = weighted_gt if use_sps_label else majority_gt
+
+        selected_gt_list.append(selected_gt)
         weighted_gt_list.append(weighted_gt)
-        weighted_confidence_list.append(float(probs.max().item()))
+        raw_majority_gt_list.append(majority_gt)
+        weighted_confidence_list.append(weighted_confidence)
         majority_ratio_list.append(float(majority_ratio))
         unique_answer_count_list.append(len(answer_to_scores))
+        sps_override_list.append(float(weighted_gt != majority_gt and use_sps_label))
+        sps_agreement_list.append(float(weighted_gt == majority_gt))
 
     for i in range(num_prompts):
         data_item = batch[i]
         original_gt = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        data_item.non_tensor_batch["reward_model"]["ground_truth"] = weighted_gt_list[i]
-        data_item.non_tensor_batch["reward_model"]["majority_gt"] = weighted_gt_list[i]
+        data_item.non_tensor_batch["reward_model"]["ground_truth"] = selected_gt_list[i]
+        data_item.non_tensor_batch["reward_model"]["majority_gt"] = selected_gt_list[i]
         data_item.non_tensor_batch["reward_model"]["sps_weighted_gt"] = weighted_gt_list[i]
+        data_item.non_tensor_batch["reward_model"]["raw_majority_gt"] = raw_majority_gt_list[i]
         data_item.non_tensor_batch["reward_model"]["original_gt"] = original_gt
 
     batch.non_tensor_batch["majority_ratio_list"] = np.array(majority_ratio_list, dtype=float)
     batch.non_tensor_batch["sps_weighted_confidence_list"] = np.array(weighted_confidence_list, dtype=float)
     batch.non_tensor_batch["sps_unique_answer_count_list"] = np.array(unique_answer_count_list, dtype=float)
+    batch.non_tensor_batch["sps_override_list"] = np.array(sps_override_list, dtype=float)
+    batch.non_tensor_batch["sps_agreement_list"] = np.array(sps_agreement_list, dtype=float)
     return batch
 
 

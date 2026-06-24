@@ -1144,7 +1144,7 @@ class RayPPOTrainer:
                             sps_mode = self.config.ttrl.get("sps_reward_mode", "group_norm_base")
                             K = (
                                 self.config.ttrl.n_votes_per_prompt
-                                if sps_mode == "answer_weighted_vote"
+                                if sps_mode in ("answer_weighted_vote", "answer_weighted_gate")
                                 else self.config.ttrl.n_samples_per_prompt
                             )
                             sps_temp = self.config.ttrl.sps_proposal_temperature
@@ -1174,7 +1174,7 @@ class RayPPOTrainer:
                                 base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
 
                             response_mask = compute_response_mask(gen_batch_output)
-                            if sps_mode == "answer_weighted_vote":
+                            if sps_mode in ("answer_weighted_vote", "answer_weighted_gate"):
                                 from verl.trainer.ppo.ttrl_utils import (
                                     apply_sps_weighted_ttrl_gt,
                                     select_top_k_per_prompt,
@@ -1191,6 +1191,9 @@ class RayPPOTrainer:
                                     alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
                                     length_normalize=self.config.ttrl.get("sps_length_normalize", True),
                                     weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                    use_majority_fallback=sps_mode == "answer_weighted_gate",
+                                    gate_confidence_threshold=self.config.ttrl.get("sps_gate_confidence_threshold", 0.8),
+                                    gate_majority_ratio_threshold=self.config.ttrl.get("sps_gate_majority_ratio_threshold", 0.75),
                                 )
                                 sps_reward_tensor, sps_info = compute_sps_reward(
                                     ref_log_prob=base_lp.batch["ref_log_prob"],
@@ -1202,12 +1205,18 @@ class RayPPOTrainer:
                                     reward_mode="group_norm_base",
                                     length_normalize=self.config.ttrl.get("sps_length_normalize", True),
                                 )
-                                sps_info["sps/reward_mode"] = 2.0
+                                sps_info["sps/reward_mode"] = 3.0 if sps_mode == "answer_weighted_gate" else 2.0
                                 sps_info["sps/weighted_label_confidence"] = float(
                                     batch.non_tensor_batch["sps_weighted_confidence_list"].mean()
                                 )
                                 sps_info["sps/unique_answer_count"] = float(
                                     batch.non_tensor_batch["sps_unique_answer_count_list"].mean()
+                                )
+                                sps_info["sps/override_rate"] = float(
+                                    batch.non_tensor_batch["sps_override_list"].mean()
+                                )
+                                sps_info["sps/agreement_rate"] = float(
+                                    batch.non_tensor_batch["sps_agreement_list"].mean()
                                 )
                                 gen_batch_output = select_top_k_per_prompt(
                                     gen_batch_output, K, self.config.ttrl.n_samples_per_prompt
