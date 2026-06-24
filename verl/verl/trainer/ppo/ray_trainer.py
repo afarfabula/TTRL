@@ -1134,7 +1134,104 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if self.config.get("ttrl", {}).get("enable", False):
+                        if self.config.get("ttrl", {}).get("enable", False) and self.config.ttrl.get("sps_enable", False):
+                            # === SPS reward variant of TTRL ===
+                            # Low-temperature proposal sampling of K rollouts, scored by the
+                            # base model (temp=1.0) to form an importance weight used as a
+                            # continuous reward. Replaces majority voting.
+                            from verl.trainer.ppo.sps_utils import compute_sps_reward
+
+                            sps_mode = self.config.ttrl.get("sps_reward_mode", "group_norm_base")
+                            K = (
+                                self.config.ttrl.n_votes_per_prompt
+                                if sps_mode == "answer_weighted_vote"
+                                else self.config.ttrl.n_samples_per_prompt
+                            )
+                            sps_temp = self.config.ttrl.sps_proposal_temperature
+                            gen_batch.meta_info["kwargs"] = {"n": K, "temperature": sps_temp}
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            assert len(gen_batch_output) == len(batch) * K
+                            assert "rollout_log_probs" in gen_batch_output.batch, (
+                                "SPS requires actor_rollout_ref.rollout.calculate_log_probs=True"
+                            )
+
+                            # base-model (temp=1.0) sequence logprob over the K rollouts.
+                            # Build a fresh scoring proto so we never mutate the (locked)
+                            # rollout output; also avoids leaking a temp-scaled ref_log_prob
+                            # into the main batch (the real ref step recomputes at train temp).
+                            sps_score_batch = DataProto.from_dict(
+                                tensors={
+                                    "input_ids": gen_batch_output.batch["input_ids"],
+                                    "attention_mask": gen_batch_output.batch["attention_mask"],
+                                    "position_ids": gen_batch_output.batch["position_ids"],
+                                    "responses": gen_batch_output.batch["responses"],
+                                },
+                                meta_info={"ref_temperature_override": 1.0},
+                            )
+                            if not self.ref_in_actor:
+                                base_lp = self.ref_policy_wg.compute_ref_log_prob(sps_score_batch)
+                            else:
+                                base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
+
+                            response_mask = compute_response_mask(gen_batch_output)
+                            if sps_mode == "answer_weighted_vote":
+                                from verl.trainer.ppo.ttrl_utils import (
+                                    apply_sps_weighted_ttrl_gt,
+                                    select_top_k_per_prompt,
+                                )
+
+                                batch = apply_sps_weighted_ttrl_gt(
+                                    batch=batch,
+                                    gen_batch_output=gen_batch_output,
+                                    n=K,
+                                    tokenizer=self.tokenizer,
+                                    ref_log_prob=base_lp.batch["ref_log_prob"],
+                                    rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                    response_mask=response_mask,
+                                    alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                    length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                    weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                )
+                                sps_reward_tensor, sps_info = compute_sps_reward(
+                                    ref_log_prob=base_lp.batch["ref_log_prob"],
+                                    rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                    response_mask=response_mask,
+                                    n=K,
+                                    alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                    weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                    reward_mode="group_norm_base",
+                                    length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                )
+                                sps_info["sps/reward_mode"] = 2.0
+                                sps_info["sps/weighted_label_confidence"] = float(
+                                    batch.non_tensor_batch["sps_weighted_confidence_list"].mean()
+                                )
+                                sps_info["sps/unique_answer_count"] = float(
+                                    batch.non_tensor_batch["sps_unique_answer_count_list"].mean()
+                                )
+                                gen_batch_output = select_top_k_per_prompt(
+                                    gen_batch_output, K, self.config.ttrl.n_samples_per_prompt
+                                )
+                                assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
+                            else:
+                                sps_reward_tensor, sps_info = compute_sps_reward(
+                                    ref_log_prob=base_lp.batch["ref_log_prob"],
+                                    rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                    response_mask=response_mask,
+                                    n=K,
+                                    alpha=1.0 / sps_temp,
+                                    weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                    reward_mode=sps_mode,
+                                    length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                )
+                                # stash SPS reward via union of a fresh proto (locked-safe)
+                                gen_batch_output = gen_batch_output.union(
+                                    DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
+                                )
+                            for _k, _v in sps_info.items():
+                                metrics.update({f"train/{_k}": _v})
+                        elif self.config.get("ttrl", {}).get("enable", False):
+
                             from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt
 
                             gen_batch.meta_info["kwargs"] = {"n": self.config.ttrl.n_votes_per_prompt}
@@ -1263,6 +1360,16 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # SPS-TTRL: replace rule-based reward with the SPS importance weight
+                        if (
+                            self.config.get("ttrl", {}).get("enable", False)
+                            and self.config.ttrl.get("sps_enable", False)
+                            and "sps_reward" in batch.batch
+                        ):
+                            batch.batch["token_level_scores"] = batch.batch["sps_reward"].to(
+                                reward_tensor.dtype
+                            )
+
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
@@ -1308,7 +1415,33 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    if self.config.get("ttrl", {}).get("enable", False):
+                    if (
+                        self.config.get("ttrl", {}).get("enable", False)
+                        and self.config.ttrl.get("sps_enable", False)
+                        and "sps_reward" in batch.batch
+                    ):
+                        # SPS-TTRL monitoring: correlate SPS weight with the *true* GT reward.
+                        # GT was never overwritten in SPS mode, so reward_fn measures correctness.
+                        gt_reward_tensor, _ = compute_reward(batch, self.reward_fn)
+                        with torch.no_grad():
+                            K = self.config.ttrl.n_samples_per_prompt
+                            sps_w = batch.batch["sps_reward"].sum(-1)            # (B,)
+                            gt_r = gt_reward_tensor.sum(-1).to(sps_w.dtype)      # (B,) 0/1
+                            P = sps_w.shape[0] // K
+                            w_g = sps_w.view(P, K)
+                            gt_g = gt_r.view(P, K)
+                            # answer selected by SPS = argmax weight; is it correct?
+                            sel = w_g.argmax(dim=-1)
+                            sps_pick_acc = gt_g.gather(1, sel.unsqueeze(-1)).mean().item()
+                            passk = (gt_g.sum(-1) >= 1).float().mean().item()
+                            # weight mass placed on correct rollouts
+                            correct_mass = (w_g * gt_g).sum(-1).mean().item()
+                        metrics.update({
+                            "train/sps_pick_accuracy": sps_pick_acc,
+                            f"train/pass@{K}": passk,
+                            "train/sps_correct_weight_mass": correct_mass,
+                        })
+                    elif self.config.get("ttrl", {}).get("enable", False):
                         from verl.trainer.ppo.ttrl_utils import apply_original_gt, compute_ttrl_metrics
                         batch = apply_original_gt(batch)
                         reward_tensor_original, reward_extra_infos_dict_original = compute_reward(batch, self.reward_fn)

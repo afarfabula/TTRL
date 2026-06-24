@@ -83,6 +83,104 @@ def apply_ttrl_gt(batch, gen_batch_output, n, tokenizer):
     return batch
 
 
+def apply_sps_weighted_ttrl_gt(
+    batch,
+    gen_batch_output,
+    n,
+    tokenizer,
+    ref_log_prob,
+    rollout_log_probs,
+    response_mask,
+    alpha,
+    length_normalize=True,
+    weight_temperature=1.0,
+):
+    """
+    Apply an SPS-weighted self-consistency pseudo label to the batch.
+
+    For each prompt, rollouts are clustered by extracted final answer. The
+    pseudo label is the answer with the largest logsumexp SPS weight:
+        score_i = alpha * logp_base(y_i|x) - logq(y_i|x)
+        S(answer) = logsumexp(score_i / temperature for i in answer cluster)
+    This stays unsupervised: original ground truth is only saved for diagnostics.
+    """
+    assert len(gen_batch_output) % n == 0, "gen_batch_output length must be divisible by n"
+    num_prompts = len(gen_batch_output) // n
+    assert len(batch) == num_prompts, "batch length must be equal to the number of prompts"
+    assert ref_log_prob.shape == rollout_log_probs.shape == response_mask.shape
+    assert ref_log_prob.shape[0] == len(gen_batch_output)
+
+    mask_f = response_mask.to(torch.float32)
+    base_seq = (ref_log_prob.to(torch.float32) * mask_f).sum(dim=-1)
+    q_seq = (rollout_log_probs.to(torch.float32) * mask_f).sum(dim=-1)
+    lengths = mask_f.sum(dim=-1).clamp(min=1.0)
+    scores = alpha * base_seq - q_seq
+    if length_normalize:
+        scores = scores / lengths
+    scores = scores.detach().cpu()
+
+    weighted_gt_list = []
+    weighted_confidence_list = []
+    majority_ratio_list = []
+    unique_answer_count_list = []
+
+    temp = max(float(weight_temperature), 1e-6)
+    for i in range(num_prompts):
+        answer_to_scores = {}
+        answers = []
+        start = i * n
+        for j in range(n):
+            data_item = gen_batch_output[start + j]
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is None:
+                continue
+            answer = simplify_expression_string(answer)
+            answers.append(answer)
+            answer_to_scores.setdefault(answer, []).append(scores[start + j] / temp)
+
+        if not answer_to_scores:
+            weighted_gt_list.append("None")
+            weighted_confidence_list.append(0.0)
+            majority_ratio_list.append(0.0)
+            unique_answer_count_list.append(0)
+            continue
+
+        answer_scores = {
+            answer: torch.logsumexp(torch.stack(vals), dim=0)
+            for answer, vals in answer_to_scores.items()
+        }
+        weighted_gt = max(answer_scores.items(), key=lambda item: item[1].item())[0]
+        stacked = torch.stack(list(answer_scores.values()))
+        probs = torch.softmax(stacked - stacked.max(), dim=0)
+
+        counter = Counter(answers)
+        majority_ratio = counter.most_common(1)[0][1] / n
+
+        weighted_gt_list.append(weighted_gt)
+        weighted_confidence_list.append(float(probs.max().item()))
+        majority_ratio_list.append(float(majority_ratio))
+        unique_answer_count_list.append(len(answer_to_scores))
+
+    for i in range(num_prompts):
+        data_item = batch[i]
+        original_gt = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+        data_item.non_tensor_batch["reward_model"]["ground_truth"] = weighted_gt_list[i]
+        data_item.non_tensor_batch["reward_model"]["majority_gt"] = weighted_gt_list[i]
+        data_item.non_tensor_batch["reward_model"]["sps_weighted_gt"] = weighted_gt_list[i]
+        data_item.non_tensor_batch["reward_model"]["original_gt"] = original_gt
+
+    batch.non_tensor_batch["majority_ratio_list"] = np.array(majority_ratio_list, dtype=float)
+    batch.non_tensor_batch["sps_weighted_confidence_list"] = np.array(weighted_confidence_list, dtype=float)
+    batch.non_tensor_batch["sps_unique_answer_count_list"] = np.array(unique_answer_count_list, dtype=float)
+    return batch
+
+
 def _batch_majority_vote(model_outputs: List[str], n: int) -> tuple[List[str], List[float]]:
     """
     Used to generate the ground truth for TTRL.

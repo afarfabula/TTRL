@@ -1,0 +1,333 @@
+# TTRL × SPS 实验交接文档
+
+最后更新：2026-06-25
+
+本文档记录在 `/opt/tiger/TTRL`（内嵌 verl 0.4.1 + TTRL 补丁）上，把「SPS（base-model 序列 logprob）reward」接入 TTRL 替代 majority voting 的实现、实验、结论与后续优化方向。
+
+---
+
+## 1. 背景与动机
+
+- TTRL（Test-Time RL，arXiv:2504.16084）= 无标注测试时强化学习。原版用 **majority voting** 产生伪标签：对每个 prompt 采 N 条 rollout，多数投票出的答案当作 ground truth，再用规则判分给每条 rollout 0/1 reward，喂 GRPO。
+- 我们之前在 `reasoning-with-sampling` 里发现 **SPS（K=32 低温采样 + base model 序列 logprob 打分）** 在 Math500 推理选择上很有效。
+- 本次目标：**用 SPS 的 base-logprob 信号替代 majority voting 作为 TTRL 的 reward**，看是否能更好。
+- 模型 Qwen3-4B，数据 MATH-TTT（=Math500，500 题），GRPO，5 epoch。
+
+---
+
+## 2. 代码改动（均在 /opt/tiger/TTRL/verl）
+
+### 2.1 新增：SPS reward 计算
+- `verl/trainer/ppo/sps_utils.py`（新文件）
+  - `compute_sps_reward(ref_log_prob, rollout_log_probs, response_mask, n, alpha, ...)`
+  - 两种 reward 模式：
+    - `group_norm_base`（默认，RL 友好）：`score = (alpha*logp_base - logq)/len`，再在每个 prompt 的 K 条 rollout 内做 **z-score 标准化** → 稠密、零均值，匹配 GRPO 的 group advantage。
+    - `softmax_weight`（消融用）：`softmax_K(logw)`，会塌缩到单条 rollout（effective_K≈1），不适合当 RL reward。
+
+### 2.2 编排：训练主循环
+- `verl/trainer/ppo/ray_trainer.py`
+  - 在 `fit()` 的生成阶段加 SPS 分支（`ttrl.sps_enable=True` 时）：
+    1. 低温采样 K=32 条 rollout（`rollout_log_probs` 即 proposal logq，需开 `calculate_log_probs`）。
+    2. 用 base/ref model 在 **温度=1.0** 下打分得 `logp_base`（通过新增的 `ref_temperature_override`）。
+    3. `compute_sps_reward` 算每条 rollout 的 reward，写入 `token_level_scores`（last valid token）。
+  - reward 覆盖、SPS 监控指标（effective_K / pick_accuracy / pass@K）均加了 `sps_enable` 的分支保护，不影响原 majority-voting 路径。
+  - 关键修复：vLLM 返回的 TensorDict 是 locked 的，不能 `batch["x"]=...`，改用 `DataProto.from_dict + union`。
+
+### 2.3 worker：base 模型温度可覆盖
+- `verl/workers/fsdp_workers.py`：`compute_ref_log_prob` 支持 `meta_info["ref_temperature_override"]`。
+  - 原因：verl 的 logprob 计算会把 logits 除以温度（dp_actor.py:184），默认用 `rollout.temperature`。SPS 需要 base 在 **温度=1.0** 下的真实序列 logprob，故必须可覆盖。
+
+### 2.4 配置与脚本
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`：新增 `ttrl.sps_enable / sps_proposal_temperature / sps_reward_mode / sps_length_normalize / sps_weight_temperature`。
+- `verl/examples/ttrl/run_sps_math_qwen3_4b.sh`：SPS-TTRL 训练脚本（4 卡 0-3，T=0.4，K=32，5 epoch，test_freq=5）。
+- `verl/examples/ttrl/run_majvote_math_qwen3_4b.sh`：majority-voting baseline（4 卡 4-7，同口径对比，仅 `sps_enable=False`、采样 T=1.0）。
+- `verl/probe.sh`：一键探测两条 run 的进度/GPU/val 曲线/健康度/报错。
+  - 注意 majvote 用了 `RAY_TMPDIR=/tmp/ray_majvote`，其 session 真实路径是 `/tmp/ray_majvote/ray/session_latest`（多一层 `ray/`）。
+
+---
+
+## 3. 实验设置（两条对比 run，同 baseline 0.537）
+
+| 维度 | SPS-TTRL | MajVote-TTRL |
+|---|---|---|
+| GPU | 0-3 | 4-7 |
+| reward | SPS group_norm_base | majority voting 0/1 |
+| 采样温度 | **0.4**（低温） | **1.0** |
+| K / n_votes | 32 | 64 投票 → 32 训练 |
+| 其余 | Qwen3-4B / Math500 / GRPO / lr 5e-7 / 5 epoch / test_freq=5 | 同左 |
+
+> 踩坑记录：
+> 1. 初版用 `softmax_weight` reward → effective_K 塌缩到 1，梯度稀疏，val 原地踏步。改 `group_norm_base` 后 effective_K≈32，reward 稠密。
+> 2. 单步耗时一度 285s，定位到 81% 花在「每步都 val」。`test_freq=1→5` 后纯训练步降到 ~53s。
+> 3. val 慢的根因：500题×n4×3072token 长解码长尾。已用 TP=1 + gpu_mem=0.8。
+
+---
+
+## 4. 结果（关键负结果）
+
+Math500 验证集 `acc/mean@4`（主指标）：
+
+| step | SPS mean@4 | SPS best@4 | MajVote mean@4 | MajVote best@4 |
+|---:|---:|---:|---:|---:|
+| 0 (baseline) | 0.537 | 0.622 | 0.537 | 0.622 |
+| 15 | 0.584 | 0.661 | 0.620 | 0.691 |
+| 30 | 0.651 | 0.720 | 0.755 | 0.811 |
+| 50 | 0.678 | 0.738 | 0.813 | 0.862 |
+| 70 | 0.695 | 0.750 | 0.845 | 0.889 |
+| 95 | 0.695 | 0.755 | 0.865 | 0.912 |
+| 120 | 0.719 | 0.769 | 0.870 | 0.913 |
+| 150 | 0.704 | 0.767 | 0.873 | 0.912 |
+| 185 | 0.699 | 0.746 | **0.888** | **0.923** |
+| 250 | 0.698 | 0.758 | （run 仍在进行） | |
+
+**结论：majority voting 大幅胜出。**
+- MajVote：0.537 → **0.888**（+35pp），单调上升、仍在涨，best@4 到 0.923。
+- SPS：step120 触顶 ~0.719 后进入平台并轻微回落，**全程未超过 0.72**（+18pp 后停滞）。
+- **本次实验证伪了「SPS reward 替代 majority voting 会更好」的假设。**
+
+---
+
+## 5. 原因分析（背后的启发）
+
+### 5.1 探索坍缩：低温采样让 SPS 先天近视（核心）
+- policy entropy：SPS step1=0.095（一路降到 step95=0.042）；MajVote step1=0.265。SPS 探索性只有 MajVote 的 ~1/3。
+- 低温 T=0.4 让 32 条 rollout 高度同质化，SPS reward 是在「一堆几乎相同的样本里抠微小差异」，信噪比低、梯度方向缺乏多样性 → 平滑慢爬、早早平台。
+- **启发：TTRL/test-time RL 里 rollout 多样性（探索）比 reward 的精细度更重要。推理时低温为了选最优，训练时低温却扼杀探索——场景错配。**
+
+### 5.2 reward 目标偏了：SPS 优化「base 偏好」而非「正确性」
+- MajVote reward 直接代理正确性（实测 label_accuracy 0.875~1.0，伪标签质量高）。
+- SPS reward = `α·logp_base − logq`，本质是「哪条更像 base model 高概率输出」。但 **base 高概率 ≠ 答案正确**，数学题上流畅常见的路径未必对。SPS 在优化一个与正确性只弱相关的目标。
+- **启发：base-logprob 信号适合「从一批里挑一个」（推理时选择），但作为 RL 奖励，优化目标偏离了正确性。选择任务 ≠ 奖励任务。**
+
+### 5.3 reward 形态过软
+- 组内 z-score 抹掉了「题目难易」的绝对信息，且连续零均值奖励比 0/1 稀疏奖励对 GRPO 的推进更温和 → 又慢一档。
+
+---
+
+## 6. 后续优化方向（按性价比排序）
+
+### 🥇 A. 解耦温度：训练高温探索 + SPS 照常打分
+- rollout 采样温度提到 1.0（保证探索），SPS 打分公式不变（α 仍可用 1/0.25）。
+- 当前代码里采样温度与 SPS α 绑死，需要拆成两个独立参数。
+- 最小改动、最可能立刻见效，用来回答「SPS 是被低温拖累，还是奖励目标本身偏了」。
+
+### 🥈 B. SPS 当「软加权」增强 majority voting，而非替代
+- 主信号仍是正确性（投票 / self-consistency 的 0/1）。
+- 用 **answer-marginalized SPS** 给伪标签纠偏：按 `S(a)=logsumexp({logw_i | answer=a})` 聚合每个答案的证据，选 top 答案当伪标签（= base-logprob 加权的多数票）。
+- 在多数票不确定时（majority_ratio 低，如实测 step5=0.31）能纠偏。这是最有前途的结合点。
+
+### 🥉 C. reward 改成更「硬」的排序奖励
+- SPS top-k rollout 给 +1、其余 0，或 rank-based reward，让信号强度接近 0/1。配合 A 的高温采样。
+
+### 方法论
+- **防熵坍缩**：SPS entropy 已降到 0.04，长跑有崩风险；TTRL 这类自奖励应加 entropy 监控/正则。
+- **看 best@4 不只看 mean@4**：若 best@4（能力上界）不涨，只是 mean@4 靠「变确定」涨，是在压缩分布而非提升能力。
+
+---
+
+## 7. 复现命令
+
+SPS-TTRL：
+```bash
+bash /opt/tiger/TTRL/verl/examples/ttrl/run_sps_math_qwen3_4b.sh
+```
+majority-voting baseline：
+```bash
+bash /opt/tiger/TTRL/verl/examples/ttrl/run_majvote_math_qwen3_4b.sh
+```
+监控两条 run：
+```bash
+bash /opt/tiger/TTRL/verl/probe.sh
+```
+
+## 8. 关联文档
+- SPS 推理实验交接：`/opt/tiger/reasoning-with-sampling/llm_experiments/SPS_EXPERIMENT_HANDOFF.md`
+
+---
+
+## 9. 2026-06-25 新 goal：优化 SPS-TTRL 内部反馈方案
+
+目标：停止 GPU 0-3 上旧 SPS-TTRL run，用 GPU 0-3 先跑一个 **中途不带 validation 的 50 step** 训练实验；等 GPU 4-7 的 MajVote run 结束后，可扩到 8 卡。目标指标：最终 Math500 `acc/mean@4 >= 0.85`。约束：训练反馈必须是无监督的模型内部信号，不使用真实答案作为训练 reward。
+
+### 9.1 已执行的资源操作
+- 旧 SPS-TTRL run：`math-qwen3_4b-sps-5ep`，GPU 0-3，停止前约 `step 259/310`。
+- 已对旧 SPS run 的进程组发送 `TERM` 并确认 GPU 0-3 释放。
+- GPU 4-7 上 MajVote run 继续保留；用户说明约 3 小时后可用 8 卡。
+
+### 9.2 实验 v1：SPS-weighted self-consistency
+
+动机：上一版 SPS 直接 dense reward 失败，主要问题是低温探索坍缩和 reward 目标偏软。新方案不再让 SPS 直接替代训练 reward，而是把 SPS 用在 **答案簇级别的伪标签选择** 上：
+
+1. 高温采样 `N_VOTES=64` 条 rollout，`rollout_temperature=1.0`，恢复探索。
+2. 对每条 rollout 计算 `logw = alpha * logp_base - logq`，其中 base/ref logprob 固定温度 1.0。
+3. 按最终答案聚类，计算答案级分数：
+   `S(answer)=logsumexp(logw_i / weight_temperature | answer_i=answer)`。
+4. 选择 `S(answer)` 最大的答案作为无监督伪标签。
+5. 下采样前 32 条 rollout 训练，reward 使用普通 math reward 对这个伪标签打 `0/1`。
+6. 真实答案只用于已有诊断指标，不参与训练信号。
+
+代码改动：
+- `verl/trainer/ppo/ttrl_utils.py`
+  - 新增 `apply_sps_weighted_ttrl_gt(...)`。
+  - 负责 decode rollout、抽取 boxed answer、答案聚类、答案级 SPS logsumexp 加权、写入伪标签。
+- `verl/trainer/ppo/ray_trainer.py`
+  - `ttrl.sps_reward_mode=answer_weighted_vote` 时：
+    - 生成数量使用 `ttrl.n_votes_per_prompt`。
+    - 调用 `apply_sps_weighted_ttrl_gt` 生成伪标签。
+    - 再 `select_top_k_per_prompt(..., n_samples_per_prompt)` 下采样训练。
+    - 不写入 `sps_reward`，因此不会覆盖普通 0/1 reward。
+  - 旧 `group_norm_base` / `softmax_weight` 路径保持不变。
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增 `answer_weighted_vote` 模式说明。
+  - 新增 `ttrl.sps_weight_temperature_base`，用于把训练采样温度和 SPS alpha 解耦。
+- `examples/ttrl/run_sps_weighted_vote_math_qwen3_4b_50step.sh`
+  - 新 4 卡实验脚本。
+  - `CUDA_VISIBLE_DEVICES=0,1,2,3`
+  - `RAY_TMPDIR=/tmp/ray_sps_weighted_vote`
+  - `trainer.val_before_train=False`
+  - `trainer.test_freq=50`
+  - `trainer.total_training_steps=50`
+  - 设计意图：无启动 validation、无中途 validation，只在最后 step 触发一次 validation。
+
+启动命令：
+```bash
+cd /opt/tiger/TTRL/verl
+nohup bash examples/ttrl/run_sps_weighted_vote_math_qwen3_4b_50step.sh \
+  > /opt/tiger/TTRL/verl/sps_weighted_vote_50step.log 2>&1 &
+```
+
+结果记录：
+- 已启动，Ray session：
+  `/tmp/ray_sps_weighted_vote/ray/session_2026-06-25_00-49-04_007116_371528`
+- step 1 已完成，新分支跑通到 actor update：
+  - `train/sps/reward_mode=2.0`（`answer_weighted_vote`）
+  - `train/sps/effective_K=63.884`，高温探索没有 softmax 塌缩。
+  - `train/sps/weighted_label_confidence=0.750`
+  - `train/sps/unique_answer_count=0.750`
+  - `train/label_accuracy=0.750`（只用于诊断，不参与训练）
+  - `train/reward_accuracy=1.000`
+  - `train/majority_ratio=0.535`
+  - `actor/entropy=0.263`
+  - `response_length/mean=2480.480`，`clip_ratio=0.605`
+  - `timing_s/step=73.180`
+  - 未触发 step 0 / 中途 validation，符合 `val_before_train=False` 和 `test_freq=50` 设计。
+- step 2 已完成，趋势良好：
+  - `train/sps/effective_K=63.875`
+  - `train/sps/weighted_label_confidence=0.868`
+  - `train/sps/unique_answer_count=1.000`
+  - `train/label_accuracy=0.875`
+  - `train/pass@32=0.875`
+  - `train/majority_ratio=0.631`
+  - `actor/entropy=0.275`
+  - `response_length/clip_ratio=0.512`
+  - `timing_s/step=69.949`
+- 2026-06-25 00:58 CST 进度：run 仍在 GPU 0-3 正常训练，已到 `step 5/50`，未出现中途 validation，符合实验设置。
+- step 3：
+  - `train/sps/effective_K=63.856`
+  - `train/sps/weighted_label_confidence=0.875`
+  - `train/sps/unique_answer_count=0.875`
+  - `train/label_accuracy=0.875`
+  - `train/pass@32=0.875`
+  - `train/majority_ratio=0.621`
+  - `actor/entropy=0.238`
+  - `response_length/clip_ratio=0.535`
+  - `timing_s/step=70.697`
+- step 4：
+  - `train/sps/effective_K=63.877`
+  - `train/sps/weighted_label_confidence=0.372`
+  - `train/sps/unique_answer_count=0.500`
+  - `train/label_accuracy=0.375`
+  - `train/pass@32=0.375`
+  - `train/majority_ratio=0.338`
+  - `actor/entropy=0.282`
+  - `response_length/clip_ratio=0.738`
+  - `timing_s/step=71.791`
+- step 5：
+  - `train/sps/effective_K=63.892`
+  - `train/sps/weighted_label_confidence=0.643`
+  - `train/sps/unique_answer_count=1.125`
+  - `train/label_accuracy=0.750`
+  - `train/pass@32=0.750`
+  - `train/majority_ratio=0.299`
+  - `actor/entropy=0.243`
+  - `response_length/clip_ratio=0.750`
+  - `timing_s/step=69.473`
+- 观察：SPS 加权分布本身没有塌缩（`effective_K` 稳定在 63.8+），但 response clipping 在 step 4-5 明显升高到约 0.74-0.75，可能限制最终 Math500 表现；继续等 50 step 最终验证后再决定是否改 `max_response_length`/rollout 温度/采样过滤。
+- 2026-06-25 01:05 CST 进度：run 仍在 GPU 0-3 正常训练，已到 `step 11/50`，仍未出现中途 validation。
+- step 6-11 摘要：
+  - step 6：`effective_K=63.871`，`weighted_label_confidence=0.826`，`label_accuracy=0.500`，`pass@32=0.750`，`majority_ratio=0.516`，`entropy=0.209`，`clip_ratio=0.699`。
+  - step 7：`effective_K=63.877`，`weighted_label_confidence=0.616`，`label_accuracy=0.375`，`pass@32=0.625`，`majority_ratio=0.570`，`entropy=0.259`，`clip_ratio=0.566`。
+  - step 8：`effective_K=63.891`，`weighted_label_confidence=0.625`，`label_accuracy=0.625`，`pass@32=0.625`，`majority_ratio=0.562`，`entropy=0.268`，`clip_ratio=0.508`。
+  - step 9：`effective_K=63.902`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.750`，`majority_ratio=0.672`，`entropy=0.220`，`clip_ratio=0.477`。
+  - step 10：`effective_K=63.902`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.742`，`entropy=0.238`，`clip_ratio=0.559`。
+  - step 11：`effective_K=63.878`，`weighted_label_confidence=0.375`，`label_accuracy=0.375`，`pass@32=0.375`，`majority_ratio=0.252`，`entropy=0.286`，`clip_ratio=0.766`。
+- 中间判断：`effective_K` 持续接近 64，说明 SPS answer-weighted vote 没有退化成单样本选择；小批次质量波动较大，且难批次通常伴随高 `clip_ratio`。若最终指标不达标，优先尝试降低长输出截断（更短 prompt/限制思考长度/调低 rollout 温度或增大可用 response length），其次再调 SPS 权重温度。
+- 2026-06-25 01:16 CST 进度：run 仍在 GPU 0-3 正常训练，已到 `step 21/50`，仍未出现中途 validation。
+- step 12-21 摘要：
+  - step 12：`effective_K=63.902`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.521`，`entropy=0.256`，`clip_ratio=0.504`。
+  - step 13：`effective_K=63.891`，`weighted_label_confidence=0.875`，`label_accuracy=0.750`，`pass@32=0.875`，`majority_ratio=0.570`，`entropy=0.273`，`clip_ratio=0.512`。
+  - step 14：`effective_K=63.898`，`weighted_label_confidence=1.000`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.740`，`entropy=0.239`，`clip_ratio=0.488`。
+  - step 15：`effective_K=63.925`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.779`，`entropy=0.199`，`clip_ratio=0.281`。
+  - step 16：`effective_K=63.896`，`weighted_label_confidence=0.625`，`label_accuracy=0.625`，`pass@32=0.500`，`majority_ratio=0.500`，`entropy=0.235`，`clip_ratio=0.500`。
+  - step 17：`effective_K=63.932`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.863`，`entropy=0.207`，`clip_ratio=0.316`。
+  - step 18：`effective_K=63.937`，`weighted_label_confidence=0.891`，`label_accuracy=0.750`，`pass@32=0.875`，`majority_ratio=0.785`，`entropy=0.187`，`clip_ratio=0.352`。
+  - step 19：`effective_K=63.904`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.604`，`entropy=0.213`，`clip_ratio=0.520`。
+  - step 20：`effective_K=63.862`，`weighted_label_confidence=0.745`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.594`，`entropy=0.241`，`clip_ratio=0.496`。
+  - step 21：`effective_K=63.909`，`weighted_label_confidence=1.000`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.531`，`entropy=0.210`，`clip_ratio=0.641`。
+- 中间判断：step 12-21 的小批次训练质量大多恢复到 `pass@32=0.75-1.0`，但 `clip_ratio` 仍在 0.28-0.64 波动。当前不提前修改 run，等待 step 50 最终 Math500 `mean@4` 决策。
+- 2026-06-25 01:27 CST 进度：run 仍在 GPU 0-3 正常训练，已到 `step 30/50`，仍未出现中途 validation。
+- step 22-30 摘要：
+  - step 22：`effective_K=63.896`，`weighted_label_confidence=0.875`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.723`，`entropy=0.207`，`clip_ratio=0.402`。
+  - step 23：`effective_K=63.908`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.498`，`entropy=0.195`，`clip_ratio=0.727`。
+  - step 24：`effective_K=63.936`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.928`，`entropy=0.192`，`clip_ratio=0.234`。
+  - step 25：`effective_K=63.912`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.891`，`entropy=0.162`，`clip_ratio=0.188`。
+  - step 26：`effective_K=63.932`，`weighted_label_confidence=0.998`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.873`，`entropy=0.170`，`clip_ratio=0.246`。
+  - step 27：`effective_K=63.919`，`weighted_label_confidence=0.866`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.703`，`entropy=0.217`，`clip_ratio=0.410`。
+  - step 28：`effective_K=63.941`，`weighted_label_confidence=1.000`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.777`，`entropy=0.175`，`clip_ratio=0.410`。
+  - step 29：`effective_K=63.959`，`weighted_label_confidence=0.974`，`label_accuracy=1.000`，`pass@32=0.875`，`majority_ratio=0.863`，`entropy=0.160`，`clip_ratio=0.172`。
+  - step 30：`effective_K=63.921`，`weighted_label_confidence=1.000`，`label_accuracy=1.000`，`pass@32=1.000`，`majority_ratio=0.811`，`entropy=0.184`，`clip_ratio=0.320`。
+- 中间判断：step 24-30 明显优于前段，训练小批次 `majority_ratio` 上升且 `clip_ratio` 多数低于 0.45；继续等待 final-only validation。
+- 2026-06-25 01:38 CST 进度：run 仍在 GPU 0-3 正常训练，已到 `step 40/50`，仍未出现中途 validation。
+- step 31-40 摘要：
+  - step 31：`effective_K=63.904`，`weighted_label_confidence=0.824`，`label_accuracy=0.625`，`pass@32=0.875`，`majority_ratio=0.570`，`entropy=0.199`，`clip_ratio=0.523`。
+  - step 32：`effective_K=63.933`，`weighted_label_confidence=0.748`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.744`，`entropy=0.188`，`clip_ratio=0.262`。
+  - step 33：`effective_K=63.947`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.750`，`entropy=0.159`，`clip_ratio=0.250`。
+  - step 34：`effective_K=63.925`，`weighted_label_confidence=1.000`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.711`，`entropy=0.210`，`clip_ratio=0.449`。
+  - step 35：`effective_K=63.918`，`weighted_label_confidence=0.623`，`label_accuracy=0.625`，`pass@32=0.625`，`majority_ratio=0.506`，`entropy=0.210`，`clip_ratio=0.660`。
+  - step 36：`effective_K=63.647`，`weighted_label_confidence=0.891`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.850`，`entropy=0.193`，`clip_ratio=0.234`。
+  - step 37：`effective_K=63.919`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.734`，`entropy=0.200`，`clip_ratio=0.367`。
+  - step 38：`effective_K=63.925`，`weighted_label_confidence=0.871`，`label_accuracy=0.750`，`pass@32=0.875`，`majority_ratio=0.645`，`entropy=0.195`，`clip_ratio=0.379`。
+  - step 39：`effective_K=63.917`，`weighted_label_confidence=0.941`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.717`，`entropy=0.151`，`clip_ratio=0.398`。
+  - step 40：`effective_K=63.932`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.863`，`entropy=0.219`，`clip_ratio=0.156`。
+- 中间判断：step 31-40 仍有单步难批次（step 35），但最近几步 `clip_ratio` 已明显低于前段，`effective_K` 除 step 36 外都稳定在 63.9 左右。继续等 step 50 final validation。
+- 2026-06-25 01:53 CST final：run 完整结束，GPU 0-3 已释放，最终验证只在 step 50 触发。
+- step 41-50 摘要：
+  - step 41：`effective_K=63.897`，`weighted_label_confidence=0.998`，`label_accuracy=0.750`，`pass@32=1.000`，`majority_ratio=0.896`，`entropy=0.164`，`clip_ratio=0.426`。
+  - step 42：`effective_K=63.928`，`weighted_label_confidence=0.998`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.775`，`entropy=0.184`，`clip_ratio=0.336`。
+  - step 43：`effective_K=63.904`，`weighted_label_confidence=1.000`，`label_accuracy=0.875`，`pass@32=1.000`，`majority_ratio=0.496`，`entropy=0.199`，`clip_ratio=0.676`。
+  - step 44：`effective_K=63.914`，`weighted_label_confidence=0.875`，`label_accuracy=0.750`，`pass@32=0.875`，`majority_ratio=0.590`，`entropy=0.182`，`clip_ratio=0.441`。
+  - step 45：`effective_K=63.942`，`weighted_label_confidence=1.000`，`label_accuracy=0.750`，`pass@32=1.000`，`majority_ratio=0.617`，`entropy=0.178`，`clip_ratio=0.547`。
+  - step 46：`effective_K=63.936`，`weighted_label_confidence=0.869`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.721`，`entropy=0.214`，`clip_ratio=0.383`。
+  - step 47：`effective_K=63.930`，`weighted_label_confidence=0.875`，`label_accuracy=0.750`，`pass@32=0.875`，`majority_ratio=0.768`，`entropy=0.189`，`clip_ratio=0.340`。
+  - step 48：`effective_K=63.933`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.703`，`entropy=0.188`，`clip_ratio=0.418`。
+  - step 49：`effective_K=63.904`，`weighted_label_confidence=0.750`，`label_accuracy=0.750`，`pass@32=0.750`，`majority_ratio=0.723`，`entropy=0.171`，`clip_ratio=0.371`。
+  - step 50：`effective_K=63.943`，`weighted_label_confidence=0.875`，`label_accuracy=0.875`，`pass@32=0.875`，`majority_ratio=0.803`，`entropy=0.164`，`clip_ratio=0.309`。
+- Final Math500 validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.738430583501006`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.7992957746478874`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.741702213279678`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.6725975855130784`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.7484909456740443`
+- 结论：
+  - 相比旧 direct-SPS 50 step `mean@4=0.678`，v1 提升到 `0.7384`，绝对提升约 `+6.04pp`，满足“有提升的改动要本地 commit 记录”。
+  - 未达到 goal 要求的 `mean@4>=0.85`，不能标记 goal complete。
+  - 该方案恢复了高温探索并避免 SPS softmax 坍缩，但最终 `best@4=0.7993`，说明 50 step 后能力上界仍不够；下一轮需要更强的伪标签质量或更贴近 MajVote 的稳定性。
+
+### 9.3 下一轮候选
+
+目标是在保留无监督内部反馈的前提下向 MajVote 50-step/长跑表现靠近，优先使用已释放的 GPU 0-3；GPU 4-7 上 MajVote 仍在跑，暂不可用。
+
+候选 v2：
+1. **Hybrid pseudo-label fallback**：先做普通 majority vote；仅当 answer-level SPS 与 majority 冲突且 SPS confidence 足够高时替换伪标签。动机：v1 完全用 SPS 选伪标签后 `best@4` 仍偏低，说明 SPS 单独主导会覆盖掉部分稳定多数票。
+2. **Clip-aware rollout**：降低 rollout 温度到 0.8 或把 response 长度/过滤策略调到减少截断，避免高 `clip_ratio` 批次污染伪标签。
+3. **Confidence gate**：当 weighted confidence 低或 unique answer 太少时不训练该 prompt 或回退 majority label，减少 step 11/35 这类难批次的错误强化。

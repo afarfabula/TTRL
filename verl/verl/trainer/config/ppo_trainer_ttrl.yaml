@@ -15,3 +15,35 @@ ttrl:
 
   # Number of rollouts per prompt, used for label voting
   n_votes_per_prompt: ${actor_rollout_ref.rollout.n}
+
+  # === SPS reward variant (replaces majority voting) ===
+  # When sps_enable=true, the reward is derived from the base-model sequence
+  # logprob over K low-temperature rollouts.
+  #
+  # Reward modes:
+  #   "group_norm_base"  (default, RL-friendly): per-prompt z-score of
+  #         (alpha * logp_base - logq) / len      -> dense, zero-mean over K
+  #   "softmax_weight"   (selection view, ablation): softmax_K(logw)
+  #         -> tends to collapse to a single rollout, sparse gradients
+  #   "answer_weighted_vote": cluster rollouts by final answer, choose the
+  #         pseudo label with answer-level logsumexp SPS weight, then train with
+  #         normal 0/1 self-consistency reward against that pseudo label.
+  sps_enable: false
+
+  # Low-temperature proposal temperature used both for sampling the K rollouts
+  # and for the alpha = 1/T scaling in the SPS weight (matches the K=32 finding).
+  sps_proposal_temperature: 0.25
+
+  # Temperature used only for alpha=1/T in answer_weighted_vote. This decouples
+  # high-temperature training exploration from the original low-temperature SPS
+  # selection prior.
+  sps_weight_temperature_base: ${ttrl.sps_proposal_temperature}
+
+  # Reward shaping mode.
+  sps_reward_mode: group_norm_base
+
+  # Whether to length-normalize the sequence logweight (recommended).
+  sps_length_normalize: true
+
+  # Temperature of the per-prompt softmax (softmax_weight mode only).
+  sps_weight_temperature: 1.0
