@@ -32,6 +32,49 @@ def select_top_k_per_prompt(data, n_votes_per_prompt, n_samples_per_prompt):
     return data[selected_indices]
 
 
+def select_majority_first_per_prompt(data, n_votes_per_prompt, n_samples_per_prompt, tokenizer, majority_gt_list):
+    """
+    Select rollouts whose extracted answer matches the majority pseudo label first.
+    Fill any remaining slots in original rollout order.
+    """
+    assert len(data) % n_votes_per_prompt == 0, "data length must be divisible by n_votes_per_prompt"
+    num_prompts = len(data) // n_votes_per_prompt
+    assert len(majority_gt_list) == num_prompts, "majority_gt_list length must match prompt count"
+
+    selected_indices = []
+    majority_selected_counts = []
+    for i in range(num_prompts):
+        start = i * n_votes_per_prompt
+        prompt_indices = list(range(start, start + n_votes_per_prompt))
+        majority_gt = majority_gt_list[i]
+        majority_indices = []
+        for idx in prompt_indices:
+            data_item = data[idx]
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is None:
+                continue
+            answer = simplify_expression_string(answer)
+            if answer == majority_gt:
+                majority_indices.append(idx)
+
+        chosen = majority_indices[:n_samples_per_prompt]
+        if len(chosen) < n_samples_per_prompt:
+            chosen_set = set(chosen)
+            chosen.extend(idx for idx in prompt_indices if idx not in chosen_set)
+        chosen = chosen[:n_samples_per_prompt]
+        assert len(chosen) == n_samples_per_prompt
+        selected_indices.extend(chosen)
+        majority_selected_counts.append(min(len(majority_indices), n_samples_per_prompt))
+
+    return data[selected_indices], np.array(majority_selected_counts, dtype=float) / float(n_samples_per_prompt)
+
+
 # === Ground Truth Manipulation ===
 
 
@@ -230,6 +273,8 @@ def apply_sps_weighted_ttrl_gt(
         data_item.non_tensor_batch["reward_model"]["original_gt"] = original_gt
 
     batch.non_tensor_batch["majority_ratio_list"] = np.array(majority_ratio_list, dtype=float)
+    batch.non_tensor_batch["sps_selected_gt_list"] = np.array(selected_gt_list, dtype=object)
+    batch.non_tensor_batch["sps_raw_majority_gt_list"] = np.array(raw_majority_gt_list, dtype=object)
     batch.non_tensor_batch["sps_weighted_confidence_list"] = np.array(weighted_confidence_list, dtype=float)
     batch.non_tensor_batch["sps_unique_answer_count_list"] = np.array(unique_answer_count_list, dtype=float)
     batch.non_tensor_batch["sps_override_list"] = np.array(sps_override_list, dtype=float)
