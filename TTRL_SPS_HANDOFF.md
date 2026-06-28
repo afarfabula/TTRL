@@ -2219,3 +2219,908 @@ Worker 使用规则更新
 - 下一步：
   - 当前瓶颈已从 `mean@4=0.837` 推到 `0.841`，`best@4=0.8829` 仍明显高于目标，`maj@4=0.8428` 更接近但未过 0.85。
   - 更合理的下一轮是保持 v14 的 power=1.5 主干，进一步处理 final 4-sample 聚合质量，例如轻量提高高置信 prompt 的训练强度、或针对 answer-level agreement 做温和 majority calibration；不建议回到 actor-base 或 bf16 路径。
+
+启动尝试 16：v15 计划
+- 目的：沿 v14 已验证有效的非线性容量压缩方向，进一步降低低置信 prompt 的最低更新容量，尝试把 50-step `mean@4` 从 `0.841` 推到 `>=0.85`。
+- 背景：
+  - v11 `floor=0.15,power=1.0` 达到 `mean@4=0.8370221327967807`。
+  - v14 `floor=0.15,power=1.5` 达到 `mean@4=0.8410462776659959`，说明对低置信 prompt 做非线性压缩有效。
+  - v14 step 50 的 `train/ground_truth_reward=0.859`、`clip_ratio=0.188` 健康；`best@4=0.8829` 说明候选容量仍够，主要差距在平均/聚合质量。
+- 设计：
+  - 使用 8 卡、50 step、`val_before_train=False`、`test_freq=50`。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_v15`。
+  - 保持 v14 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.sps_weight_power=1.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_weight_floor=0.10`
+    - 让低 majority ratio / 低 SPS-majority agreement / 高 clip prompt 只保留 10% 最低容量，进一步把训练容量让给高内部一致性 prompt。
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185 step 实验。
+  - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
+  - 若低于 v14，不做 commit。
+
+启动尝试 16：v15 启动修正
+- 2026-06-28 11:20 CST 首次启动 v15 未进入训练，不是算法结果。
+- 失败原因：
+  - Ray 报错 `AF_UNIX path length cannot exceed 107 bytes`。
+  - 原 `RAY_DIR=/tmp/ray_v15_floor010_power15_refbase_localfp32` 与 session/socket 路径拼接后过长。
+- 修正：
+  - 将 v15 runner 的 `RAY_DIR` 改为短路径 `/tmp/r15`。
+  - 同步更新 `tail_v15_brief_worker.sh` 的 `LOG_ROOT=/tmp/r15/ray/session_latest/logs`。
+- 后续：
+  - 保持 v15 算法参数不变，重新在同一健康 worker `974593` 上启动。
+
+后续实验上限与 185-step 决策规则
+- 用户 2026-06-28 明确更新：
+  - 继续做 50-step final-only 实验直到 v20。
+  - 若 v20 之前任一方案 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即用该方案启动 185-step 训练查看最终指标。
+  - 若做到 v20 仍未达到 `0.85`，不再继续 50-step 搜索，直接用当时最佳 50-step 方案启动 185-step 训练。
+  - 必须持续维护本 handoff 文档，确保新会话可以完整、正确、可复现地获取实验上下文。
+  - 有提升的改动继续保存本地 git commit；非提升实验只记录文档，不提交 improvement commit。
+- 截至该规则写入时的最佳已完成方案：
+  - v14：`ttrl.sps_weight_floor=0.15`，`ttrl.sps_weight_power=1.5`，`ttrl.sps_clip_penalty=0.5`，`sps_base_logprob_source=ref`，actor 默认 fp32，本地模型 copy。
+  - final `val-core/MATH-TTT/acc/mean@4=0.8410462776659959`。
+  - local commit：`f02da11 Add SPS power-weight experiment`。
+- 当前运行中：
+  - v15：`ttrl.sps_weight_floor=0.10`，其余沿用 v14。
+  - worker：`974593`，8x B200，健康 `/proc`。
+  - 仍是 50 step、`val_before_train=False`、`test_freq=50`、final-only validation。
+
+启动尝试 16：v15 最终结果
+- 2026-06-28 11:21-12:07 CST，v15 在 worker `974593` 上完成。
+- 首次启动失败记录：
+  - 11:20 CST 第一次 v15 因 Ray socket 路径过长失败，未进入训练，不是算法结果。
+  - 修正 `RAY_DIR=/tmp/r15` 后重新启动并跑完整 50 step。
+- 运行完整性：
+  - 8 卡、50 step。
+  - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+  - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:50.000`。
+  - 没有中途 validation；唯一 validation 在 step 50 触发。
+  - `WORKER_V15_EXIT status=0`。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor010_clip05_power15_refbase_localfp32_8_50step_v15.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor010_clip05_power15_refbase_localfp32_8_v15_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor010_clip05_power15_refbase_localfp32_8_v15_metrics.txt`
+- step 50 训练诊断：
+  - `train/sps/reward_mode=6.000`
+  - `train/sps/effective_K=63.945`
+  - `train/sps/weighted_label_confidence=1.000`
+  - `train/sps/agreement_rate=1.000`
+  - `train/sps/train_weight=0.848`
+  - `train/label_accuracy=1.000`
+  - `train/reward_accuracy=0.621`
+  - `train/majority_voting_reward=0.804`
+  - `train/ground_truth_reward=0.879`
+  - `train/pass@32=1.000`
+  - `train/majority_ratio=0.863`
+  - `response_length/clip_ratio=0.223`
+  - `timing_s/ref=2.863`
+  - `timing_s/testing=168.222`
+  - `timing_s/step=213.832`（含 final validation）
+- final validation 结果：
+  - `val-core/MATH-TTT/acc/mean@4=0.8148893360160966`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8618571428571428`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.81482092555332`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.7670623742454729`
+  - `training/global_step=50.000`
+- 结论：
+  - v15 明显低于 v14 `mean@4=0.8410462776659959`，也低于 v11。
+  - `sps_weight_floor=0.10` 过度压低低置信 prompt 的最低容量，final `best@4` 从 v14 的 `0.8829` 降到 `0.8619`，说明候选上限也被伤到。
+  - v15 不是提升结果，不做 local git commit，不触发 185 step。
+  - 后续不要继续降低 floor；应回到 v14 的 `floor=0.15,power=1.5` 主干，做更温和的聚合/高置信强化。
+- worker 状态：
+  - v15 结束后再次检查 `974593`，发现 `/proc/self` 与 `/proc/meminfo` 缺失，平台提示 `mount -t proc proc /proc`。
+  - 按 worker 使用规则，该 worker 判定不可用，不再继续启动训练。
+  - 2026-06-28 12:08 CST 已执行 `mlx worker kill 974593`，避免同时占用两个 worker。
+  - 后续 v16 需要在 master/非 worker 终端 launch 新 8x B200 worker 后继续。
+
+启动尝试 17：v16 计划
+- 2026-06-28 12:10 CST，新 worker `974689` 可用。
+- worker 健康检查：
+  - `NO_COLOR=1 TERM=dumb mlx worker list` 只显示一个 worker：`974689`，8x NVIDIA-B200。
+  - 使用 `NO_COLOR=1 TERM=dumb mlx worker login 974689` 进入同一 worker。
+  - `hostname=trial-301416869-trialrun-301416869-worker-0`。
+  - `/proc/self` 与 `/proc/meminfo` 均存在，`ls /proc` 非空。
+  - `nvidia-smi --query-gpu` 显示 GPU 0-7 均为 NVIDIA B200，显存占用 0 MiB，利用率 0%。
+- 目的：
+  - v15 证明 `floor=0.10` 过度压低低置信 prompt 容量，会伤害 `best@4` 与 `mean@4`。
+  - v16 回到 v14 主干，沿相反方向温和提高最低容量，测试 `floor=0.20` 是否能在不破坏候选上限的情况下提升平均/聚合质量。
+- 设计：
+  - 使用 8 卡、50 step、`trainer.val_before_train=False`、`trainer.test_freq=50`。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_v16`。
+  - 保持 v14 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.sps_weight_power=1.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_weight_floor=0.20`
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor020_clip05_power15_refbase_localfp32_8_50step_v16.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_v16_brief_worker.sh`
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185-step 实验。
+  - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
+  - 若低于 v14，不做 commit。
+
+追加记录：best-v14 185-step rerun 监控
+- 2026-06-28 19:39 CST，fixed best-v14 185-step rerun 仍在 worker `974803` 上健康运行。
+- worker 与运行完整性：
+  - `hostname=trial-301419915-trialrun-301419915-worker-0`。
+  - `/proc/self` 与 `/proc/meminfo` 均存在，worker 可用。
+  - 使用 8x NVIDIA B200，未 launch 第二个 worker。
+  - `trainer.val_before_train=False`，`trainer.test_freq=185`，截至 step 152 未出现中途 validation。
+  - 运行命令已确认包含 `trainer.total_epochs=4`、`trainer.total_training_steps=185`、`trainer.test_freq=185`，修复了 attempt1 因 `total_epochs=1` 在 step 62 退出的问题。
+- 当前运行参数：
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - `ttrl.sps_base_logprob_source=ref`
+  - `actor_rollout_ref.actor.use_kl_loss=True`
+  - 本地模型 copy：`/tmp/qwen3_4b_local_185_v14`
+  - experiment name：`math-qwen3_4b-sps-rule-conf-weight-floor015-clip05-power15-refbase-localfp32-best-v14-185step-8gpu`
+- 已记录的 rerun 进度：
+  - step 1：`train_weight=0.515`，`ground_truth_reward=0.523`，`label_accuracy=0.750`，`timing_s/step=49.675`，`perf/throughput=1658.566`。
+  - step 50：`train_weight=0.835`，`ground_truth_reward=0.863`，`label_accuracy=1.000`，`timing_s/step=45.790`，`perf/throughput=1288.899`；未触发 validation。
+  - step 63：已跨过，确认 `trainer.total_epochs=4` 生效。
+  - step 100：`train_weight=0.911`，`ground_truth_reward=0.965`，`label_accuracy=1.000`，`timing_s/step=44.429`，`perf/throughput=1257.384`；未触发 validation。
+  - step 129：`train_weight=0.911`，`ground_truth_reward=0.848`，`label_accuracy=0.875`，`timing_s/step=48.471`，`perf/throughput=1106.842`。
+  - step 131：`train_weight=0.747`，`ground_truth_reward=0.820`，`label_accuracy=0.875`，`timing_s/step=51.014`，`perf/throughput=1325.045`。
+  - step 133：`train_weight=0.879`，`ground_truth_reward=0.805`，`label_accuracy=0.875`，`timing_s/step=51.110`，`perf/throughput=1126.738`。
+  - step 135：`train_weight=0.819`，`ground_truth_reward=0.758`，`label_accuracy=0.750`，`timing_s/step=53.177`，`perf/throughput=993.610`。
+  - step 142：`train_weight=0.778`，`ground_truth_reward=0.727`，`label_accuracy=0.625`，`timing_s/step=53.560`，`perf/throughput=1244.941`。
+  - step 152：`train_weight=0.789`，`ground_truth_reward=0.832`，`label_accuracy=1.000`，`timing_s/step=52.144`，`perf/throughput=1347.358`；仍未触发 validation。
+- 日志：
+  - master short log：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14.log`
+  - worker Ray logs：`/tmp/r185_v14/ray/session_latest/logs/`
+  - monitor：`bash /opt/tiger/TTRL/verl/examples/ttrl/tail_best185_v14_brief_worker.sh`
+- 下一步：
+  - 继续监控到 step 185 final validation。
+  - 记录 final `val-core/MATH-TTT/acc/mean@4`、`best@4`、`maj@4`。
+  - 若 final 指标超过当前 best 50-step v14 `mean@4=0.8410462776659959`，再按用户要求保存 local git commit；若未提升，只记录文档，不提交负结果脚本。
+- final 结果：
+  - 2026-06-28 20:07 CST，fixed best-v14 185-step rerun 正常结束，日志含 `WORKER_BEST185_V14_EXIT status=0`。
+  - 运行完整性：
+    - 8 卡、185 step。
+    - `trainer.val_before_train=False`，`trainer.test_freq=185`。
+    - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:185.000`。
+    - step 50、100、152、172 均未出现 validation；唯一 validation 在 step 185 触发。
+    - `trainer.total_epochs=4` 修复有效，没有复现 attempt1 的 step 62 正常退出问题。
+  - step 172 训练诊断：
+    - `train/sps/train_weight=0.891`
+    - `train/ground_truth_reward=0.906`
+    - `train/label_accuracy=1.000`
+    - `timing_s/step=44.942`
+    - `perf/throughput=1257.554`
+  - step 185 训练诊断：
+    - `train/sps/effective_K=63.917`
+    - `train/sps/weighted_label_confidence=0.982`
+    - `train/sps/agreement_rate=1.000`
+    - `train/sps/train_weight=0.834`
+    - `train/label_accuracy=1.000`
+    - `train/reward_accuracy=0.836`
+    - `train/majority_voting_reward=0.805`
+    - `train/ground_truth_reward=0.914`
+    - `train/pass@32=1.000`
+    - `train/majority_ratio=0.900`
+    - `response_length/clip_ratio=0.246`
+    - `timing_s/testing=160.909`
+    - `timing_s/step=206.380`（含 final validation）
+    - `perf/throughput=280.838`（含 final validation）
+  - final validation 结果：
+    - `val-core/MATH-TTT/acc/mean@4=0.8983903420523138`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.9266338028169014`
+    - `val-core/MATH-TTT/acc/best@4/std=0.015385567605658186`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.9024346076458752`
+    - `val-core/MATH-TTT/acc/maj@4/std=0.03460663974249451`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.8636177062374245`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.930`
+    - `training/global_step=185.000`
+  - 结论：
+    - 达到并超过目标 `mean@4 >= 0.85`。
+    - 相比 best 50-step v14 `mean@4=0.8410462776659959`，提升 `+0.0573440643863179`。
+    - 当前最佳方案更新为：`floor=0.15, clip=0.5, power=1.5, sps_base_logprob_source=ref, actor fp32, local model copy, 185 steps, final-only validation`。
+    - 训练反馈仍为内部无监督信号；真实答案只用于训练诊断和 final validation。
+  - 新增/保存记录：
+    - runner：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14.sh`
+    - monitor：`/opt/tiger/TTRL/verl/examples/ttrl/tail_best185_v14_brief_worker.sh`
+    - log：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14.log`
+    - metrics snapshot：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_metrics.txt`
+    - Ray task snapshot：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_ray_taskrunner.log`
+  - commit 规则：
+    - 该结果是经验提升，需保存 local git commit。
+    - negative v18-v20 runner/log 不纳入该提升 commit；仅文档记录负结果。
+- 启动状态：
+  - 2026-06-28 14:49 CST，在 worker `974727` 上启动 v19。
+  - 本地模型 copy 从 `/mnt/hdfs/models/qwen3_4b` 到 `/tmp/qwen3_4b_local_v19`，14:49 CST 完成。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r19`，`MASTER_PORT=29589`。
+  - 14:53 CST 已确认 8 张 B200 正在工作，worker `/proc/self` 与 `/proc/meminfo` 仍存在。
+  - 14:53 CST 已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.556`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/step=52.521`
+    - `perf/throughput=1568.697`
+  - 观察：相比 v14/v16 step 1 的 `train_weight=0.515` 和 v18 step 1 的 `0.540`，`clip=0.4` 给早期 batch 略高训练容量；运行速度正常，暂未出现中途 validation。
+  - 15:09 CST 进度到 step 20，仍未出现 validation。
+  - step 2-20 监控摘要：
+    - step 2：`train_weight=0.678`，`ground_truth_reward=0.629`，`label_accuracy=0.875`，`timing_s/step=46.517`，`perf/throughput=1877.789`。
+    - step 3：`train_weight=0.660`，`ground_truth_reward=0.641`，`label_accuracy=0.875`，`timing_s/step=47.857`，`perf/throughput=1835.714`。
+    - step 4：`train_weight=0.377`，`ground_truth_reward=0.332`，`label_accuracy=0.500`，`timing_s/step=49.264`，`perf/throughput=1902.067`。
+    - step 5：`train_weight=0.418`，`ground_truth_reward=0.305`，`label_accuracy=0.750`，`timing_s/step=46.242`，`perf/throughput=1905.370`。
+    - step 6：`train_weight=0.546`，`ground_truth_reward=0.531`，`label_accuracy=0.500`，`timing_s/step=53.928`，`perf/throughput=1701.474`。
+    - step 8：`train_weight=0.551`，`ground_truth_reward=0.559`，`label_accuracy=0.625`，`timing_s/step=53.036`，`perf/throughput=1580.516`。
+    - step 9：`train_weight=0.687`，`ground_truth_reward=0.660`，`label_accuracy=0.875`，`timing_s/step=46.177`，`perf/throughput=1887.373`。
+    - step 10：`train_weight=0.702`，`ground_truth_reward=0.746`，`label_accuracy=1.000`，`timing_s/step=46.923`，`perf/throughput=1888.572`。
+    - step 11：`train_weight=0.298`，`ground_truth_reward=0.254`，`label_accuracy=0.375`，`timing_s/step=54.109`，`perf/throughput=1759.012`。
+    - step 12：`train_weight=0.674`，`ground_truth_reward=0.527`，`label_accuracy=0.875`，`timing_s/step=53.304`，`perf/throughput=1541.588`。
+    - step 14：`train_weight=0.740`，`ground_truth_reward=0.762`，`label_accuracy=0.875`，`timing_s/step=46.305`，`perf/throughput=1761.749`。
+    - step 15：`train_weight=0.790`，`ground_truth_reward=0.766`，`label_accuracy=0.875`，`timing_s/step=46.667`，`perf/throughput=1444.101`。
+    - step 16：`train_weight=0.558`，`ground_truth_reward=0.516`，`label_accuracy=0.625`，`timing_s/step=46.437`，`perf/throughput=1650.561`。
+    - step 18：`train_weight=0.792`，`ground_truth_reward=0.750`，`label_accuracy=0.875`，`timing_s/step=45.882`，`perf/throughput=1688.433`。
+    - step 19：`train_weight=0.615`，`ground_truth_reward=0.648`，`label_accuracy=0.750`，`timing_s/step=46.177`，`perf/throughput=1753.102`。
+    - step 20：`train_weight=0.620`，`ground_truth_reward=0.637`，`label_accuracy=0.750`，`timing_s/step=45.987`，`perf/throughput=1754.357`。
+- v19 最终结果：
+  - 2026-06-28 15:35 CST，v19 在 worker `974727` 上完成。
+  - 运行完整性：
+    - 8 卡、50 step。
+    - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+    - 训练日志推进到 `training/global_step:50.000`。
+    - 未出现中途 validation；唯一 validation 在 step 50 触发。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip04_power15_refbase_localfp32_8_50step_v19.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip04_power15_refbase_localfp32_8_v19_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip04_power15_refbase_localfp32_8_v19_metrics.txt`
+  - step 50 训练诊断：
+    - `train/sps/reward_mode=6.000`
+    - `train/sps/effective_K=63.949`
+    - `train/sps/weighted_label_confidence=0.869`
+    - `train/sps/agreement_rate=0.875`
+    - `train/sps/train_weight=0.826`
+    - `train/label_accuracy=0.875`
+    - `train/reward_accuracy=0.641`
+    - `train/majority_voting_reward=0.814`
+    - `train/ground_truth_reward=0.859`
+    - `train/pass@32=0.875`
+    - `train/majority_ratio=0.855`
+    - `response_length/clip_ratio=0.199`
+    - `timing_s/testing=163.645`
+    - `timing_s/step=209.708`（含 final validation）
+  - final validation 结果：
+    - `val-core/MATH-TTT/acc/mean@4=0.8324949698189135`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8822152917505031`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.8339094567404426`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.780`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.851`
+  - 结论：
+    - v19 低于 v14 `mean@4=0.8410462776659959`，不是提升结果，不做 local git commit，不触发 185 step。
+    - `clip_penalty=0.4` 放松截断惩罚后 `best@4` 接近 v14，但 `mean@4/maj@4` 明显下降；当前证据不支持继续降低 clip penalty。
+    - 当前最佳仍为 v14。
+
+启动尝试 21：v20 计划
+- 目的：
+  - v19 证明放松截断惩罚到 `clip=0.4` 不如 v14。
+  - v20 回到 v14 主干，只把 `clip_penalty` 从 `0.5` 提高到 `0.6`，测试更强截断抑制是否能改善平均/多数聚合质量。
+- worker：
+  - 继续复用健康 worker `974727`；不 launch 第二个 worker。
+- 设计：
+  - 使用 8 卡、50 step、`trainer.val_before_train=False`、`trainer.test_freq=50`。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_v20`。
+  - 保持 v14 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_weight_power=1.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_clip_penalty=0.6`
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip06_power15_refbase_localfp32_8_50step_v20.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_v20_brief_worker.sh`
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185-step 实验。
+  - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
+  - 若低于 v14，不做 commit。
+  - 若 v20 仍未达到 0.85，直接用当前最佳 v14 方案启动 185-step 训练。
+- worker 切换与启动状态：
+  - v19 结束后检查 worker `974727`，`/proc/self` 或 `/proc/meminfo` 不可用，`ps` 报 `Error, do this: mount -t proc proc /proc`，按长期规则判定 worker 不可用。
+  - 2026-06-28 15:38 CST，在 master 终端执行 `NO_COLOR=1 TERM=dumb mlx worker kill 974727`，返回 `killing 1 workers: 974727`。
+  - 再次 `NO_COLOR=1 TERM=dumb mlx worker list` 确认 worker 列表为空后，才 launch 新 worker，避免同时使用两个 worker。
+  - 2026-06-28 15:39-15:40 CST，按标准命令 launch 新 worker `974803`：
+    - `NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`
+    - launch 成功后自动 login 到 `974803`。
+  - 新 worker 健康检查：
+    - `hostname=trial-301419915-trialrun-301419915-worker-0`
+    - `/proc/self` 与 `/proc/meminfo` 均存在，`PROC_OK`。
+    - GPU 0-7 均为 NVIDIA B200，显存占用 0 MiB，利用率 0%。
+  - 2026-06-28 15:41 CST，在 worker `974803` 上启动 v20。
+  - 本地模型 copy 从 `/mnt/hdfs/models/qwen3_4b` 到 `/tmp/qwen3_4b_local_v20`，15:45 CST 完成；这次 HDFS copy 明显慢于 v18/v19，但持续推进，没有卡死。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r20`，`MASTER_PORT=29590`。
+  - 15:50 CST 已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.478`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/step=53.484`
+    - `perf/throughput=1540.451`
+  - 观察：相比 v14/v16 step 1 的 `train_weight=0.515`，`clip=0.6` 更强地降低了早期 batch 训练容量；运行速度正常，暂未出现中途 validation。
+  - 16:05 CST 进度到 step 20，仍未出现 validation。
+  - step 3-20 监控摘要：
+    - step 3：`train_weight=0.557`，`ground_truth_reward=0.645`，`label_accuracy=0.875`，`timing_s/step=47.847`，`perf/throughput=1850.926`。
+    - step 4：`train_weight=0.313`，`ground_truth_reward=0.363`，`label_accuracy=0.500`，`timing_s/step=46.904`，`perf/throughput=1998.949`。
+    - step 5：`train_weight=0.364`，`ground_truth_reward=0.301`，`label_accuracy=0.750`，`timing_s/step=45.994`，`perf/throughput=1925.006`。
+    - step 6：`train_weight=0.433`，`ground_truth_reward=0.523`，`label_accuracy=0.500`，`timing_s/step=53.534`，`perf/throughput=1715.319`。
+    - step 7：`train_weight=0.459`，`ground_truth_reward=0.578`，`label_accuracy=0.375`，`timing_s/step=47.573`，`perf/throughput=1893.674`。
+    - step 9：`train_weight=0.614`，`ground_truth_reward=0.688`，`label_accuracy=0.875`，`timing_s/step=45.740`，`perf/throughput=1873.218`。
+    - step 10：`train_weight=0.589`，`ground_truth_reward=0.754`，`label_accuracy=1.000`，`timing_s/step=47.065`，`perf/throughput=1882.031`。
+    - step 11：`train_weight=0.305`，`ground_truth_reward=0.254`，`label_accuracy=0.375`，`timing_s/step=55.993`，`perf/throughput=1686.543`。
+    - step 12：`train_weight=0.563`，`ground_truth_reward=0.523`，`label_accuracy=0.750`，`timing_s/step=52.724`，`perf/throughput=1558.860`。
+    - step 14：`train_weight=0.644`，`ground_truth_reward=0.750`，`label_accuracy=0.875`，`timing_s/step=46.098`，`perf/throughput=1755.415`。
+    - step 15：`train_weight=0.755`，`ground_truth_reward=0.785`，`label_accuracy=0.875`，`timing_s/step=46.508`，`perf/throughput=1426.215`。
+    - step 16：`train_weight=0.530`，`ground_truth_reward=0.504`，`label_accuracy=0.625`，`timing_s/step=45.795`，`perf/throughput=1680.870`。
+    - step 18：`train_weight=0.720`，`ground_truth_reward=0.758`，`label_accuracy=0.750`，`timing_s/step=45.483`，`perf/throughput=1700.454`。
+    - step 19：`train_weight=0.588`，`ground_truth_reward=0.680`，`label_accuracy=0.875`，`timing_s/step=45.891`，`perf/throughput=1763.397`。
+    - step 20：`train_weight=0.574`，`ground_truth_reward=0.625`，`label_accuracy=0.750`，`timing_s/step=45.582`，`perf/throughput=1793.868`。
+  - 中段观察：v20 的 `train_weight` 整体低于 v19，也低于 v14/v16 同类早期 batch，更像保守更新；最终是否提升聚合质量仍以 step 50 validation 为准。
+- v20 最终结果：
+  - 2026-06-28 16:33 CST，v20 在 worker `974803` 上完成。
+  - 运行完整性：
+    - 8 卡、50 step。
+    - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+    - 训练日志推进到 `training/global_step:50.000`。
+    - 未出现中途 validation；唯一 validation 在 step 50 触发。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip06_power15_refbase_localfp32_8_50step_v20.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip06_power15_refbase_localfp32_8_v20_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip06_power15_refbase_localfp32_8_v20_metrics.txt`
+  - step 50 训练诊断：
+    - `train/sps/reward_mode=6.000`
+    - `train/sps/effective_K=63.947`
+    - `train/sps/weighted_label_confidence=0.866`
+    - `train/sps/agreement_rate=0.875`
+    - `train/sps/train_weight=0.803`
+    - `train/label_accuracy=0.875`
+    - `train/reward_accuracy=0.652`
+    - `train/majority_voting_reward=0.788`
+    - `train/ground_truth_reward=0.848`
+    - `train/pass@32=0.875`
+    - `train/majority_ratio=0.848`
+    - `response_length/clip_ratio=0.195`
+    - `timing_s/testing=165.092`
+    - `timing_s/step=210.978`（含 final validation）
+  - final validation 结果：
+    - `val-core/MATH-TTT/acc/mean@4=0.8204225352112676`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8721348088531188`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.8252635814889336`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.760`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.837`
+  - 结论：
+    - v20 低于 v14 `mean@4=0.8410462776659959`，不是提升结果，不做 local git commit。
+    - `clip_penalty=0.6` 的更强截断惩罚明显伤害 `mean@4` 与 `best@4`；结合 v19 的 `clip=0.4` 回退，v14 的 `clip=0.5` 仍是较优设置。
+    - v20 结束后，v15-v20 都未达到 `mean@4 >= 0.85`；按用户要求，直接使用当前最佳 v14 方案启动 185-step 训练。
+
+启动尝试 22：best-v14 185-step 计划
+- 目的：
+  - 到 v20 仍未达到 `mean@4 >= 0.85`。
+  - 使用当前最佳 50-step 方案 v14 跑 185 step，观察长训练最终指标。
+- 当前最佳 v14 方案：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - `ttrl.sps_base_logprob_source=ref`
+  - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 50-step final `val-core/MATH-TTT/acc/mean@4=0.8410462776659959`
+  - local improvement commit：`f02da11 Add SPS power-weight experiment`
+- worker：
+  - 继续复用 worker `974803`，启动前需确认 `/proc/self` 与 `/proc/meminfo` 仍存在、8 张 B200 空闲。
+- 设计：
+  - 使用 8 卡、185 step。
+  - `trainer.val_before_train=False`。
+  - `trainer.test_freq=185`，即无中途 validation，仅 step 185 final validation。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_185_v14`。
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_best185_v14_brief_worker.sh`
+- 启动状态：
+  - v20 后 worker `974803` 仍健康：
+    - `/proc/self` 与 `/proc/meminfo` 存在，`PROC_OK`。
+    - GPU 0-7 显存占用 0 MiB，利用率 0%。
+    - 没有残留 `main_ppo`、`raylet`、`gcs_server` 进程。
+  - 2026-06-28 16:37 CST，在 worker `974803` 上启动 best-v14 185-step。
+  - 本地模型 copy 从 `/mnt/hdfs/models/qwen3_4b` 到 `/tmp/qwen3_4b_local_185_v14`，16:37 CST 完成。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r185_v14`，`MASTER_PORT=29591`。
+  - 训练命令已确认覆盖：
+    - `trainer.total_training_steps=185`
+    - `trainer.test_freq=185`
+    - `trainer.val_before_train=False`
+    - v14 参数：`floor=0.15`、`clip=0.5`、`power=1.5`、`sps_base_logprob_source=ref`。
+  - 16:41 CST 已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.515`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/step=52.408`
+    - `perf/throughput=1572.074`
+  - 观察：step 1 与 v14/v16 的 best 配置早期行为一致，确认 185-step runner 正在按 v14 参数运行。
+  - 16:57 CST 进度到 step 20，仍未出现 validation。
+  - step 2-20 监控摘要：
+    - step 2：`train_weight=0.624`，`ground_truth_reward=0.637`，`label_accuracy=0.875`，`timing_s/step=46.785`，`perf/throughput=1849.609`。
+    - step 3：`train_weight=0.604`，`ground_truth_reward=0.645`，`label_accuracy=0.875`，`timing_s/step=47.815`，`perf/throughput=1837.825`。
+    - step 4：`train_weight=0.391`，`ground_truth_reward=0.340`，`label_accuracy=0.625`，`timing_s/step=46.697`，`perf/throughput=1991.463`。
+    - step 5：`train_weight=0.409`，`ground_truth_reward=0.340`，`label_accuracy=0.750`，`timing_s/step=46.552`，`perf/throughput=1899.359`。
+    - step 7：`train_weight=0.496`，`ground_truth_reward=0.598`，`label_accuracy=0.375`，`timing_s/step=47.764`，`perf/throughput=1874.675`。
+    - step 8：`train_weight=0.579`，`ground_truth_reward=0.562`，`label_accuracy=0.750`，`timing_s/step=52.980`，`perf/throughput=1575.866`。
+    - step 9：`train_weight=0.687`，`ground_truth_reward=0.703`，`label_accuracy=0.875`，`timing_s/step=46.009`，`perf/throughput=1844.624`。
+    - step 10：`train_weight=0.664`，`ground_truth_reward=0.777`，`label_accuracy=1.000`，`timing_s/step=46.911`，`perf/throughput=1852.534`。
+    - step 11：`train_weight=0.287`，`ground_truth_reward=0.250`，`label_accuracy=0.250`，`timing_s/step=53.723`，`perf/throughput=1751.680`。
+    - step 13：`train_weight=0.630`，`ground_truth_reward=0.637`，`label_accuracy=0.750`，`timing_s/step=45.927`，`perf/throughput=1856.864`。
+    - step 14：`train_weight=0.698`，`ground_truth_reward=0.766`，`label_accuracy=0.875`，`timing_s/step=46.303`，`perf/throughput=1749.170`。
+    - step 15：`train_weight=0.770`，`ground_truth_reward=0.781`，`label_accuracy=0.875`，`timing_s/step=46.150`，`perf/throughput=1423.444`。
+    - step 17：`train_weight=0.811`，`ground_truth_reward=0.859`，`label_accuracy=1.000`，`timing_s/step=46.644`，`perf/throughput=1581.648`。
+    - step 18：`train_weight=0.776`，`ground_truth_reward=0.777`，`label_accuracy=0.875`，`timing_s/step=45.820`，`perf/throughput=1648.215`。
+    - step 19：`train_weight=0.639`，`ground_truth_reward=0.703`，`label_accuracy=0.875`，`timing_s/step=46.489`，`perf/throughput=1716.758`。
+    - step 20：`train_weight=0.597`，`ground_truth_reward=0.652`，`label_accuracy=0.750`，`timing_s/step=46.010`，`perf/throughput=1754.287`。
+  - 观察：前 20 步吞吐与 50-step v14/v16 同量级，`trainer.test_freq=185` 生效，未触发任何中途 validation。
+  - 17:21 CST 进度越过 step 50，仍未出现 validation，确认 `trainer.test_freq=185` 生效。
+  - step 50 训练诊断：
+    - `train/sps/train_weight=0.852`
+    - `train/ground_truth_reward=0.855`
+    - `train/label_accuracy=1.000`
+    - `timing_s/step=46.079`
+    - `perf/throughput=1268.465`
+- best-v14 185-step 首次尝试提前结束：
+  - 2026-06-28 17:30 CST，首次 185-step runner 在 step 62 后以 `WORKER_BEST185_V14_EXIT status=0` 正常退出。
+  - 没有触发 validation，因为未达到 `trainer.test_freq=185`。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_metrics.txt`
+  - 原因判断：
+    - 底层 runner 仍带 `trainer.total_epochs=1`，MATH-TTT train split 单 epoch 约 62 个 batch。
+    - 即使覆盖了 `trainer.total_training_steps=185`，训练 loop 在 1 个 epoch 结束后仍正常退出。
+  - 修复：
+    - 2026-06-28 17:34 CST，已修改 `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14.sh`，增加覆盖 `trainer.total_epochs=4`。
+    - 重新启动 185-step 时仍保留 `trainer.total_training_steps=185` 和 `trainer.test_freq=185`，目标是实际跑满 185 step 并只做最终 validation。
+  - 证据保留：
+    - 2026-06-28 17:34 CST，重新启动前已把首次尝试日志重命名保留，避免覆盖：
+      - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_attempt1_step62.log`
+      - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_ray_taskrunner_attempt1_step62.log`
+      - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_185step_best_v14_metrics.txt_attempt1_step62.log`
+  - 重新启动：
+    - 2026-06-28 17:35 CST，worker `974803` 仍健康，GPU 0-7 空闲。
+    - 已重新启动修复后的 best-v14 185-step runner。
+    - 本次仍使用本地模型 copy `/tmp/qwen3_4b_local_185_v14`、`RAY_TMPDIR=/tmp/r185_v14`、`MASTER_PORT=29591`。
+    - 命令行已确认包含 `trainer.total_epochs=4`、`trainer.total_training_steps=185`、`trainer.test_freq=185`。
+  - 17:39 CST，重跑已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.515`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/step=49.675`
+    - `perf/throughput=1658.566`
+  - 18:18 CST，重跑越过 step 50，仍未出现 validation：
+    - `training/global_step=50.000`
+    - `train/sps/train_weight=0.835`
+    - `train/ground_truth_reward=0.863`
+    - `train/label_accuracy=1.000`
+    - `timing_s/step=45.790`
+    - `perf/throughput=1288.899`
+  - 18:28 CST，重跑越过首次尝试的退出点 step 62，说明 `trainer.total_epochs=4` 修复生效：
+    - step 63：`train_weight=0.767`，`ground_truth_reward=0.762`，`label_accuracy=0.750`，`timing_s/step=45.888`，`perf/throughput=1428.641`。
+    - step 66：`train_weight=0.791`，`ground_truth_reward=0.836`，`label_accuracy=0.875`，`timing_s/step=52.423`，`perf/throughput=1110.997`。
+  - 18:57 CST，重跑越过 step 100，仍未出现 validation：
+    - `training/global_step=100.000`
+    - `train/sps/train_weight=0.911`
+    - `train/ground_truth_reward=0.965`
+    - `train/label_accuracy=1.000`
+    - `timing_s/step=44.429`
+    - `perf/throughput=1257.384`
+
+v18 最终结果
+- 2026-06-28 14:47 CST，v18 在 worker `974727` 上完成。
+- 运行完整性：
+  - 8 卡、50 step。
+  - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+  - 训练日志推进到 `training/global_step:50.000`。
+  - 未出现中途 validation；唯一 validation 在 step 50 触发。
+- 日志与快照：
+  - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power125_refbase_localfp32_8_50step_v18.log`
+  - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power125_refbase_localfp32_8_v18_ray_taskrunner.log`
+  - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power125_refbase_localfp32_8_v18_metrics.txt`
+- step 50 训练诊断：
+  - `train/sps/reward_mode=6.000`
+  - `train/sps/effective_K=63.944`
+  - `train/sps/weighted_label_confidence=0.934`
+  - `train/sps/agreement_rate=1.000`
+  - `train/sps/train_weight=0.845`
+  - `train/label_accuracy=0.875`
+  - `train/reward_accuracy=0.527`
+  - `train/majority_voting_reward=0.799`
+  - `train/ground_truth_reward=0.844`
+  - `train/pass@32=0.875`
+  - `train/majority_ratio=0.855`
+  - `response_length/clip_ratio=0.199`
+  - `timing_s/testing=166.235`
+  - `timing_s/step=212.048`（含 final validation）
+- final validation 结果：
+  - `val-core/MATH-TTT/acc/mean@4=0.8360160965794768`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8782334004024144`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.8376056338028169`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.7915573440643863`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.8541247484909457`
+- 结论：
+  - v18 低于 v14 `mean@4=0.8410462776659959`，不是提升结果，不做 local git commit，不触发 185 step。
+  - `power=1.25` 比 v14 更温和，但 final `mean@4` 和 `best@4` 都低于 v14；结合 v17 `power=2.0` 回退，当前证据显示 `power=1.5` 仍是较优幂次。
+  - 当前最佳仍为 v14。
+- worker 状态：
+  - v18 后 worker `974727` 仍健康，`/proc/self` 和 `/proc/meminfo` 存在。
+  - 8 卡在 v18 结束后进入低利用状态，可继续复用同一个 worker 跑 v19。
+
+启动尝试 20：v19 计划
+- 目的：
+  - v15/v16 显示 `floor` 两侧移动都不如 v14；v17/v18 显示 `power=1.5` 两侧移动也不如 v14。
+  - v19 回到 v14 主干，只把截断惩罚从 `clip=0.5` 温和放松到 `clip=0.4`，测试是否能保留候选上限并提升平均/聚合质量。
+- worker：
+  - 继续复用健康 worker `974727`；不 launch 第二个 worker。
+- 设计：
+  - 使用 8 卡、50 step、`trainer.val_before_train=False`、`trainer.test_freq=50`。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_v19`。
+  - 保持 v14 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_weight_power=1.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_clip_penalty=0.4`
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip04_power15_refbase_localfp32_8_50step_v19.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_v19_brief_worker.sh`
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185-step 实验。
+  - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
+  - 若低于 v14，不做 commit。
+- 启动状态：
+  - 2026-06-28 14:01 CST，在 worker `974727` 上启动 v18。
+  - 本地模型 copy 从 `/mnt/hdfs/models/qwen3_4b` 到 `/tmp/qwen3_4b_local_v18`，14:01 CST 完成。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r18`。
+  - 14:05 CST 已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.540`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/ref=3.078`
+    - `timing_s/step=52.202`
+    - `perf/throughput=1578.284`
+  - 观察：相比 v14/v16 step 1 的 `train_weight=0.515`，`power=1.25` 给中低置信 batch 更高容量；运行速度正常，未触发中途 validation。
+  - 14:13 CST 进度到 step 10，仍未出现 validation。
+  - step 2-10 监控摘要：
+    - step 2：`train_weight=0.651`，`ground_truth_reward=0.594`，`label_accuracy=0.875`，`timing_s/step=46.286`，`perf/throughput=1892.622`。
+    - step 3：`train_weight=0.635`，`ground_truth_reward=0.660`，`label_accuracy=0.875`，`timing_s/step=48.210`，`perf/throughput=1837.241`。
+    - step 4：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 5：`train_weight=0.432`，`ground_truth_reward=0.309`，`label_accuracy=0.750`，`timing_s/step=45.672`，`perf/throughput=1937.092`。
+    - step 6：`train_weight=0.518`，`ground_truth_reward=0.508`，`label_accuracy=0.500`，`timing_s/step=53.370`，`perf/throughput=1715.387`。
+    - step 7：`train_weight=0.513`，`ground_truth_reward=0.594`，`label_accuracy=0.375`，`timing_s/step=47.628`，`perf/throughput=1880.002`。
+    - step 8：`train_weight=0.556`，`ground_truth_reward=0.574`，`label_accuracy=0.625`，`timing_s/step=52.704`，`perf/throughput=1571.676`。
+    - step 9：`train_weight=0.688`，`ground_truth_reward=0.715`，`label_accuracy=0.875`，`timing_s/step=48.870`，`perf/throughput=1741.574`。
+    - step 10：`train_weight=0.713`，`ground_truth_reward=0.797`，`label_accuracy=1.000`，`timing_s/step=49.870`，`perf/throughput=1729.169`。
+  - 初步观察：`power=1.25` 比 v17 明显更少压缩，也略高于 v14/v16 的早期 `train_weight`；需要 final validation 判断是否提升平均表现。
+  - 14:21 CST 进度到 step 20，仍未出现 validation。
+  - step 11-20 监控摘要：
+    - step 11：`train_weight=0.296`，`ground_truth_reward=0.250`，`label_accuracy=0.375`，`timing_s/step=52.810`，`perf/throughput=1784.252`。
+    - step 12：`train_weight=0.605`，`ground_truth_reward=0.547`，`label_accuracy=0.750`，`timing_s/step=57.995`，`perf/throughput=1400.184`。
+    - step 13：`train_weight=0.606`，`ground_truth_reward=0.621`，`label_accuracy=0.625`，`timing_s/step=49.940`，`perf/throughput=1700.501`。
+    - step 14：`train_weight=0.734`，`ground_truth_reward=0.781`，`label_accuracy=0.875`，`timing_s/step=48.576`，`perf/throughput=1647.903`。
+    - step 15：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 16：`train_weight=0.605`，`ground_truth_reward=0.512`，`label_accuracy=0.750`，`timing_s/step=46.223`，`perf/throughput=1655.549`。
+    - step 17：`train_weight=0.848`，`ground_truth_reward=0.914`，`label_accuracy=1.000`，`timing_s/step=46.714`，`perf/throughput=1575.352`。
+    - step 18：`train_weight=0.787`，`ground_truth_reward=0.762`，`label_accuracy=0.875`，`timing_s/step=45.492`，`perf/throughput=1668.822`。
+    - step 19：`train_weight=0.658`，`ground_truth_reward=0.691`，`label_accuracy=0.875`，`timing_s/step=45.859`，`perf/throughput=1734.759`。
+    - step 20：`train_weight=0.676`，`ground_truth_reward=0.645`，`label_accuracy=0.750`，`timing_s/step=46.030`，`perf/throughput=1754.190`。
+  - 14:29 CST 进度到 step 31，仍未出现 validation。
+  - step 21-31 监控摘要：
+    - step 21：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 22：`train_weight=0.728`，`ground_truth_reward=0.730`，`label_accuracy=0.750`，`timing_s/step=45.964`，`perf/throughput=1679.429`。
+    - step 23：`train_weight=0.555`，`ground_truth_reward=0.566`，`label_accuracy=0.875`，`timing_s/step=46.931`，`perf/throughput=2040.020`。
+    - step 24：`train_weight=0.884`，`ground_truth_reward=0.977`，`label_accuracy=1.000`，`timing_s/step=46.637`，`perf/throughput=1512.888`。
+    - step 25：`train_weight=0.907`，`ground_truth_reward=0.906`，`label_accuracy=1.000`，`timing_s/step=45.998`，`perf/throughput=1473.524`。
+    - step 26：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 27：`train_weight=0.806`，`ground_truth_reward=0.781`，`label_accuracy=1.000`，`timing_s/step=47.284`，`perf/throughput=1645.436`。
+    - step 28：`train_weight=0.857`，`ground_truth_reward=0.871`，`label_accuracy=0.875`，`timing_s/step=45.949`，`perf/throughput=1616.769`。
+    - step 29：`train_weight=0.898`，`ground_truth_reward=0.875`，`label_accuracy=1.000`，`timing_s/step=45.579`，`perf/throughput=1324.979`。
+    - step 30：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 31：`train_weight=0.633`，`ground_truth_reward=0.629`，`label_accuracy=0.625`，`timing_s/step=47.097`，`perf/throughput=1765.782`。
+  - 中段观察：`power=1.25` 对高置信 batch 给到更高容量，step 24-29 的 `train_weight` 多在 0.85-0.91；这可能提高学习强度，但也可能削弱 v14 的低置信防护，最终仍以 validation 判断。
+- 启动状态：
+  - 2026-06-28 13:08 CST，在 worker `974727` 上启动 v17。
+  - 本地模型 copy 从 `/mnt/hdfs/models/qwen3_4b` 到 `/tmp/qwen3_4b_local_v17`，13:12 CST 完成。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r17`。
+  - 13:17 CST 已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.476`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/ref=3.333`
+    - `timing_s/step=53.787`
+    - `perf/throughput=1531.783`
+  - 观察：相比 v14/v16 step 1 的 `train_weight=0.515`，`power=2.0` 确实进一步压低了中低置信 batch 的训练容量；运行速度正常，未触发中途 validation。
+  - 13:24 CST 进度到 step 10，仍未出现 validation。
+  - step 2-10 监控摘要：
+    - step 2：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 3：`train_weight=0.548`，`ground_truth_reward=0.688`，`label_accuracy=0.875`，`timing_s/step=48.638`，`perf/throughput=1814.094`。
+    - step 4：`train_weight=0.287`，`ground_truth_reward=0.348`，`label_accuracy=0.375`，`timing_s/step=47.524`，`perf/throughput=1964.740`。
+    - step 5：`train_weight=0.362`，`ground_truth_reward=0.320`，`label_accuracy=0.750`，`timing_s/step=46.612`，`perf/throughput=1902.870`。
+    - step 6：`train_weight=0.442`，`ground_truth_reward=0.516`，`label_accuracy=0.500`，`timing_s/step=54.676`，`perf/throughput=1658.380`。
+    - step 7：`train_weight=0.461`，`ground_truth_reward=0.574`，`label_accuracy=0.375`，`timing_s/step=48.664`，`perf/throughput=1828.507`。
+    - step 8：`train_weight=0.554`，`ground_truth_reward=0.578`，`label_accuracy=0.750`，`timing_s/step=56.188`，`perf/throughput=1479.818`。
+    - step 9：`train_weight=0.613`，`ground_truth_reward=0.715`，`label_accuracy=0.875`，`timing_s/step=46.787`，`perf/throughput=1812.010`。
+    - step 10：`train_weight=0.572`，`ground_truth_reward=0.777`，`label_accuracy=1.000`，`timing_s/step=46.900`，`perf/throughput=1878.180`。
+  - 初步观察：`power=2.0` 对低置信 batch 的压缩强于 v14/v16，例如 step 4 `train_weight=0.287`；训练吞吐正常，暂未出现异常。
+  - 13:32 CST 进度到 step 20，仍未出现 validation。
+  - step 11-20 监控摘要：
+    - step 11：`train_weight=0.261`，`ground_truth_reward=0.258`，`label_accuracy=0.375`，`timing_s/step=53.937`，`perf/throughput=1761.208`。
+    - step 12：`train_weight=0.561`，`ground_truth_reward=0.531`，`label_accuracy=0.750`，`timing_s/step=53.590`，`perf/throughput=1536.792`。
+    - step 13：`train_weight=0.543`，`ground_truth_reward=0.602`，`label_accuracy=0.750`，`timing_s/step=46.765`，`perf/throughput=1839.944`。
+    - step 14：`train_weight=0.642`，`ground_truth_reward=0.789`，`label_accuracy=0.875`，`timing_s/step=46.513`，`perf/throughput=1753.977`。
+    - step 15：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 16：`train_weight=0.594`，`ground_truth_reward=0.512`，`label_accuracy=0.750`，`timing_s/step=46.302`，`perf/throughput=1661.275`。
+    - step 17：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 18：`train_weight=0.712`，`ground_truth_reward=0.742`，`label_accuracy=0.875`，`timing_s/step=46.416`，`perf/throughput=1678.176`。
+    - step 19：`train_weight=0.579`，`ground_truth_reward=0.645`，`label_accuracy=0.875`，`timing_s/step=46.299`，`perf/throughput=1750.141`。
+    - step 20：`train_weight=0.562`，`ground_truth_reward=0.633`，`label_accuracy=0.750`，`timing_s/step=46.077`，`perf/throughput=1761.789`。
+  - 13:40 CST 进度到 step 30，仍未出现 validation。
+  - step 21-30 监控摘要：
+    - step 21：`train_weight=0.491`，`ground_truth_reward=0.574`，`label_accuracy=0.875`，`timing_s/step=53.597`，`perf/throughput=1655.577`。
+    - step 22：`train_weight=0.695`，`ground_truth_reward=0.711`，`label_accuracy=0.750`，`timing_s/step=46.438`，`perf/throughput=1684.843`。
+    - step 23：`train_weight=0.429`，`ground_truth_reward=0.555`，`label_accuracy=0.875`，`timing_s/step=48.180`，`perf/throughput=1994.604`。
+    - step 24：`train_weight=0.821`，`ground_truth_reward=0.945`，`label_accuracy=1.000`，`timing_s/step=47.185`，`perf/throughput=1511.929`。
+    - step 25：`train_weight=0.847`，`ground_truth_reward=0.918`，`label_accuracy=1.000`，`timing_s/step=46.016`，`perf/throughput=1517.570`。
+    - step 26：`train_weight=0.799`，`ground_truth_reward=0.879`，`label_accuracy=0.875`，`timing_s/step=47.216`，`perf/throughput=1590.146`。
+    - step 27：`train_weight=0.698`，`ground_truth_reward=0.750`，`label_accuracy=1.000`，`timing_s/step=47.358`，`perf/throughput=1695.858`。
+    - step 28：`train_weight=0.740`，`ground_truth_reward=0.848`，`label_accuracy=0.875`，`timing_s/step=47.131`，`perf/throughput=1615.514`。
+    - step 29：`train_weight=0.865`，`ground_truth_reward=0.883`，`label_accuracy=1.000`，`timing_s/step=46.263`，`perf/throughput=1333.568`。
+    - step 30：`train_weight=0.772`，`ground_truth_reward=0.824`，`label_accuracy=1.000`，`timing_s/step=54.157`，`perf/throughput=1359.174`。
+  - 中段观察：step 24-30 多数 batch 质量较高，`power=2.0` 对高置信 batch 仍保留足够容量；需要 final validation 判断更强压缩是否伤害平均表现。
+  - 13:48 CST 进度到 step 41，仍未出现 validation。
+  - step 31-41 监控摘要：
+    - step 31：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 32：`train_weight=0.805`，`ground_truth_reward=0.754`，`label_accuracy=1.000`，`timing_s/step=46.125`，`perf/throughput=1420.946`。
+    - step 33：`train_weight=0.748`，`ground_truth_reward=0.750`，`label_accuracy=0.750`，`timing_s/step=46.634`，`perf/throughput=1476.349`。
+    - step 34：`train_weight=0.673`，`ground_truth_reward=0.750`，`label_accuracy=0.875`，`timing_s/step=46.063`，`perf/throughput=1587.669`。
+    - step 35：`train_weight=0.554`，`ground_truth_reward=0.555`，`label_accuracy=1.000`，`timing_s/step=47.158`，`perf/throughput=1962.521`。
+    - step 36：`train_weight=0.738`，`ground_truth_reward=0.898`，`label_accuracy=0.875`，`timing_s/step=46.759`，`perf/throughput=1462.137`。
+    - step 37：`train_weight=0.723`，`ground_truth_reward=0.742`，`label_accuracy=0.750`，`timing_s/step=45.580`，`perf/throughput=1585.551`。
+    - step 38：`train_weight=0.721`，`ground_truth_reward=0.695`，`label_accuracy=0.875`，`timing_s/step=46.837`，`perf/throughput=1489.597`。
+    - step 39：`train_weight=0.668`，`ground_truth_reward=0.781`，`label_accuracy=0.750`，`timing_s/step=54.808`，`perf/throughput=1299.966`。
+    - step 40：已完成并正常落盘；监控轮询未单独记录数值。
+    - step 41：`train_weight=0.717`，`ground_truth_reward=0.914`，`label_accuracy=0.750`，`timing_s/step=48.087`，`perf/throughput=1521.783`。
+- v17 最终结果：
+  - 2026-06-28 13:59 CST，v17 在 worker `974727` 上完成。
+  - 运行完整性：
+    - 8 卡、50 step。
+    - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+    - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:50.000`。
+    - 没有中途 validation；唯一 validation 在 step 50 触发。
+    - `WORKER_V17_EXIT status=0`。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power20_refbase_localfp32_8_50step_v17.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power20_refbase_localfp32_8_v17_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power20_refbase_localfp32_8_v17_metrics.txt`
+  - step 50 训练诊断：
+    - `train/sps/reward_mode=6.000`
+    - `train/sps/effective_K=63.947`
+    - `train/sps/weighted_label_confidence=0.951`
+    - `train/sps/agreement_rate=1.000`
+    - `train/sps/train_weight=0.801`
+    - `train/label_accuracy=0.875`
+    - `train/reward_accuracy=0.629`
+    - `train/majority_voting_reward=0.773`
+    - `train/ground_truth_reward=0.863`
+    - `train/pass@32=1.000`
+    - `train/majority_ratio=0.863`
+    - `response_length/clip_ratio=0.219`
+    - `timing_s/testing=166.494`
+    - `timing_s/step=213.012`（含 final validation）
+  - final validation 结果：
+    - `val-core/MATH-TTT/acc/mean@4=0.817907444668008`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8678531187122736`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.8208269617706238`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.7628068410462777`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.834`
+    - `training/global_step=50.000`
+  - 结论：
+    - v17 低于 v14 `mean@4=0.8410462776659959`，也低于 v16；不是提升结果，不做 local git commit，不触发 185 step。
+    - `power=2.0` 过强压缩低置信 prompt 容量，final `best@4` 也明显低于 v14，说明过强幂次压缩会伤候选上限。
+    - 当前最佳仍为 v14。
+  - worker 状态：
+    - v17 结束后检查 worker `974727`，`/proc/self` 与 `/proc/meminfo` 仍存在，8 张 B200 空闲。
+    - 可继续复用同一 worker 跑 v18，避免重新 launch。
+
+启动尝试 19：v18 计划
+- 目的：
+  - v14 `power=1.5` 是当前最好；v17 `power=2.0` 明显回退，说明过强幂次压缩伤候选上限。
+  - v18 固定 v14 的 `floor=0.15` 与 `clip=0.5`，只把 `power` 调低到 `1.25`，测试更温和的非线性容量压缩是否优于 v14。
+- worker：
+  - 继续复用健康 worker `974727`。
+  - v17 后已确认 `/proc/self`、`/proc/meminfo` 存在，8 张 B200 空闲。
+- 设计：
+  - 使用 8 卡、50 step、`trainer.val_before_train=False`、`trainer.test_freq=50`。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_v18`。
+  - 保持 v14 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_weight_power=1.25`
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power125_refbase_localfp32_8_50step_v18.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_v18_brief_worker.sh`
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185-step 实验。
+  - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
+  - 若低于 v14，不做 commit。
+- 启动状态：
+  - 2026-06-28 12:11 CST，在 worker `974689` 上启动 v16。
+  - 本地模型 copy 从 `/mnt/hdfs/models/qwen3_4b` 到 `/tmp/qwen3_4b_local_v16`，12:16 CST 完成。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r16`，避免 v15 的 Unix socket 路径过长问题。
+  - 12:21 CST 已完成 step 1，未出现 validation：
+    - `training/global_step=1.000`
+    - `train/sps/train_weight=0.515`
+    - `train/ground_truth_reward=0.523`
+    - `train/label_accuracy=0.750`
+    - `timing_s/ref=3.092`
+    - `timing_s/step=53.632`
+    - `perf/throughput=1536.190`
+  - 12:22 CST 已完成 step 2，未出现 validation：
+    - `training/global_step=2.000`
+    - `train/sps/train_weight=0.626`
+    - `train/ground_truth_reward=0.602`
+    - `train/label_accuracy=0.875`
+    - `timing_s/ref=3.120`
+    - `timing_s/step=46.268`
+    - `perf/throughput=1863.636`
+  - 12:22 CST 已完成 step 3，未出现 validation：
+    - `training/global_step=3.000`
+    - `train/sps/train_weight=0.594`
+    - `train/ground_truth_reward=0.645`
+    - `train/label_accuracy=0.875`
+    - `timing_s/ref=3.133`
+    - `timing_s/step=48.935`
+    - `perf/throughput=1821.211`
+  - 观察：v16 普通 step 时间与 v14 基本一致，GPU 0-7 正常使用，当前没有训练错误；Ray dashboard/log monitor 有平台侧非训练错误输出，但训练 actor 已正常推进。
+  - 12:29 CST 进度到 step 11，仍未出现 validation，符合 final-only 设置。
+  - step 4-11 监控摘要：
+    - step 4：`train_weight=0.347`，`ground_truth_reward=0.344`，`label_accuracy=0.500`，`timing_s/step=49.290`，`perf/throughput=1898.955`。
+    - step 5：`train_weight=0.408`，`ground_truth_reward=0.293`，`label_accuracy=0.625`，`timing_s/step=47.125`，`perf/throughput=1876.464`。
+    - step 6：`train_weight=0.483`，`ground_truth_reward=0.492`，`label_accuracy=0.500`，`timing_s/step=54.799`，`perf/throughput=1672.279`。
+    - step 7：`train_weight=0.485`，`ground_truth_reward=0.566`，`label_accuracy=0.375`，`timing_s/step=48.022`，`perf/throughput=1896.950`。
+    - step 8：`train_weight=0.531`，`ground_truth_reward=0.574`，`label_accuracy=0.625`，`timing_s/step=53.133`，`perf/throughput=1590.068`。
+    - step 9：`train_weight=0.640`，`ground_truth_reward=0.680`，`label_accuracy=0.875`，`timing_s/step=45.886`，`perf/throughput=1897.587`。
+    - step 10：`train_weight=0.659`，`ground_truth_reward=0.758`，`label_accuracy=1.000`，`timing_s/step=46.891`，`perf/throughput=1875.037`。
+    - step 11：`train_weight=0.269`，`ground_truth_reward=0.254`，`label_accuracy=0.375`，`timing_s/step=53.825`，`perf/throughput=1771.542`。
+  - 初步观察：低质量 batch 仍会被显著降权，高质量 batch 可拿到较高容量；`floor=0.20` 没有像 v15 `floor=0.10` 那样从早期监控上显示过度压低全部容量。
+  - 12:36 CST 进度到 step 20，仍未出现 validation。
+  - step 12-20 监控摘要：
+    - step 12：`train_weight=0.630`，`ground_truth_reward=0.531`，`label_accuracy=0.875`，`timing_s/step=52.943`，`perf/throughput=1549.715`。
+    - step 13：`train_weight=0.608`，`ground_truth_reward=0.617`，`label_accuracy=0.750`，`timing_s/step=46.448`，`perf/throughput=1873.655`。
+    - step 14：`train_weight=0.684`，`ground_truth_reward=0.770`，`label_accuracy=0.875`，`timing_s/step=46.434`，`perf/throughput=1753.344`。
+    - step 15：`train_weight=0.782`，`ground_truth_reward=0.809`，`label_accuracy=0.875`，`timing_s/step=46.510`，`perf/throughput=1426.563`。
+    - step 16：`train_weight=0.543`，`ground_truth_reward=0.531`，`label_accuracy=0.625`，`timing_s/step=46.131`，`perf/throughput=1673.171`。
+    - step 17：`train_weight=0.814`，`ground_truth_reward=0.867`，`label_accuracy=1.000`，`timing_s/step=46.792`，`perf/throughput=1609.631`。
+    - step 18：`train_weight=0.768`，`ground_truth_reward=0.750`，`label_accuracy=0.875`，`timing_s/step=45.587`，`perf/throughput=1716.446`。
+    - step 19：`train_weight=0.628`，`ground_truth_reward=0.656`，`label_accuracy=0.875`，`timing_s/step=45.975`，`perf/throughput=1756.478`。
+    - step 20：`train_weight=0.598`，`ground_truth_reward=0.621`，`label_accuracy=0.750`，`timing_s/step=46.972`，`perf/throughput=1736.064`。
+  - 12:44 CST 进度到 step 30，仍未出现 validation。
+  - step 21-30 监控摘要：
+    - step 21：`train_weight=0.628`，`ground_truth_reward=0.551`，`label_accuracy=0.875`，`timing_s/step=53.488`，`perf/throughput=1633.337`。
+    - step 22：`train_weight=0.735`，`ground_truth_reward=0.723`，`label_accuracy=0.750`，`timing_s/step=46.480`，`perf/throughput=1685.602`。
+    - step 23：`train_weight=0.500`，`ground_truth_reward=0.586`，`label_accuracy=0.875`，`timing_s/step=47.194`，`perf/throughput=2023.749`。
+    - step 24：`train_weight=0.863`，`ground_truth_reward=0.957`，`label_accuracy=1.000`，`timing_s/step=47.065`，`perf/throughput=1526.624`。
+    - step 25：`train_weight=0.896`，`ground_truth_reward=0.922`，`label_accuracy=1.000`，`timing_s/step=45.664`，`perf/throughput=1497.429`。
+    - step 26：`train_weight=0.867`，`ground_truth_reward=0.910`，`label_accuracy=0.875`，`timing_s/step=46.997`，`perf/throughput=1554.374`。
+    - step 27：`train_weight=0.764`，`ground_truth_reward=0.727`，`label_accuracy=1.000`，`timing_s/step=47.072`，`perf/throughput=1724.307`。
+    - step 28：`train_weight=0.806`，`ground_truth_reward=0.848`，`label_accuracy=0.875`，`timing_s/step=45.784`，`perf/throughput=1621.484`。
+    - step 29：`train_weight=0.886`，`ground_truth_reward=0.898`，`label_accuracy=1.000`，`timing_s/step=46.289`，`perf/throughput=1321.824`。
+    - step 30：`train_weight=0.816`，`ground_truth_reward=0.836`，`label_accuracy=1.000`，`timing_s/step=53.876`，`perf/throughput=1314.657`。
+  - 中段观察：step 24-30 多数 batch 的 `ground_truth_reward` 明显高于前段，训练信号较强；但这只是诊断信号，真实答案没有参与训练，最终是否提升仍以 step 50 validation 为准。
+  - 12:52 CST 进度到 step 40，仍未出现 validation。
+  - step 31-40 监控摘要：
+    - step 31：`train_weight=0.604`，`ground_truth_reward=0.621`，`label_accuracy=0.625`，`timing_s/step=47.492`，`perf/throughput=1766.977`。
+    - step 32：`train_weight=0.794`，`ground_truth_reward=0.754`，`label_accuracy=0.875`，`timing_s/step=46.172`，`perf/throughput=1417.292`。
+    - step 33：`train_weight=0.788`，`ground_truth_reward=0.758`，`label_accuracy=0.875`，`timing_s/step=46.393`，`perf/throughput=1474.052`。
+    - step 34：`train_weight=0.737`，`ground_truth_reward=0.836`，`label_accuracy=0.875`，`timing_s/step=45.781`，`perf/throughput=1561.098`。
+    - step 35：`train_weight=0.635`，`ground_truth_reward=0.559`，`label_accuracy=1.000`，`timing_s/step=46.574`，`perf/throughput=1957.717`。
+    - step 36：`train_weight=0.790`，`ground_truth_reward=0.902`，`label_accuracy=0.875`，`timing_s/step=46.463`，`perf/throughput=1422.227`。
+    - step 37：`train_weight=0.758`，`ground_truth_reward=0.750`，`label_accuracy=0.875`，`timing_s/step=45.373`，`perf/throughput=1567.924`。
+    - step 38：`train_weight=0.756`，`ground_truth_reward=0.664`，`label_accuracy=0.875`，`timing_s/step=45.992`，`perf/throughput=1481.418`。
+    - step 39：`train_weight=0.737`，`ground_truth_reward=0.793`，`label_accuracy=0.875`，`timing_s/step=53.274`，`perf/throughput=1351.324`。
+    - step 40：`train_weight=0.869`，`ground_truth_reward=0.875`，`label_accuracy=0.875`，`timing_s/step=52.937`，`perf/throughput=1184.856`。
+- v16 最终结果：
+  - 2026-06-28 13:03 CST，v16 在 worker `974689` 上完成。
+  - 运行完整性：
+    - 8 卡、50 step。
+    - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+    - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:50.000`。
+    - 没有中途 validation；唯一 validation 在 step 50 触发。
+    - `WORKER_V16_EXIT status=0`。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor020_clip05_power15_refbase_localfp32_8_50step_v16.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor020_clip05_power15_refbase_localfp32_8_v16_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor020_clip05_power15_refbase_localfp32_8_v16_metrics.txt`
+  - step 50 训练诊断：
+    - `train/sps/reward_mode=6.000`
+    - `train/sps/effective_K=63.948`
+    - `train/sps/weighted_label_confidence=0.996`
+    - `train/sps/agreement_rate=1.000`
+    - `train/sps/train_weight=0.843`
+    - `train/label_accuracy=1.000`
+    - `train/reward_accuracy=0.664`
+    - `train/majority_voting_reward=0.769`
+    - `train/ground_truth_reward=0.836`
+    - `train/pass@32=1.000`
+    - `train/majority_ratio=0.852`
+    - `response_length/clip_ratio=0.234`
+    - `timing_s/testing=164.826`
+    - `timing_s/step=212.972`（含 final validation）
+  - final validation 结果：
+    - `val-core/MATH-TTT/acc/mean@4=0.8279678068410463`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8809517102615695`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.8307505030181087`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.7714124748490946`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.846`
+    - `training/global_step=50.000`
+  - 结论：
+    - v16 低于 v14 `mean@4=0.8410462776659959`，不是提升结果，不做 local git commit，不触发 185 step。
+    - `floor=0.20` 相比 v14 的 `floor=0.15` 没有带来提升；继续提高 floor 的优先级较低。
+    - 当前最佳仍为 v14。
+  - worker 状态：
+    - v16 完成后 worker `974689` 出现 `/proc/self` 与 `/proc/meminfo` 缺失，日志含 `Fail to open /proc/self/stat` 等 procfs 损坏告警。
+    - 按 worker 规则，该 worker 判定不可用。
+    - 2026-06-28 13:04 CST 已执行 `NO_COLOR=1 TERM=dumb mlx worker kill 974689`，输出 `killing 1 workers: 974689`。
+
+启动尝试 18：v17 计划
+- 2026-06-28 13:06 CST，新 worker `974727` 可用。
+- worker 健康检查：
+  - `NO_COLOR=1 TERM=dumb mlx worker list` 只显示一个 worker：`974727`，8x NVIDIA-B200。
+  - launch 成功后自动 login 到同一 worker；没有再 launch 第二个 worker。
+  - `hostname=trial-301417900-trialrun-301417900-worker-0`。
+  - `/proc/self` 与 `/proc/meminfo` 均存在，`ls /proc` 非空。
+  - `nvidia-smi --query-gpu` 显示 GPU 0-7 均为 NVIDIA B200，显存占用 0 MiB，利用率 0%。
+- 目的：
+  - v14 `floor=0.15,power=1.5` 是当前最好。
+  - v15 `floor=0.10` 明显回退，v16 `floor=0.20` 也低于 v14，说明 floor 不宜继续调。
+  - v17 固定 v14 的 `floor=0.15` 与 `clip=0.5`，只增强幂次压缩到 `power=2.0`，测试更强低置信容量压缩是否优于 v14。
+- 设计：
+  - 使用 8 卡、50 step、`trainer.val_before_train=False`、`trainer.test_freq=50`。
+  - 使用本地模型 copy `/tmp/qwen3_4b_local_v17`。
+  - 保持 v14 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_weight_power=2.0`
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power20_refbase_localfp32_8_50step_v17.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_v17_brief_worker.sh`
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185-step 实验。
+  - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
+  - 若低于 v14，不做 commit。
