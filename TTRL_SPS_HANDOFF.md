@@ -2350,6 +2350,91 @@ Worker 使用规则更新
   - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
   - 若低于 v14，不做 commit。
 
+追加记录：2026-06-29 新模型权重准备状态
+- 当前 active goal：
+  - 将 best-v14 SPS-TTRL 方案迁移到 `Qwen2.5-Math-7B` 与 `Qwen3-8B`。
+  - 先分别跑 184-step final-only validation，不测 base model val。
+  - 后续基于 SPS 实验现象与 PowerFlow 的 reward-reweighted reference distribution / distribution matching 思路，优化具有分布锐化解释的无监督内部反馈算法，使 `Qwen3-8B` 在 50-step final-only 后 Math500 `val-core/MATH-TTT/acc/mean@4 >= 0.90`。
+  - 新模型权重只放 `/opt/tiger`，不要写入 HDFS；GPU 实验只使用一个 8-GPU worker，不同时使用两个 worker。
+- `/opt/tiger/qwen2.5_math_7b`：
+  - 用户确认本地已有，本轮用 `/opt/tiger/modelchef/.venv/bin/python` 做离线 `AutoConfig` / `AutoTokenizer` 校验通过。
+  - `model_type=qwen2`，`architectures=['Qwen2ForCausalLM']`，`hidden_size=3584`，`num_hidden_layers=28`，`num_attention_heads=28`，`max_position_embeddings=4096`。
+  - tokenizer 为 `Qwen2TokenizerFast`，`len(tokenizer)=151665`，`eos_token_id=151643`，`pad_token_id=151643`。
+- `/opt/tiger/qwen3_8b`：
+  - 通过 ModelScope 下载到本地 `/opt/tiger/qwen3_8b`，不写 HDFS。
+  - `/opt/tiger` 当前磁盘较紧：`/dev/vdh` 125G，已用 118G，可用约 7.3G，使用率 95%。后续不要在系统盘继续放大文件；训练 wrapper 会复制模型到 `/tmp` 后运行。
+  - 五个 shard 尺寸校验通过：
+    - `model-00001-of-00005.safetensors`：3996250744
+    - `model-00002-of-00005.safetensors`：3993160032
+    - `model-00003-of-00005.safetensors`：3959604768
+    - `model-00004-of-00005.safetensors`：3187841392
+    - `model-00005-of-00005.safetensors`：1244659840
+  - `model.safetensors.index.json` 只引用上述五个 shard，`metadata.total_size=16381470720`，无缺失引用。
+  - `safetensors.safe_open(..., framework='pt', device='cpu')` 可逐个打开五个 shard。
+  - `/opt/tiger/modelchef/.venv/bin/python` 离线 `AutoConfig` / `AutoTokenizer` 校验通过。
+  - `model_type=qwen3`，`architectures=['Qwen3ForCausalLM']`，`hidden_size=4096`，`num_hidden_layers=36`，`num_attention_heads=32`，`max_position_embeddings=40960`。
+  - tokenizer 为 `Qwen2TokenizerFast`，`len(tokenizer)=151669`，`eos_token_id=151645`，`pad_token_id=151643`。
+- 下一步：
+  - 新增两个 best-v14 迁移 wrapper，分别指向 `/opt/tiger/qwen2.5_math_7b` 与 `/opt/tiger/qwen3_8b`，在 worker 上复制到 `/tmp` 后启动 184-step final-only 实验。
+  - 申请或复用单个 8GPU worker 前先检查当前 worker 列表；若 `/proc` 空、`/proc/self` 或 `/proc/meminfo` 缺失，按规则 kill 坏 worker 后再 launch，不能同时保留两个 worker。
+
+追加记录：新 goal，扩展到 Qwen2.5-Math-7B 与 Qwen3-8B
+- 目标：
+  - 将当前最佳 SPS-TTRL v14 方案扩展到 `Qwen2.5-Math-7B` 与 `Qwen3-8B`。
+  - 先准备模型权重，再申请单个 8xGPU worker；不同时使用两个 worker。
+  - 不测试 base model val。
+  - 先用 v14 方案分别跑两个新模型的 184-step final-only 训练并在 step 184 做 Math500 validation。
+  - 后续继续优化算法，使 `Qwen3-8B` 在 50-step final-only 训练后 Math500 `val-core/MATH-TTT/acc/mean@4 >= 0.90`。
+  - 新算法需要明确体现“基于 SPS 实验现象启发”，不是凭空猜测；所有实验改动写入本文档，有提升结果保存 local git commit。
+- 当前可用权重（2026-06-29 已刷新，详见上一节“新模型权重准备状态”）：
+  - `Qwen2.5-Math-7B` 已存在：
+    - `/mnt/hdfs/models/qwen2.5_math_7b`
+    - `/opt/tiger/qwen2.5_math_7b`
+  - 已用当前 venv 校验：
+    - `model_type=qwen2`
+    - `architectures=['Qwen2ForCausalLM']`
+    - `hidden_size=3584`
+    - `num_hidden_layers=28`
+    - tokenizer vocab size `151665`
+  - `Qwen3-8B` 已下载并校验到 `/opt/tiger/qwen3_8b`；按用户最新要求，未写入 HDFS。
+  - 当前磁盘：
+    - `/opt/tiger` 可用约 7.3G，系统盘很紧，后续不要继续在 `/opt/tiger` 放大文件。
+    - `/tmp` 可用约 425G；新 wrapper 在 worker 上将模型复制到 `/tmp` 后训练。
+    - 本目标不把新权重写入 HDFS。
+- 现有 v14 方案：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - `ttrl.sps_base_logprob_source=ref`
+  - actor fp32，local model copy，8 GPU。
+  - 训练反馈仍为内部无监督信号；真实答案只用于训练诊断和 final validation。
+- PowerFlow 参考方向：
+  - `/opt/tiger/PowerFlow/POWERFLOW_TRAINING_EXPLAINED.md` 中 PowerFlow 将训练理解为匹配 `reward-reweighted reference distribution`。
+  - 关键形式：`delta = log_z + avg_log_prob_current - beta * adjusted_ref_reward_term`，其中 `beta` 控制 reward/reference 项强度，`log_z` 估计归一化项。
+  - 对 SPS-TTRL 后续优化的启发：把当前 v14 的 prompt-level confidence capacity 进一步扩展为“分布锐化”机制：在同一 prompt 的 answer/rollout 分布上，用 SPS agreement、majority confidence、ref-vs-rollout logprob 构造 sharper target 或 sharper prompt/sample weights；显式记录 `beta/power/temperature/log_z-like normalizer` 的对应含义。
+- 下一步：
+  - 使用新增 wrapper 依次运行 `Qwen2.5-Math-7B` 和 `Qwen3-8B` 的 v14 184-step final-only 实验。
+  - 申请或复用单个 8xGPU worker 前先检查 worker 列表和 `/proc` 健康状态；不能同时保留两个 worker。
+
+追加记录：2026-06-29 worker 975077 状态
+- 申请前 `NO_COLOR=1 TERM=dumb mlx worker list` 为空，没有存量 worker。
+- 使用用户指定命令申请单个 worker：
+  - `NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`
+- 新 worker：
+  - id：`975077`
+  - hostname：`trial-301426002-trialrun-301426002-worker-0`
+  - GPU：8x NVIDIA B200，`nvidia-smi -L` 显示 GPU 0-7 均可见。
+  - `/proc` 健康：`/proc/self` 与 `/proc/meminfo` 存在，`find /proc -maxdepth 1 | wc -l = 71`，不是空 `/proc`。
+  - 磁盘：`/opt/tiger` 仍为 125G/118G/7.3G/95%；worker 本地 `/tmp` 为 3.5T，已用 426G，可用 2.9T。
+  - 两套模型在 worker 内用 `/opt/tiger/modelchef/.venv/bin/python` 离线 `AutoConfig` / `AutoTokenizer` 校验通过。
+- 已新增 184-step best-v14 迁移 wrapper：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen25_math_7b_8_184step_v14.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_184step_v14.sh`
+- 下一步运行顺序：
+  - 先跑 `Qwen2.5-Math-7B` 184-step v14 final-only。
+  - 再跑 `Qwen3-8B` 184-step v14 final-only。
+
 追加记录：best-v14 185-step rerun 监控
 - 2026-06-28 19:39 CST，fixed best-v14 185-step rerun 仍在 worker `974803` 上健康运行。
 - worker 与运行完整性：
