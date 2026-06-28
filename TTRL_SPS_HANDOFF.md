@@ -1505,3 +1505,717 @@ step 1：
   - v11 超过当前最好 v4 `mean@4=0.829476861167002`，绝对提升 `+0.0075452716297787`，约 `+0.75` 个点，因此按实验规则保存本地 improvement commit。
   - 降低 prompt-level capacity floor 到 `0.15` 是目前最有效的新增改动；它保留低置信 prompt 的少量信号，同时把训练容量更明显地让给高内部一致性、低截断 prompt。
   - `best@4=0.8826277665995976` 已显著高于 0.85，`maj@4=0.8413963782696177` 接近目标，下一步更应围绕无监督内部信号改善 4 样本聚合/主样本质量，而不是继续只调 final decoding。
+
+### 9.15 当前环境阻塞：procfs 损坏，暂不能安全启动 v12
+
+v11 完成后环境状态：
+- `nvidia-smi -L` 仍能列出 8 张 B200，GPU 0-7 均空闲。
+- `/proc` 为空目录：
+  - `/proc/self` 不存在。
+  - `/proc/meminfo` 不存在。
+  - `/proc/cpuinfo` 不存在。
+- 直接健康检查：
+  - `psutil.pids()` 报 `IndexError: list index out of range`。
+  - `torch.cuda.is_available()` 报 CUDA `Error 304: OS call failed or operation not supported on this OS` 并返回 `False`。
+  - `torch.cuda.device_count()` 仍返回 `8`，说明设备节点存在，但 CUDA 初始化依赖 procfs，训练不可用。
+- 修复尝试：
+  - `sudo mount -t proc proc /proc` 失败：`permission denied`。
+  - `capsh --print` 显示 bounding set 缺少 `CAP_SYS_ADMIN`，容器内无法自行 mount procfs。
+  - `/host/proc` 不存在，`/remote_rootfs/proc` 也是空目录，没有可 bind 的备用 procfs。
+- Worker 状态：
+  - `NO_COLOR=1 TERM=dumb mlx worker list` 只看到当前 worker `974351`，8x `NVIDIA-B200`。
+  - `mlx worker quota` 没有新的 8x B200 可直接替换；可见公共 GPU 资源不是本实验要求的 8x B200。
+- 结论：
+  - 当前 8 卡硬件空闲，但容器基础 procfs 损坏，Ray/psutil/torch CUDA 均不可靠。
+  - 在 procfs 恢复或切换到健康 8x B200 worker 前，不应启动 v12 训练，否则大概率在 Ray 初始化或 CUDA 初始化阶段失败。
+  - 后续所有实验仍按用户最新要求使用 8 卡；恢复后优先继续 50 step、无中途 validation、final-only validation 的 SPS-TTRL 实验。
+
+### 9.16 待启动实验 v12：低 floor + 非线性容量压缩，8 卡
+
+设计：
+- 背景：
+  - v11 已证明降低 `sps_weight_floor` 到 `0.15` 可以提升 `mean@4` 到 `0.8370221327967807`。
+  - v11 的 `best@4=0.8826277665995976`，说明候选样本容量足够；主要瓶颈仍是平均样本质量与 majority 聚合质量。
+- 算法变化：
+  - 新增 `ttrl.sps_weight_power`，仅作用于 `answer_rule_conf_weight` / `answer_conf_weight` 的 prompt-level train weight。
+  - 公式从 v11 的：
+    - `prompt_weight = max(majority_ratio, agreement_confidence) * clip_penalty_factor`
+  - 变为：
+    - `prompt_weight = clip(prompt_weight, 0, 1) ** sps_weight_power`
+    - 再套 `max(sps_weight_floor, prompt_weight)`。
+  - v12 计划使用 `ttrl.sps_weight_power=1.5`、`sps_weight_floor=0.15`、`sps_clip_penalty=0.5`。
+- 直觉：
+  - 对低中置信 prompt 进一步降权，对高置信 prompt 影响较小。
+  - 仍保留 floor，避免退化成 v3/v8 那样的 hard filter / hard selection。
+  - 训练 reward 仍是 majority pseudo-label 的 rule-based 0/1 reward，不使用真实 answer。
+  - 反馈信号仍来自模型内部 rollout answer majority、SPS-majority agreement confidence、rollout clip ratio。
+- 运行约束：8 卡、50 step、`val_before_train=False`、`test_freq=50`、无中途 validation。
+
+代码/脚本改动：
+- `verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增默认 `ttrl.sps_weight_power=1.0`。
+- `verl/verl/trainer/ppo/ttrl_utils.py`
+  - `apply_sps_weighted_ttrl_gt` 新增 `weight_power` 参数。
+  - confidence weight 分支在 clip penalty 后应用 `prompt_weight ** weight_power`。
+- `verl/verl/trainer/ppo/ray_trainer.py`
+  - 从 config 读取并传入 `ttrl.sps_weight_power`。
+- 新增 `examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_8_50step.sh`
+  - 复用 v11 主脚本。
+  - 覆盖：
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.sps_weight_power=1.5`
+  - 使用：
+    - `RAY_TMPDIR=/tmp/ray_v12`
+    - `MASTER_PORT=29571`
+    - `TORCHINDUCTOR_CACHE_DIR=/tmp/ti_v12`
+  - 日志与指标：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_50step.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_metrics.txt`
+
+静态检查：
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_8_50step.sh` 通过。
+- `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 通过。
+
+当前状态：
+- 因 9.15 的 procfs/CUDA/Ray 环境损坏，v12 尚未启动。
+- 恢复条件：
+  - `/proc/self`、`/proc/meminfo` 存在。
+  - `psutil.pids()` 正常。
+  - `torch.cuda.is_available()` 正常返回 `True`。
+  - `nvidia-smi` 显示 GPU 0-7 空闲。
+
+启动尝试 1：
+- 2026-06-28 05:46 CST 尝试通过 `mlx worker launch` 新建 8x B200 worker 执行 v12：
+  - `--resourcetype arnold`
+  - `--usergroup mlsys_inference`
+  - `--cluster cloudnative-useast1b`
+  - `--queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee`
+  - `--gpu 8 --type NVIDIA-B200 --cpu 248 --memory 3800`
+  - `--workdir /opt/tiger/TTRL/verl`
+  - `--alias sps-v12-power15`
+  - command: `bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_8_50step.sh`
+- 结果：
+  - worker `974518` 一度创建并显示 `running`。
+  - `mlx worker launch` 后续自动进入 `Login Worker...` 阶段失败：
+    - `failed to get status OK response (status code: 403)`
+    - `exec command: 0`
+  - 随后 `mlx worker list --show-all` 显示 worker `974518` 已 `deleted`。
+  - 本地未出现 v12 日志或 metrics 文件，不能视为 v12 已启动。
+
+启动尝试 2：
+- 2026-06-28 05:48 CST 再次通过 `mlx worker launch --no-input --logdir /opt/tiger/TTRL/verl/worker_launch_logs` 新建 8x B200 worker 执行 v12。
+  - worker `974520` 创建成功并保持 `running`。
+  - host: `trial-301411711-trialrun-301411711-worker-0`
+  - `/proc/self`、`/proc/meminfo` 存在，`nvidia-smi -L` 正常列出 8 张 B200。
+  - Ray session: `/tmp/ray_v12/ray/session_2026-06-28_05-51-09_401028_155`
+  - 主日志：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_50step.log`
+    - `/opt/tiger/TTRL/verl/worker_launch_logs/version_0/worker_0.stdout`
+- 现象：
+  - PPO 主进程 PID `155` 仍存活。
+  - 主日志停在 `Started a local Ray instance`，没有出现 `TaskRunner hostname`、`Training from scratch` 或 `training/global_step`。
+  - GPU 0-7 长时间保持 `utilization=0`、`memory.used≈2208MiB`。
+  - Ray worker 日志中可见 `WorkerDict` rank 开始加载 Qwen3-4B checkpoint，部分 rank 输出 `Gloo Rank ... connected to 7 peer ranks`，但没有进入训练循环。
+  - 未产生 `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_metrics.txt`。
+- 结论：
+  - v12 尝试 2 判定为 Ray/WorkerGroup 初始化阶段卡死，不能作为算法结果。
+  - 下一步不改变 v12 的无监督训练反馈算法，只启动 v12b 修复运行环境隔离：
+    - 使用新的 `RAY_TMPDIR`、`MASTER_PORT`、`TORCHINDUCTOR_CACHE_DIR`。
+    - 清理卡住的 v12 Ray/PPO 进程。
+    - 避免复用已卡死 Ray session。
+  - v12b 仍必须满足：8 卡、50 step、`val_before_train=False`、`test_freq=50`、无中途 validation。
+
+启动尝试 3：v12b
+- 2026-06-28 06:04 CST 新建 8x B200 worker `974533`，host `trial-301411836-trialrun-301411836-worker-0`，执行 v12b。
+- v12b 算法参数与 v12 相同：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- v12b 只改变运行隔离：
+  - `RAY_TMPDIR=/tmp/ray_v12b`
+  - `MASTER_PORT=29572`
+  - `TORCHINDUCTOR_CACHE_DIR=/tmp/ti_v12b`
+  - 日志：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_50step_v12b.log`
+- 现象：
+  - Ray started 后，TaskRunner 在 Ray worker 日志中正常出现。
+  - 数据集加载、filter、config validation 均通过。
+  - 8 个 `WorkerDict` rank 均创建，Qwen3-4B checkpoint 加载完成，Gloo rank 互联成功。
+  - GPU 0-7 约 `2208MiB` 占用，utilization 仍为 0。
+  - TaskRunner 日志停在：
+    - `Waiting for register center actor HQ9kYa_register_center to be ready. Elapsed time: 0 seconds out of 300 seconds.`
+  - rank0 日志显示 `WorkerGroupRegisterCenter` actor 文件存在，但控制端仍未越过等待。
+- 结论：
+  - v12b 未进入训练 step，不是算法结果。
+  - 卡点从 v12 的“主日志看不到 TaskRunner”推进到“TaskRunner/WorkerDict 已起，但控制端等待 register center”。
+  - 根因指向当前 Ray 环境下 `list_named_actors()` 对命名 actor 可见性/刷新不稳定；worker 端可以通过 `ray.get_actor(register_center_name)` 找到 register center。
+- 代码兼容性修复：
+  - `verl/single_controller/ray/base.py`
+  - 等待 register center 时改为直接轮询 `ray.get_actor(actor_name)`，捕获 `ValueError` 后 sleep。
+  - 不再先依赖 `actor_name in list_named_actors()`。
+  - 静态检查通过：
+    - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/single_controller/ray/base.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+- 下一步：
+  - 在同一台 `974533` 上启动 v12c。
+  - v12c 算法参数不变，仅带上 register center 兼容性修复，并用独立日志/Ray tmp：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_50step_v12c.log`
+    - `/tmp/ray_v12c`
+    - `MASTER_PORT=29573`
+
+启动尝试 4：v12c
+- 2026-06-28 06:17 CST 新建 8x B200 worker `974537`，host `trial-301411966-trialrun-301411966-worker-0`，执行 v12c。
+- v12c 算法参数与 v12/v12b 相同：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- v12c 只带上运行兼容性修复：
+  - `verl/single_controller/ray/base.py` 中等待 register center 时直接 `ray.get_actor(actor_name)`，不再先依赖 `list_named_actors()`。
+  - `RAY_TMPDIR=/tmp/ray_v12c`
+  - `MASTER_PORT=29573`
+  - `TORCHINDUCTOR_CACHE_DIR=/tmp/ti_v12c`
+- 诊断结果：
+  - 主日志仍停在 Ray started：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_8_50step_v12c.log`
+  - TaskRunner Ray 日志显示数据加载、filter、config validation 均通过，`Total training steps: 50` 正常打印。
+  - 窄诊断确认 register center 实际已经创建：
+    - `ZN0mUc_register_center` namespace 为 `e05671ac-e549-41be-9758-bd7bab4df9a5`
+    - 8 个 `ZN0mUcWorkerDict_0:{0..7}` 均在同 namespace。
+    - register center core-worker 日志显示 `get_rank_zero_info` 与 8 次 `set_worker_info` 均执行过。
+  - 8 个 WorkerDict rank 均开始执行 `WorkerDict.ref_init_model`，加载 Qwen3-4B checkpoint shards，并输出 `Gloo Rank ... connected to 7 peer ranks`。
+  - 卡点转移到 FSDP/NCCL 初始化附近：
+    - rank0 输出到 `Qwen3ForCausalLM contains 4.02B parameters`、`wrap_policy: ...`、`NCCL version 2.27.6+cuda12.9` 后不再推进。
+    - 8 个 `ray::WorkerDict` 进程均为 `D (disk sleep)`。
+    - GPU 0-7 长时间保持 `utilization=0`、`memory.used≈2208MiB`。
+  - 没有出现 `Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v12c 没有进入训练 step，不是算法结果。
+  - v12c 修复了“register center 不可见”的判断误区；真实剩余问题是 `ref_init_model` 里的分布式/FSDP/NCCL 初始化挂住。
+  - 该失败不触发 improvement commit。
+
+启动尝试 5：v12d 计划
+- 目的：不改变无监督 reward/训练算法，仅修正 v12b/v12c 启动环境。
+- 发现：v12b wrapper 里 `unset NCCL_SOCKET_FAMILY` 没有真正生效，因为底层 `run_sps_rule_conf_weight_math_qwen3_4b_50step_8gpu.sh` 会再次固定导出 `NCCL_SOCKET_FAMILY=AF_INET6`。
+- 代码修正：
+  - `run_sps_rule_conf_weight_math_qwen3_4b_50step_8gpu.sh` 增加 `TTRL_UNSET_NCCL_SOCKET_FAMILY=1` 开关。
+  - 默认行为保持旧逻辑；只有 v12d wrapper 显式设置该开关时才 `unset NCCL_SOCKET_FAMILY`。
+- 新增 v12d wrapper：
+  - `verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_8_50step_v12d.sh`
+  - `RAY_TMPDIR=/tmp/ray_v12d`
+  - `MASTER_PORT=29574`
+  - `TORCHINDUCTOR_CACHE_DIR=/tmp/ti_v12d`
+  - `TTRL_UNSET_NCCL_SOCKET_FAMILY=1`
+  - 算法参数仍为 `floor=0.15`、`clip=0.5`、`weight_power=1.5`。
+- 静态检查：
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/run_sps_rule_conf_weight_math_qwen3_4b_50step_8gpu.sh /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_8_50step_v12d.sh /opt/tiger/TTRL/verl/examples/ttrl/diagnose_v12c_narrow_worker.sh /opt/tiger/TTRL/verl/examples/ttrl/diagnose_v12c_stacks_worker.sh` 通过。
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/single_controller/ray/base.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 通过。
+
+启动尝试 5：v12d 结果
+- 2026-06-28 06:29 CST 新建 8x B200 worker `974538`，host `trial-301412035-trialrun-301412035-worker-0`，执行 v12d。
+- v12d 算法参数仍与 v12/v12b/v12c 相同：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 运行差异：
+  - `TTRL_UNSET_NCCL_SOCKET_FAMILY=1` 生效，底层脚本不再强制 `NCCL_SOCKET_FAMILY=AF_INET6`。
+  - `RAY_TMPDIR=/tmp/ray_v12d`
+  - `MASTER_PORT=29574`
+  - `TORCHINDUCTOR_CACHE_DIR=/tmp/ti_v12d`
+- 诊断结果：
+  - TaskRunner 数据加载、filter、config validation 均通过，`Total training steps: 50` 正常打印。
+  - 8 个 WorkerDict rank 均加载 Qwen3-4B checkpoint shards，Gloo rank 互联成功。
+  - rank0 仍停在 `Qwen3ForCausalLM contains 4.02B parameters`、`wrap_policy: ...`、`NCCL version 2.27.6+cuda12.9` 附近。
+  - GPU 0-7 长时间保持 `utilization=0`、`memory.used≈2208MiB`。
+  - 没有出现 `Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v12d 没有进入训练 step，不是算法结果。
+  - 单独取消 `NCCL_SOCKET_FAMILY=AF_INET6` 不能解决新建 worker 上的 FSDP/NCCL 初始化卡点。
+  - worker `974538` 已删除，未触发 improvement commit。
+
+启动尝试 6：v12e 结果
+- 2026-06-28 06:35 CST 新建 8x B200 worker `974539`，host `trial-301412063-trialrun-301412063-worker-0`，执行 v12e。
+- v12e 算法参数仍与 v12 系列相同：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 运行差异：
+  - `TTRL_UNSET_NCCL_SOCKET_FAMILY=1`
+  - `actor_rollout_ref.actor.fsdp_config.sync_module_states=False`
+  - `actor_rollout_ref.ref.fsdp_config.sync_module_states=False`
+  - `RAY_TMPDIR=/tmp/ray_v12e`
+  - `MASTER_PORT=29575`
+  - `TORCHINDUCTOR_CACHE_DIR=/tmp/ti_v12e`
+- 诊断结果：
+  - TaskRunner 数据加载、filter、config validation 均通过，`Total training steps: 50` 正常打印。
+  - 8 个 WorkerDict rank 均启动，Gloo rank 互联成功，checkpoint shards 加载完成。
+  - rank0 输出到 `Qwen3ForCausalLM contains 4.02B parameters` 与 `wrap_policy: ...` 后不再推进；本次可见 tail 中尚未出现 v12d 的 `NCCL version` 行。
+  - GPU 0-7 长时间保持 `utilization=0`、`memory.used≈1054MiB`。
+  - 没有出现 `After actor FSDP init`、`Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v12e 没有进入训练 step，不是算法结果。
+  - 关闭 FSDP `sync_module_states` 未解决初始化卡点，只改变了卡住时的显存占用/日志位置。
+  - worker `974539` 已于 2026-06-28 06:42 CST 删除，未触发 improvement commit。
+
+当前运行侧结论：
+- 本机原 worker `974351` 仍有 procfs/CUDA 损坏：
+  - `/proc/self` 与 `/proc/meminfo` 不存在。
+  - `psutil.pids()` 报 `IndexError: list index out of range`。
+  - 因此不能直接复用 v11 成功时的本机路径启动新实验。
+- 新建 8x B200 worker 的 `/proc` 健康，但 v12b-v12e 均卡在 Ray WorkerDict 的 FSDP/NCCL 初始化阶段，未进入训练。
+- v12 的 `sps_weight_power=1.5` 算法改动尚未获得有效训练结果；当前最好仍是已提交的 v11：
+  - `val-core/MATH-TTT/acc/mean@4=0.8370221327967807`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8826277665995976`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.8413963782696177`
+
+下一步 v12f 计划：
+- 优先恢复 8 卡训练可运行性，不再叠加新的 reward 公式改动。
+- 保持 v12 的无监督内部反馈算法参数不变，仅改运行通信环境：
+  - 尝试让单机 Ray/FSDP/Gloo/NCCL 通信全部走 loopback：
+    - `GLOO_SOCKET_IFNAME=lo`
+    - `NCCL_SOCKET_IFNAME=lo`
+    - `TP_SOCKET_IFNAME=lo`
+    - `MY_HOST_IP=127.0.0.1`
+    - `MASTER_ADDR=127.0.0.1`
+  - 保持 `NCCL_IB_DISABLE=1`，避免新 worker 上 eth0/IPv6/IB 组合造成 FSDP init 卡死。
+- 若 v12f 仍不进入训练，则下一步应退回到 v11 算法做 8 卡健康复现实验，区分“v12 代码改动导致的初始化问题”和“新建 worker 资源环境普遍问题”。
+
+启动尝试 7：v12f 结果
+- 2026-06-28 06:44 CST 新建 8x B200 worker `974548`，host `trial-301412098-trialrun-301412098-worker-0`，执行 v12f。
+- v12f 算法参数仍与 v12 系列相同：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.5`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 运行差异：
+  - 底层 `run_sps_rule_conf_weight_math_qwen3_4b_50step_8gpu.sh` 改为允许 wrapper 覆盖通信环境：
+    - `MY_HOST_IP=${MY_HOST_IP:-127.0.0.1}`
+    - `MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}`
+    - `GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}`
+    - `NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}`
+    - `TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-eth0}`
+  - v12f wrapper 显式设置：
+    - `GLOO_SOCKET_IFNAME=lo`
+    - `NCCL_SOCKET_IFNAME=lo`
+    - `TP_SOCKET_IFNAME=lo`
+    - `MASTER_ADDR=127.0.0.1`
+    - `MY_HOST_IP=127.0.0.1`
+    - `TTRL_UNSET_NCCL_SOCKET_FAMILY=1`
+    - `RAY_TMPDIR=/tmp/ray_v12f`
+    - `MASTER_PORT=29576`
+- 诊断结果：
+  - 远端 worker `/proc` 健康，8 张 B200 正常可见。
+  - Ray local instance 启动，TaskRunner 创建成功，数据加载和 config validation 通过，`Total training steps: 50` 正常打印。
+  - 8 个 `WorkerDict` rank 均创建并进入 `WorkerDict.ref_init_model`。
+  - Gloo rank 互联成功，checkpoint shards 加载完成；GPU 0-7 显存升到 `memory.used≈2208MiB`。
+  - 随后所有/大多数 `ray::WorkerDict.ref_init_model` 进程进入 `D` 状态，GPU utilization 长时间为 0。
+  - 没有出现 `After actor FSDP init`、`Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v12f 没有进入训练 step，不是算法结果。
+  - 单机 loopback 通信也不能解决新建 worker 上的 FSDP/NCCL 初始化卡点。
+  - worker `974548` 已于 2026-06-28 06:49 CST 删除，未触发 improvement commit。
+
+当前决策：
+- v12b-v12f 都卡在同一类 FSDP/NCCL 初始化位置，继续叠加 reward/采样算法没有意义。
+- v12 的 `sps_weight_power=1.5` 仍未被验证；当前有效最好结果仍是 v11 `mean@4=0.8370221327967807`。
+- 下一步先做可运行性隔离：
+  1. 用当前代码启动 v11 算法复现实验（不带 `sps_weight_power` override），确认新建 8x B200 worker 是否能跑通已知成功配置。
+  2. 如果 v11 复现也卡在 FSDP init，说明问题主要是新建 worker 运行环境/平台栈，优先改资源或 FSDP 初始化路径。
+  3. 如果 v11 复现能跑通，再回到 v12 算法，说明 v12 代码/配置改动影响初始化，需要缩小 diff。
+
+约束更新：全部实验改为 8 卡
+- 2026-06-28 用户更新：后续所有实验都用 8 卡，不再做 4 卡实验。
+- 本地当前 8 张 B200 可见且空闲，但当前容器 `/proc` 仍损坏：
+  - `/proc/self` 与 `/proc/meminfo` 缺失。
+  - `ps` 报 `Error, do this: mount -t proc proc /proc`。
+  - 因此本地直接跑 Ray/psutil/verl 训练风险很高，继续优先使用新建健康 8x B200 worker。
+
+启动尝试 8：v11-repro / v11-repro2 结果
+- 目的：用已知最好 v11 算法参数复现，区分 v12 算法改动问题与新建 8x B200 worker 的运行环境问题。
+- v11 算法参数：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - 不设置 `ttrl.sps_weight_power` override。
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 第一次 worker `974550`：
+  - 启动后发现继承环境中 interface 变量带前导 `=`，例如 `NCCL_SOCKET_IFNAME==eth0`。
+  - 修复：底层 `run_sps_rule_conf_weight_math_qwen3_4b_50step_8gpu.sh` 增加 `${VAR#=}` 清理。
+  - 后续该尝试因 tokenizer 初始化 `vocab_file=None` 报 `TypeError: expected str, bytes or os.PathLike object, not NoneType`，不是有效算法结果。
+  - worker `974550` 已删除。
+- 第二次 worker `974553`：
+  - host `trial-301412149-trialrun-301412149-worker-0`，远端 `/proc` 健康，8 张 B200 正常可见。
+  - 通信环境显式设置为：
+    - `GLOO_SOCKET_IFNAME=eth0`
+    - `NCCL_SOCKET_IFNAME=eth0`
+    - `TP_SOCKET_IFNAME=eth0`
+    - `NCCL_SOCKET_FAMILY=AF_INET6`
+    - `MASTER_ADDR=127.0.0.1`
+    - `RAY_TMPDIR=/tmp/ray_v11_repro`
+  - 诊断结果：
+    - Ray local instance 启动，TaskRunner 创建成功。
+    - 8 个 `WorkerDict` actor 创建，并进入 `WorkerDict.ref_init_model`。
+    - Gloo rank 互联成功，checkpoint shards 加载完成。
+    - rank0 输出 `Qwen3ForCausalLM contains 4.02B parameters` 与 `NCCL version 2.27.6+cuda12.9`。
+    - 随后多个 `ray::WorkerDict.ref_init_model` 进程进入 `D` 状态，GPU 0-7 长时间 `utilization=0`、`memory.used≈2208MiB`。
+    - 没有出现 `Total training steps: 50` 之后的训练推进、`After actor FSDP init`、`Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v11-repro2 也未进入训练 step，不是算法结果。
+  - 当前卡点不是 v12 `sps_weight_power=1.5` 本身导致；更像新建 8x B200 worker 上 FSDP/ref init 的 NCCL/mesh 初始化问题。
+  - 当前有效最好结果仍是已提交 v11：`mean@4=0.8370221327967807`，未达到 0.85。
+  - 下一步先做 8 卡运行性修复实验：保持 v11 算法公式不变，仅将 actor/ref `fsdp_size=1`，让每张 B200 独立 FSDP shard group，验证是否能绕过全 8 卡 FSDP init 卡点。
+
+启动尝试 9：v13 配置失败
+- 2026-06-28 07:03 CST 新建 8x B200 worker `974554`，host `trial-301412248-trialrun-301412248-worker-0`。
+- 目的：保持 v11 算法公式不变，仅改运行层 `fsdp_size=1`，验证能否绕过全 8 卡 FSDP init 卡点。
+- 运行参数：
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `actor_rollout_ref.actor.fsdp_config.fsdp_size=1`
+  - `actor_rollout_ref.ref.fsdp_config.fsdp_size=1`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 结果：
+  - 远端 `/proc` 健康，8 张 B200 正常可见，训练命令开始执行。
+  - Hydra 在 compose config 阶段失败：
+    - `ConfigAttributeError: Key 'fsdp_size' is not in struct`
+    - `full_key: actor_rollout_ref.ref.fsdp_config.fsdp_size`
+    - 提示若要新增键需使用 `+actor_rollout_ref.ref.fsdp_config.fsdp_size=1`。
+  - 没有进入 Ray/FSDP 初始化，也没有训练 step 或 final validation。
+- 结论：
+  - v13 不是算法结果，失败原因是 wrapper 覆盖了不存在的 ref fsdp config 键。
+  - 代码中 `ActorRolloutRefWorker.__init__` 实际使用 `self.config.actor.fsdp_config.fsdp_size` 创建 device mesh；同一个 worker 承载 actor/ref 时，设置 actor 的 `fsdp_size` 即可影响该 worker mesh。
+  - 下一步 v13b：只保留 `actor_rollout_ref.actor.fsdp_config.fsdp_size=1`，不再覆盖 ref 下不存在的 `fsdp_size`。
+
+启动尝试 10：v13b 结果
+- 2026-06-28 07:06 CST 新建 8x B200 worker `974555`，host `trial-301412257-trialrun-301412257-worker-0`。
+- 目的：保持 v11 算法公式不变，只设置合法的 `actor_rollout_ref.actor.fsdp_config.fsdp_size=1`，继续验证 FSDP init 可运行性。
+- 运行参数：
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `actor_rollout_ref.actor.fsdp_config.fsdp_size=1`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 诊断结果：
+  - Hydra 配置通过，Ray local instance 启动。
+  - TaskRunner 创建并打印 `Total training steps: 50`。
+  - 8 个 `WorkerDict` rank 均进入 `WorkerDict.ref_init_model`。
+  - checkpoint/model 加载推进到 `Qwen3ForCausalLM contains 4.02B parameters` 与 `NCCL version 2.27.6+cuda12.9`。
+  - GPU 0-7 显存升到约 `2838MiB`，utilization 长时间为 0。
+  - 没有出现 `After actor FSDP init`、`Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v13b 不是算法结果，仍卡在独立 RefPolicy 的 FSDP/NCCL 初始化路径。
+  - `fsdp_size=1` 未解决新 worker 上的 `ref_init_model` 卡点。
+  - 下一步 v13c：减少独立 ref worker 初始化面。新增 `ttrl.sps_base_logprob_source` 开关，默认 `ref` 保持兼容；v13c 设置 `sps_base_logprob_source=actor` 并关闭 `actor.use_kl_loss`，不再创建独立 RefPolicy，用 actor 自身 logprob 作为无监督内部反馈信号。
+
+启动尝试 11：v13c 结果
+- 2026-06-28 07:14 CST 新建 8x B200 worker `974556`，host `trial-301412291-trialrun-301412291-worker-0`。
+- 目的：绕开独立 RefPolicy 的初始化卡点，用 actor 自身 logprob 作为 SPS 内部反馈的 base logprob。
+- 代码/配置改动：
+  - `verl/trainer/config/ppo_trainer_ttrl.yaml` 新增 `ttrl.sps_base_logprob_source`，默认 `ref` 保持兼容。
+  - `verl/trainer/ppo/ray_trainer.py` 的 SPS branch 支持：
+    - `ref`：历史路径，使用 `ref_policy_wg.compute_ref_log_prob(...)`。
+    - `actor`：使用 `actor_rollout_wg.compute_log_prob(...)`，将 `old_log_probs` 包装为 `ref_log_prob`。
+    - `rollout`：直接复用 `gen_batch_output.batch["rollout_log_probs"]`。
+  - v13c wrapper 设置：
+    - `ttrl.sps_base_logprob_source=actor`
+    - `actor_rollout_ref.actor.use_kl_loss=False`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_clip_penalty=0.5`
+    - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 诊断结果：
+  - Ray local instance 启动，TaskRunner 创建成功并打印 `Total training steps: 50`。
+  - `main_ppo.py` 没有创建独立 RefPolicy；8 个 `WorkerDict` 进入 `WorkerDict.actor_rollout_init_model`，说明去 RefPolicy 改动生效。
+  - 8 个 rank 均 Gloo 互联成功。
+  - 所有 rank 随后停在 actor HF 模型加载阶段，stderr 最后停在 `Loading checkpoint shards: 0%| | 0/3`；rank0 stdout 只打印到 `Model config after override: Qwen3Config ...`。
+  - 进程状态：8 个 `ray::WorkerDict.actor_rollout_init_model` 均为 `D` 状态。
+  - GPU 0-7 长时间 `utilization=0`、`memory.used≈626MiB`。
+  - 没有出现 `After init actor from HF AutoModel`、`After actor FSDP init`、`Before building vllm rollout`、`Training from scratch`、`training/global_step` 或 final validation metrics。
+- 结论：
+  - v13c 不是算法结果，仍未进入训练 step。
+  - 去掉独立 RefPolicy 是有效的运行面缩减，但新 worker 上 8 个 rank 并发从 `/mnt/hdfs/models/qwen3_4b` 加载 checkpoint shard 时卡在不可中断 IO。
+  - worker `974556` 已于 2026-06-28 07:21 CST kill/delete，8 卡释放。
+  - 下一步 v13d：保持 v13c 算法路径，先单进程将 `/mnt/hdfs/models/qwen3_4b` 复制到 worker 本地 `/tmp/qwen3_4b_local_v13d`，训练时使用本地模型路径，并设置 `actor_rollout_ref.actor.fsdp_config.model_dtype=bf16`，避免 actor 默认 fp32 加载。
+
+启动尝试 12：v13d 运行中
+- 2026-06-28 07:24 CST 新建 8x B200 worker `974561`，host `trial-301412358-trialrun-301412358-worker-0`。
+- 目的：保持 v13c 的 actor-base SPS 内部反馈算法路径，同时绕过 HDFS 并发模型加载卡点。
+- 启动差异：
+  - wrapper 先将 `/mnt/hdfs/models/qwen3_4b` 单进程复制到 worker 本地 `/tmp/qwen3_4b_local_v13d`。
+  - 本地模型复制完成时间：2026-06-28 07:26:29 CST。
+  - 本地目录大小 `7.6G`，文件列表与 HDFS mount 模型目录一致。
+  - 训练时覆盖 `actor_rollout_ref.model.path=/tmp/qwen3_4b_local_v13d`。
+  - 设置 `+actor_rollout_ref.actor.fsdp_config.model_dtype=bf16`，避免 actor 默认 fp32 加载。
+- 算法/训练参数：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.0`
+  - `ttrl.sps_base_logprob_source=actor`
+  - `actor_rollout_ref.actor.use_kl_loss=False`
+  - `ttrl.n_votes_per_prompt=64`
+  - `ttrl.n_samples_per_prompt=32`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 运行状态：
+  - Ray local instance 启动，config validation 通过，`Total training steps: 50` 正常打印。
+  - 8 个 `WorkerDict.actor_rollout_init_model` rank 均完成模型 shard 加载，进入 `actor_rollout_generate_sequences`。
+  - 2026-06-28 07:29 CST 首次确认 `Training from scratch` 与 `training/global_step:1.000`，说明 v13d 是新 8x B200 worker 上第一个进入完整训练循环的 actor-base 方案。
+  - 2026-06-28 07:40 CST 诊断显示训练推进到 `training/global_step:15.000`，GPU 0-7 显存约 `146G`，utilization 约 `10%-76%`；step 吞吐多数在 `1.75k-2.27k tokens/s`。
+  - step 7 出现一次 `actor/grad_norm:0.000`，后续 step 8-15 恢复非零，暂记录为诊断信号，不中断实验。
+  - 2026-06-28 08:08 CST 完成 50 step，并执行唯一一次 final validation；worker `974561` 正常退出 `status=0` 后自动删除，8 卡释放。
+- final validation 结果：
+  - `val-core/MATH-TTT/acc/mean@4=0.5508048289738431`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.6305553319919517`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.5542273641851108`
+  - `timing_s/testing=177.212`
+  - `training/global_step=50.000`
+- 结论：
+  - v13d 是有效完成的 8 卡、50 step、无中途 validation 实验，但不是提升结果。
+  - 相比当前最好 v11 `mean@4=0.8370221327967807` 明显退化，距离目标 `>=0.85` 更远，因此不做 local git commit。
+  - 运行层修复有效：本地模型 copy + actor bf16 + 去独立 RefPolicy 能让新 8x B200 worker 跑完整训练。
+  - 算法层结论是负向的：`sps_base_logprob_source=actor` 作为 base logprob 会把 SPS 内部反馈质量显著打低，不能作为下一步主线。
+- 下一步：
+  - 保留 v13d 的本地模型 copy 与 bf16 加载运行修复。
+  - 恢复到 `sps_base_logprob_source=ref` 或等价的稳定 base logprob；如果独立 RefPolicy 仍卡，需要优先设计“单次本地模型 + ref bf16/轻量 ref logprob”路径，而不是继续 actor-base。
+
+启动尝试 13：v13e 计划
+- 目的：验证 v13d 的运行层修复是否能支撑原 v11/ref-base SPS 质量路径，区分 v13d 退化是否由 `sps_base_logprob_source=actor` 导致。
+- 运行层沿用 v13d：
+  - 先将 `/mnt/hdfs/models/qwen3_4b` 复制到 worker 本地 `/tmp/qwen3_4b_local_v13e`。
+  - 训练时使用 `actor_rollout_ref.model.path=/tmp/qwen3_4b_local_v13e`。
+  - 设置 `+actor_rollout_ref.actor.fsdp_config.model_dtype=bf16`，降低 actor 初始化内存。
+- 算法路径恢复 ref-base：
+  - `ttrl.sps_base_logprob_source=ref`
+  - `actor_rollout_ref.actor.use_kl_loss=True`，确保创建独立 RefPolicy。
+  - ref worker 仍按现有代码默认 bf16 加载，理论上避免 actor fp32 初始化问题。
+- 训练参数：
+  - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+  - `ttrl.sps_weight_floor=0.15`
+  - `ttrl.sps_clip_penalty=0.5`
+  - `ttrl.sps_weight_power=1.0`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 静态检查：
+  - `bash -n worker_run_sps_rule_conf_weight_floor015_clip05_refbase_localbf16_8_50step_v13e.sh diagnose_v13e_worker.sh`
+  - `python -m py_compile ray_trainer.py fsdp_workers.py ttrl_utils.py`
+  - `git diff --check`
+- 判定：
+  - 若能跑通并恢复 v11 附近指标，actor-base 是 v13d 退化主因。
+  - 若仍卡在 `ref_init_model`，下一步需要改 ref logprob 的实现/调度，而不是继续调 reward 权重。
+
+启动尝试 13：v13e 运行进展
+- 用户约束更新：后续所有实验均使用 8 卡执行；不再做 4 卡新实验。
+- 2026-06-28 08:12 CST 新建 8x B200 worker `974571`，host `trial-301413035-trialrun-301413035-worker-0`。
+- 运行参数沿用 v13e 计划：
+  - 本地模型目录 `/tmp/qwen3_4b_local_v13e`，大小 `7.6G`。
+  - `ttrl.sps_base_logprob_source=ref`
+  - `actor_rollout_ref.actor.use_kl_loss=True`
+  - `+actor_rollout_ref.actor.fsdp_config.model_dtype=bf16`
+  - 8 卡，50 step，`val_before_train=False`，`test_freq=50`。
+- 2026-06-28 08:22 CST 诊断结果：
+  - 8 卡均在训练进程占用下。
+  - `Training from scratch` 与 `training/global_step:1.000` 已出现。
+  - step 1 日志包含 `timing_s/ref:3.460`，说明独立 RefPolicy/ref-base logprob 路径已经实际参与训练。
+- 2026-06-28 08:24 CST metrics tail：
+  - 最新训练进度 `training/global_step:5.000`。
+  - 8 卡仍在使用，主进程未退出。
+  - 尚未出现 `val-core/MATH-TTT/acc`，符合 `test_freq=50`、无中途 validation 的设置。
+- 当前判定：
+  - v13e 已经验证“本地模型 copy + bf16 + ref-base SPS”可进入训练循环，解决了此前新 worker 上 ref 初始化/模型加载卡点。
+  - 还不是算法结果；需要等待 step 50 final validation 后再判断是否提升或达标。
+
+启动尝试 13：v13e 最终结果
+- 2026-06-28 09:03 CST worker `974571` 正常退出并自动删除。
+- 运行完整性：
+  - 8 卡、50 step。
+  - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+  - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:50.000`。
+  - 没有中途 validation；唯一 validation 在 step 50 触发。
+  - `WORKER_V13E_EXIT status=0`。
+- step 50 训练诊断：
+  - `train/sps/reward_mode=6.000`
+  - `train/sps/effective_K=63.895`
+  - `train/sps/weighted_label_confidence=0.875`
+  - `train/sps/agreement_rate=0.875`
+  - `train/sps/train_weight=0.730`
+  - `train/label_accuracy=0.875`
+  - `train/reward_accuracy=0.730`
+  - `train/majority_voting_reward=0.605`
+  - `train/ground_truth_reward=0.645`
+  - `train/pass@32=0.750`
+  - `train/majority_ratio=0.660`
+  - `response_length/clip_ratio=0.418`
+  - `timing_s/ref=3.407`
+  - `timing_s/testing=177.826`
+- final validation 结果：
+  - `val-core/MATH-TTT/acc/mean@4=0.5417505030181087`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.642774647887324`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.5410543259557344`
+  - `training/global_step=50.000`
+- 结论：
+  - v13e 是有效完成的 8 卡、50 step、无中途 validation 实验，但不是提升结果。
+  - 相比当前最好 v11 `mean@4=0.8370221327967807` 明显退化，也低于目标 `>=0.85`，因此不做 local git commit，不标记 goal 完成。
+  - v13e 说明 ref-base 路径本身可以在新 worker 上跑通；但当前代码/运行层与 v11 成功路径存在强质量差异。
+  - v13e 和 v11 的明显诊断差异：
+    - v11 step 50 `train/ground_truth_reward=0.852`、`response_length/clip_ratio=0.191`。
+    - v13e step 50 `train/ground_truth_reward=0.645`、`response_length/clip_ratio=0.418`。
+    - v13e 的 final `mean@4` 只有约 `0.542`，接近 v13d actor-base 退化结果，说明问题不只是 `sps_base_logprob_source=actor`。
+- 下一步：
+  - 优先回到 v11 成功代码路径，只保留新 worker 必需的运行层修复做 8 卡复现实验。
+  - 重点排查当前 uncommitted 改动中会改变训练质量的部分，例如 `ttrl_utils.py`、`ray_trainer.py`、FSDP dtype/sync、以及本地模型/bf16 override。
+
+启动尝试 14：v13f 计划
+- 目的：隔离 v13e 的大幅退化是否由 actor bf16 训练导致。
+- 背景：
+  - v13e 相比 v11 的算法参数表面一致，且 `sps_base_logprob_source=ref`、`rollout.temperature=1.0`。
+  - 当前 `fsdp_workers.py` 注释说明 actor 默认应 fp32 创建，否则 optimizer 可能进入 bf16；v13e 为了跑通显式加了 `+actor_rollout_ref.actor.fsdp_config.model_dtype=bf16`。
+  - v13e step 50 的 `train/ground_truth_reward=0.645`、`response_length/clip_ratio=0.418` 明显劣于 v11 的 `0.852` 与 `0.191`，优先怀疑训练 dtype/运行层差异，而不是继续调算法权重。
+- v13f 设计：
+  - 使用 8 卡、50 step、`val_before_train=False`、`test_freq=50`。
+  - 仍将模型单进程复制到 worker 本地 `/tmp/qwen3_4b_local_v13f`，避免 HDFS 并发加载卡点。
+  - 使用 ref-base SPS：`ttrl.sps_base_logprob_source=ref`、`actor_rollout_ref.actor.use_kl_loss=True`。
+  - 恢复 actor 默认 fp32：不再覆盖 `actor_rollout_ref.actor.fsdp_config.model_dtype=bf16`。
+  - 保持 v11 算法参数：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.n_votes_per_prompt=64`
+    - `ttrl.n_samples_per_prompt=32`
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_refbase_localfp32_8_50step_v13f.sh`
+- 静态检查：
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_refbase_localfp32_8_50step_v13f.sh`
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile ray_trainer.py fsdp_workers.py ttrl_utils.py`
+  - `git diff --check`
+- 判定：
+  - 若 v13f 恢复到 v11 附近，v13e/v13d 的主要退化来自 actor bf16 或相关运行层差异。
+  - 若 v13f 仍在 0.54 附近，则需要继续回退当前代码 diff，优先检查 `ray_trainer.py`/`ttrl_utils.py` 与 v11 commit 的行为差异。
+
+Worker 使用规则更新
+- 用户明确规则：
+  - 如果 `ls /proc` 基本为空，或 `/proc/self`、`/proc/meminfo` 缺失，则该 worker 已不可用，不能继续在其中启动 Ray/训练。
+  - 不可以同时占用两个 worker。发现当前 worker 不可用时，先 `mlx worker kill <当前_worker_id>`，再 launch 新 worker。
+  - 不可以在 worker 内部 launch 新 worker；如果需要 launch，必须新开 master/非 worker 终端执行 launch。
+  - `mlx worker launch ... -- bash | tee ...` 成功后会自动 login 到新 worker，不需要再手动重复 login。
+  - 同一个 worker 可以开多个新终端执行 `mlx worker login <same_worker_id>` 做监控或诊断；这不违反“不能同时占用两个 worker”的规则。
+  - 推荐 launch 命令形态：
+    `mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`
+  - 进入 worker 后应保持同一个终端会话执行后续 GPU 操作；不要每条命令都重新 `mlx worker login`。
+- 2026-06-28 09:31 CST 验证新 worker `974593`：
+  - 使用 `NO_COLOR=1 TERM=dumb mlx worker login 974593` 打开交互 PTY。
+  - 同一终端内确认 `hostname=trial-301414101-trialrun-301414101-worker-0`，`ARNOLD_WORKER_ID=974593`。
+  - `/proc` 正常，`/proc/self` 与 `/proc/meminfo` 均存在。
+  - `nvidia-smi` 显示 GPU 0-7 为 NVIDIA B200，均空闲。
+- 纠正记录：
+  - 之前误以为当前环境不是 worker，额外 launch 了 `974592`；该 worker 已于 2026-06-28 09:11 CST kill/delete。
+  - 后续禁止同时保留两个 worker。
+
+启动尝试 14：v13f 最终结果
+- 2026-06-28 10:24 CST，v13f 在健康 worker `974593` 上完成并输出 final validation。
+- 运行完整性：
+  - 8 卡、50 step。
+  - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+  - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:50.000`。
+  - 没有中途 validation；唯一 validation 在 step 50 触发。
+  - worker 结束后 8 张 B200 均空闲。
+- step 50 训练诊断：
+  - `train/sps/reward_mode=6.000`
+  - `train/sps/effective_K=63.949`
+  - `train/sps/weighted_label_confidence=0.998`
+  - `train/sps/agreement_rate=1.000`
+  - `train/sps/train_weight=0.892`
+  - `train/label_accuracy=0.875`
+  - `train/reward_accuracy=0.648`
+  - `train/majority_voting_reward=0.811`
+  - `train/ground_truth_reward=0.848`
+  - `train/pass@32=0.875`
+  - `train/majority_ratio=0.852`
+  - `response_length/clip_ratio=0.223`
+  - `timing_s/ref=3.072`
+  - `timing_s/testing=165.733`
+- final validation 结果：
+  - `val-core/MATH-TTT/acc/mean@4=0.8249496981891348`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8710140845070423`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.8275714285714285`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.774`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.840`
+  - `training/global_step=50.000`
+- 对比 v11：
+  - v13f 的训练诊断已基本恢复到 v11 区间：v11 step 50 `train/ground_truth_reward=0.852`、`response_length/clip_ratio=0.191`；v13f step 50 为 `0.848`、`0.223`。
+  - 但 final `mean@4=0.8249496981891348` 低于当前最好 v11 `0.8370221327967807`，也低于目标 `>=0.85`。
+  - v13f 不是提升结果，不做 local git commit，不触发 185 step。
+- 当前判断：
+  - 恢复 actor fp32 能解决 v13e/v13d 的质量崩塌，但未复现 v11 最好指标。
+  - v13f 与 v11 的主要剩余差异是运行层：本地模型 copy、当前未提交的 ref/base logprob 与 FSDP 兼容改动、新 worker 平台栈随机性。
+  - 下一步应优先在当前健康 worker 上用“v11 行为 + 本地模型 copy 的最小必要运行修复”做复现实验；若复现稳定后，再验证 v12 的 `sps_weight_power=1.5` 非线性容量压缩。
+
+启动尝试 15：v14 计划
+- 目的：在 v13f 已恢复训练质量、且当前健康 worker 能完整跑 50 step 的基础上，验证 v12 尚未得到有效结果的非线性容量压缩方案。
+- 设计：
+  - 使用 8 卡、50 step、`val_before_train=False`、`test_freq=50`。
+  - 继续使用本地模型 copy `/tmp/qwen3_4b_local_v14`，避免 HDFS 并发加载卡点。
+  - 保持 v13f/v11 主干：
+    - `ttrl.sps_reward_mode=answer_rule_conf_weight`
+    - `ttrl.sps_weight_floor=0.15`
+    - `ttrl.sps_clip_penalty=0.5`
+    - `ttrl.sps_base_logprob_source=ref`
+    - actor 默认 fp32，不设置 `model_dtype=bf16`
+  - 唯一算法变化：
+    - `ttrl.sps_weight_power=1.5`
+    - 对已经裁剪到 `[0,1]` 的 prompt weight 做幂次压缩，进一步降低低 majority ratio / 低 SPS-majority agreement / 高 clip prompt 的更新容量。
+  - 训练反馈仍完全来自内部信号；真实答案只用于训练诊断和 final validation。
+- 新增脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_50step_v14.sh`
+  - `/opt/tiger/TTRL/verl/examples/ttrl/tail_v14_brief_worker.sh`
+- 判定：
+  - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185 step 实验。
+  - 若低于 v11/v13f，则说明当前非线性容量压缩不适合 50-step 短跑，不做 local git commit。
+
+启动尝试 15：v14 最终结果
+- 2026-06-28 10:29-11:15 CST，v14 在健康 worker `974593` 上完成。
+- 运行完整性：
+  - 8 卡、50 step。
+  - `trainer.val_before_train=False`，`trainer.test_freq=50`。
+  - 训练日志从 `training/global_step:1.000` 推进到 `training/global_step:50.000`。
+  - 没有中途 validation；唯一 validation 在 step 50 触发。
+  - `WORKER_V14_EXIT status=0`。
+  - 日志与快照：
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_50step_v14.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_v14_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_8_v14_metrics.txt`
+- step 50 训练诊断：
+  - `train/sps/reward_mode=6.000`
+  - `train/sps/effective_K=63.949`
+  - `train/sps/weighted_label_confidence=0.873`
+  - `train/sps/agreement_rate=0.875`
+  - `train/sps/train_weight=0.827`
+  - `train/label_accuracy=0.875`
+  - `train/reward_accuracy=0.766`
+  - `train/majority_voting_reward=0.817`
+  - `train/ground_truth_reward=0.859`
+  - `train/pass@32=0.875`
+  - `train/majority_ratio=0.863`
+  - `response_length/clip_ratio=0.188`
+  - `timing_s/ref=3.037`
+  - `timing_s/testing=164.854`
+  - `timing_s/step=211.029`（含 final validation；普通训练 step 约 46-54 秒）
+- final validation 结果：
+  - `val-core/MATH-TTT/acc/mean@4=0.8410462776659959`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8829195171026156`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.8428350100603622`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.7969617706237424`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.854`
+  - `training/global_step=50.000`
+- 对比与结论：
+  - v14 高于当前最好 v11 `mean@4=0.8370221327967807`，绝对提升 `+0.0040241448692152`，约 `+0.40` 个点。
+  - v14 也高于 v13f `mean@4=0.8249496981891348`，说明在恢复 actor fp32 后，`sps_weight_power=1.5` 的非线性容量压缩是有效的。
+  - v14 未达到目标 `mean@4 >= 0.85`，因此不触发 185 step，不标记 goal complete。
+  - 按“有提升的改动保存 git commit”规则，应保存本地 improvement commit。
+- 下一步：
+  - 当前瓶颈已从 `mean@4=0.837` 推到 `0.841`，`best@4=0.8829` 仍明显高于目标，`maj@4=0.8428` 更接近但未过 0.85。
+  - 更合理的下一轮是保持 v14 的 power=1.5 主干，进一步处理 final 4-sample 聚合质量，例如轻量提高高置信 prompt 的训练强度、或针对 answer-level agreement 做温和 majority calibration；不建议回到 actor-base 或 bf16 路径。

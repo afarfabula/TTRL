@@ -146,6 +146,7 @@ def apply_sps_weighted_ttrl_gt(
     filter_majority_ratio_threshold=0.75,
     weight_floor=0.25,
     clip_penalty=0.0,
+    weight_power=1.0,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -253,6 +254,9 @@ def apply_sps_weighted_ttrl_gt(
             prompt_weight = max(float(majority_ratio), float(agreement_confidence))
             if clip_penalty > 0:
                 prompt_weight *= max(0.0, 1.0 - float(clip_penalty) * prompt_clip_ratio)
+            power = max(float(weight_power), 1e-6)
+            if power != 1.0:
+                prompt_weight = max(0.0, min(1.0, prompt_weight)) ** power
             sps_train_weight_list.append(max(float(weight_floor), min(1.0, prompt_weight)))
         elif confidence_filter:
             keep_prompt = (

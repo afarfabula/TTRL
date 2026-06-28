@@ -1175,7 +1175,17 @@ class RayPPOTrainer:
                                 },
                                 meta_info={"ref_temperature_override": 1.0},
                             )
-                            if not self.ref_in_actor:
+                            sps_base_logprob_source = self.config.ttrl.get("sps_base_logprob_source", "ref")
+                            if sps_base_logprob_source == "actor":
+                                actor_lp = self.actor_rollout_wg.compute_log_prob(sps_score_batch)
+                                base_lp = DataProto.from_dict(
+                                    tensors={"ref_log_prob": actor_lp.batch["old_log_probs"]}
+                                )
+                            elif sps_base_logprob_source == "rollout":
+                                base_lp = DataProto.from_dict(
+                                    tensors={"ref_log_prob": gen_batch_output.batch["rollout_log_probs"]}
+                                )
+                            elif not self.ref_in_actor:
                                 base_lp = self.ref_policy_wg.compute_ref_log_prob(sps_score_batch)
                             else:
                                 base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
@@ -1214,6 +1224,7 @@ class RayPPOTrainer:
                                     filter_majority_ratio_threshold=self.config.ttrl.get("sps_filter_majority_ratio_threshold", 0.75),
                                     weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
                                     clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
+                                    weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
                                 )
                                 sps_reward_tensor, sps_info = compute_sps_reward(
                                     ref_log_prob=base_lp.batch["ref_log_prob"],
