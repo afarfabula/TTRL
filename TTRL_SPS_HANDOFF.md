@@ -4676,3 +4676,77 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - logprob/ref micro batch 从 `4` 提到 `8` 的收益已经很小；当前主要剩余瓶颈仍是 generation/rollout sharding manager 路径：`generate_sequences ~=23.34s`，`gen-generate_sequences ~=11.34s`，其次是 actor update `~9.43s`。
     - 运行结束后 worker `976650` 再次出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，log 中有 `Fail to open /proc/self/stat`。按规则不能继续用该 worker；需 kill 后重新申请唯一新 worker。
     - 下一轮优先换方向：固定 `logprob8_actor4`，尝试减少 generation/reshard 固定开销或 actor update，例如降低 `ppo_max_token_len_per_gpu`/调整 rollout batching、关闭或改变 FSDP/ref offload、或检查是否可以减少每 step 的 vLLM wake/sleep/reshard 开销。
+- 2026-06-30 05:12 CST throughput exp 09 invalid：`tput_logprob8_actor4_ref_nooffload_10step`
+  - 目的：固定当前最佳 `logprob8_actor4`，只改 `actor_rollout_ref.ref.fsdp_config.param_offload=False`，测试 ref 参数不 offload 是否减少 ref/offload 固定开销。
+  - 命令：
+    - `EXP_NAME=tput_logprob8_actor4_ref_nooffload_10step MASTER_PORT=29648 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.ref.fsdp_config.param_offload=False`
+  - 结果：无训练 step，Ray 初始化失败，不计入吞吐对比。
+    - 错误：`OSError: validate_socket_filename failed: AF_UNIX path length cannot exceed 107 bytes: /tmp/ttrl_tput_logprob8_actor4_ref_nooffload_10step/ray/session_.../sockets/plasma_store`
+    - 根因：`EXP_NAME` 和默认 `RAY_DIR=/tmp/ttrl_${EXP_NAME}` 太长，超过 Ray/AF_UNIX socket path 上限。
+  - 结论：
+    - 这是 harness/路径问题，不是 `ref_nooffload` 的性能结论。
+    - 需要用短 `EXP_NAME`/短 `RAY_DIR` 重跑同一单变量，例如 `EXP_NAME=tput_refno_10step RAY_DIR=/tmp/rno`。
+- 2026-06-30 05:24 CST throughput exp 10：`tput_refno_10step`
+  - 目的：用短 `EXP_NAME`/`RAY_DIR` 重跑 exp 09 的同一单变量，固定当前最佳 `logprob8_actor4`，只改 `actor_rollout_ref.ref.fsdp_config.param_offload=False`。
+  - 命令：
+    - `EXP_NAME=tput_refno_10step RAY_DIR=/tmp/rno MASTER_PORT=29648 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.ref.fsdp_config.param_offload=False`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_refno_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_refno_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_refno_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_refno_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_refno_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=49.673`
+    - `perf/total_num_tokens=699606.600`
+    - whole-machine throughput `=14084.271 token/s`
+    - `timing_s/gen=34.881`
+    - `timing_s/generate_sequences=23.383`
+    - `timing_s/old_log_prob=2.309`
+    - `timing_s/ref=2.189`
+    - `timing_s/update_actor=9.447`
+    - `response_length/mean=2641.176`
+    - `response_length/clip_ratio=0.541`
+    - GPU summary: `gpu_util_mean_pct=66.241`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=77805.388`，`gpu_mem_used_max_mib=161418.000`，`gpu_power_mean_w=636.796`
+  - 对比当前最佳 `tput_logprob8_actor4_10step`：
+    - step time 变慢：`49.445 -> 49.673`。
+    - 整机吞吐略降：`14103.925 -> 14084.271 token/s`。
+    - `timing_s/ref` 仅小幅改善：`2.197 -> 2.189`，不足以抵消 `gen`/`update_actor` 波动。
+  - 结论：
+    - `ref.fsdp_config.param_offload=False` 不是有效提升，不做 improvement commit。
+    - 当前 best 仍是 `tput_logprob8_actor4_10step`：`49.445s/step`，`14103.925 token/s`。
+    - 下一步继续换 generation 方向，优先尝试提高 rollout `gpu_memory_utilization` 或减少 vLLM/FSDP wake-sleep/reshard 固定开销；micro-batch/ref offload 路径收益已接近耗尽。
+- 2026-06-30 05:37 CST throughput exp 11：`tput_gmu09_10step`
+  - 目的：固定当前最佳 `logprob8_actor4`，只改 `actor_rollout_ref.rollout.gpu_memory_utilization=0.9`，测试更高 vLLM 可用显存是否改善 generation/cache/batching。
+  - 命令：
+    - `EXP_NAME=tput_gmu09_10step RAY_DIR=/tmp/gmu09 MASTER_PORT=29649 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_gmu09_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_gmu09_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_gmu09_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_gmu09_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_gmu09_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=49.364`
+    - `perf/total_num_tokens=700184.000`
+    - whole-machine throughput `=14184.102 token/s`
+    - `timing_s/gen=34.704`
+    - `timing_s/generate_sequences=23.319`
+    - `timing_s/old_log_prob=2.294`
+    - `timing_s/ref=2.183`
+    - `timing_s/update_actor=9.340`
+    - `response_length/mean=2643.431`
+    - `response_length/clip_ratio=0.542`
+    - GPU summary: `gpu_util_mean_pct=68.760`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=86333.103`，`gpu_mem_used_max_mib=179634.000`，`gpu_power_mean_w=641.828`
+  - 对比当前最佳 `tput_logprob8_actor4_10step`：
+    - step time 小幅改善：`49.445 -> 49.364`（`-0.081s`，约 `0.16%`）。
+    - 整机吞吐小幅改善：`14103.925 -> 14184.102 token/s`。
+    - `timing_s/generate_sequences` 基本不变：`23.340 -> 23.319`。
+    - `timing_s/gen` 基本不变：`34.682 -> 34.704`。
+    - `timing_s/update_actor` 小幅改善：`9.427 -> 9.340`。
+    - 显存峰值大幅升高：`161418 -> 179634 MiB`，离 B200 显存上限很近。
+  - 结论：
+    - 这是新的最佳 infra 配置，但提升极小；整机吞吐已达标，step time `49.364s` 仍未达到 `<=40s`，active goal 未完成。
+    - `gpu_memory_utilization=0.9` 不解决主瓶颈，且显存风险明显升高；后续不要继续往更高 `gpu_memory_utilization` 堆。
+    - 当前剩余缺口约 `9.364s/step`。按阶段分解，`generate_sequences ~=23.3s` 已经稳定，`gen-generate_sequences ~=11.4s` 和 `update_actor ~=9.3s` 是主要可疑固定开销；下一步应直接改/测 rollout sharding manager 的 wake/sleep/cache 路径或 actor update token/microbatch 结构，而不是继续微调显存。
+    - 运行结束后 worker `976664` 日志再次出现 `Fail to open /proc/self/stat`，需要确认 procfs；若 `/proc/self` 缺失，按规则 kill 后重新申请唯一新 worker。
