@@ -4624,3 +4624,55 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - 这是当前最佳 infra 配置，整机吞吐已超过 `10k token/s`，但 step time `50.074s` 仍未达到 `<=40s`，active goal 未完成。
     - 运行结束后 worker `976591` 出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，并在 log 中出现 `Fail to open /proc/self/stat` 等错误。按长期规则，该 worker 不可继续用于 GPU 实验，需先 kill 坏 worker 再重新申请唯一的新 8-GPU worker。
     - 下一步继续固定 v28 算法参数，只调 infra。优先尝试降低 generation 主耗时和 actor/ref/logprob 开销，例如在新 worker 上跑 `gpu_memory_utilization`、更高 micro batch、FSDP/offload 或 vLLM cache/batching 相关的单变量 10-step 实验。
+- 2026-06-30 04:50 CST worker replacement and throughput exp 07 invalid：`tput_logprob_actor_mb8_10step`
+  - worker 管理：
+    - 坏 worker `976591` 已 kill；`mlx worker list` 确认其消失后，才 launch 新 worker，保持单 worker 约束。
+    - 新 worker `976650`：8 张 `NVIDIA B200`，启动后 `/proc/self` 与 `/proc/meminfo` 正常，8 张 GPU 空闲；`/tmp` 约 `3.1T` 可用。
+    - launch 命令仍使用长期规则：`NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`。
+  - 目的：在 `mb4` 的明确提升基础上，试更大的 rollout/ref logprob micro batch 与 actor PPO micro batch。
+  - 命令：
+    - `EXP_NAME=tput_logprob_actor_mb8_10step MASTER_PORT=29646 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8`
+  - 结果：无训练 step，配置校验失败，不计入吞吐对比。
+    - 错误：`AssertionError: normalized ppo_mini_batch_size 4 should be divisible by ppo_micro_batch_size_per_gpu 8`
+    - 产物：`/opt/tiger/TTRL/verl/tput_logprob_actor_mb8_10step.log`，无有效 `_throughput_summary.txt`。
+  - 结论：
+    - actor PPO micro batch 不能直接提到 `8`，因为当前 normalized mini batch 是 `4`；actor 方向可行上限暂按 `4`。
+    - 下一步改跑可行组合：保持 actor PPO micro batch `4`，只把 rollout/ref logprob micro batch 提到 `8`，单独评估 logprob/ref 是否还能压缩。
+- 2026-06-30 05:06 CST throughput exp 08：`tput_logprob8_actor4_10step`
+  - 目的：在当前最佳 `tput_logprob_actor_mb4_10step` 基础上，保持 actor PPO micro batch `4`，只把 rollout/ref logprob micro batch 从 `4` 提到 `8`，单独评估 logprob/ref 路径是否还能压缩。
+  - 命令：
+    - `EXP_NAME=tput_logprob8_actor4_10step MASTER_PORT=29647 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4`
+  - 配置差异：
+    - `tput_logprob_actor_mb4_10step`: rollout/ref logprob micro batch `4`，actor PPO micro batch `4`
+    - this run: rollout/ref logprob micro batch `8`，actor PPO micro batch `4`
+    - 其他保持 baseline：`max_num_batched_tokens=3584`，`gpu_memory_utilization=0.8`，`free_cache_engine=True`。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_logprob8_actor4_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob8_actor4_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob8_actor4_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_logprob8_actor4_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_logprob8_actor4_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=49.445`
+    - `perf/total_num_tokens=697374.200`
+    - whole-machine throughput `=14103.925 token/s`
+    - `timing_s/gen=34.682`
+    - `timing_s/generate_sequences=23.340`
+    - `timing_s/old_log_prob=2.296`
+    - `timing_s/ref=2.197`
+    - `timing_s/update_actor=9.427`
+    - `response_length/mean=2632.456`
+    - `response_length/clip_ratio=0.539`
+    - GPU summary: `gpu_util_mean_pct=65.172`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=76780.181`，`gpu_mem_used_max_mib=161418.000`，`gpu_power_mean_w=630.120`
+  - 对比 `tput_logprob_actor_mb4_10step`：
+    - step time 小幅改善：`50.074 -> 49.445`（`-0.629s`，约 `1.3%`）。
+    - 整机吞吐小幅改善：`13968.980 -> 14103.925 token/s`。
+    - `timing_s/ref` 改善：`2.364 -> 2.197`。
+    - `timing_s/old_log_prob` 改善：`2.460 -> 2.296`。
+    - `timing_s/gen` 小幅改善：`34.995 -> 34.682`。
+    - `timing_s/update_actor` 基本持平：`9.417 -> 9.427`。
+  - 结论：
+    - 这是新的最佳 infra 配置，整机吞吐继续超过 `10k token/s`，但 step time `49.445s` 仍未达到 `<=40s`，active goal 未完成。
+    - logprob/ref micro batch 从 `4` 提到 `8` 的收益已经很小；当前主要剩余瓶颈仍是 generation/rollout sharding manager 路径：`generate_sequences ~=23.34s`，`gen-generate_sequences ~=11.34s`，其次是 actor update `~9.43s`。
+    - 运行结束后 worker `976650` 再次出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，log 中有 `Fail to open /proc/self/stat`。按规则不能继续用该 worker；需 kill 后重新申请唯一新 worker。
+    - 下一轮优先换方向：固定 `logprob8_actor4`，尝试减少 generation/reshard 固定开销或 actor update，例如降低 `ppo_max_token_len_per_gpu`/调整 rollout batching、关闭或改变 FSDP/ref offload、或检查是否可以减少每 step 的 vLLM wake/sleep/reshard 开销。
