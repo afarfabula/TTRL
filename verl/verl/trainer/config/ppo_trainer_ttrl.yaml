@@ -98,6 +98,9 @@ ttrl:
   sps_selection_parseable_bonus: 2.0
   sps_selection_nonclip_bonus: 1.0
   sps_selection_priority: score
+  sps_selection_capacity: false
+  sps_selection_capacity_floor: 0.5
+  sps_selection_capacity_power: 1.0
 
   # Optional unsupervised self-consistency reward mixed into SPS modes. This is
   # the 0/1 reward against the rollout majority pseudo label, not true labels.
@@ -108,3 +111,10 @@ ttrl:
   # 1 when a boxed answer can be parsed and 0 otherwise; it does not use the
   # true answer.
   sps_format_reward_coef: 0.0
+
+  # Throughput-only switches. When enabled, reuse logprobs already computed
+  # during SPS rollout/scoring for the selected train rollouts instead of
+  # recomputing them later in the PPO step. Defaults preserve historical
+  # behavior.
+  sps_reuse_rollout_log_probs_as_old: false
+  sps_reuse_base_log_probs_as_ref: false

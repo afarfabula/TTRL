@@ -1191,6 +1191,26 @@ class RayPPOTrainer:
                                 base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
 
                             response_mask = compute_response_mask(gen_batch_output)
+                            reuse_base_log_probs_as_ref = self.config.ttrl.get(
+                                "sps_reuse_base_log_probs_as_ref", False
+                            )
+                            if reuse_base_log_probs_as_ref:
+                                if sps_base_logprob_source != "ref":
+                                    raise ValueError(
+                                        "ttrl.sps_reuse_base_log_probs_as_ref requires "
+                                        "ttrl.sps_base_logprob_source=ref"
+                                    )
+                                rollout_temperature = float(self.config.actor_rollout_ref.rollout.temperature)
+                                if abs(rollout_temperature - 1.0) > 1e-6:
+                                    raise ValueError(
+                                        "ttrl.sps_reuse_base_log_probs_as_ref only preserves ref semantics "
+                                        "when rollout.temperature is 1.0"
+                                    )
+                                gen_batch_output = gen_batch_output.union(
+                                    DataProto.from_dict(
+                                        tensors={"sps_base_ref_log_probs": base_lp.batch["ref_log_prob"]}
+                                    )
+                                )
                             if sps_mode in (
                                 "answer_weighted_vote",
                                 "answer_weighted_gate",
@@ -1341,6 +1361,28 @@ class RayPPOTrainer:
                                     sps_info["sps/selection_fallback_rate"] = float(
                                         selection_info["fallback_rate"].mean()
                                     )
+                                    if self.config.ttrl.get("sps_selection_capacity", False):
+                                        support_capacity = selection_info["parseable_rate"] * (
+                                            1.0 - selection_info["clip_rate"]
+                                        )
+                                        capacity_floor = float(
+                                            self.config.ttrl.get("sps_selection_capacity_floor", 0.5)
+                                        )
+                                        capacity_power = max(
+                                            float(self.config.ttrl.get("sps_selection_capacity_power", 1.0)),
+                                            1e-6,
+                                        )
+                                        support_capacity = np.clip(
+                                            support_capacity, capacity_floor, 1.0
+                                        ) ** capacity_power
+                                        if "sps_train_weight_list" in batch.non_tensor_batch:
+                                            batch.non_tensor_batch["sps_train_weight_list"] = (
+                                                batch.non_tensor_batch["sps_train_weight_list"]
+                                                * support_capacity
+                                            )
+                                        sps_info["sps/selection_capacity"] = float(
+                                            support_capacity.mean()
+                                        )
                                 else:
                                     gen_batch_output = select_top_k_per_prompt(
                                         gen_batch_output, K, self.config.ttrl.n_samples_per_prompt
@@ -1437,15 +1479,40 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        reuse_rollout_log_probs_as_old = (
+                            self.config.get("ttrl", {}).get("enable", False)
+                            and self.config.ttrl.get("sps_enable", False)
+                            and self.config.ttrl.get("sps_reuse_rollout_log_probs_as_old", False)
+                        )
+                        if reuse_rollout_log_probs_as_old:
+                            if "rollout_log_probs" not in batch.batch.keys():
+                                raise ValueError(
+                                    "ttrl.sps_reuse_rollout_log_probs_as_old requires rollout_log_probs in batch"
+                                )
+                            rollout_temperature = float(self.config.actor_rollout_ref.rollout.temperature)
+                            sps_temperature = float(self.config.ttrl.get("sps_proposal_temperature", rollout_temperature))
+                            if abs(rollout_temperature - 1.0) > 1e-6 or abs(sps_temperature - 1.0) > 1e-6:
+                                raise ValueError(
+                                    "ttrl.sps_reuse_rollout_log_probs_as_old only preserves old_log_probs "
+                                    "semantics when rollout.temperature and ttrl.sps_proposal_temperature are 1.0"
+                                )
+                            batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                            batch.meta_info["temperature"] = rollout_temperature
+                            metrics["training/reused_rollout_log_probs_as_old"] = 1.0
+                        else:
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1474,11 +1541,25 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
+                            reuse_base_log_probs_as_ref = (
+                                self.config.get("ttrl", {}).get("enable", False)
+                                and self.config.ttrl.get("sps_enable", False)
+                                and self.config.ttrl.get("sps_reuse_base_log_probs_as_ref", False)
+                            )
+                            if reuse_base_log_probs_as_ref:
+                                if "sps_base_ref_log_probs" not in batch.batch.keys():
+                                    raise ValueError(
+                                        "ttrl.sps_reuse_base_log_probs_as_ref requires "
+                                        "sps_base_ref_log_probs in batch"
+                                    )
+                                batch.batch["ref_log_prob"] = batch.batch["sps_base_ref_log_probs"]
+                                metrics["training/reused_base_log_probs_as_ref"] = 1.0
+                            elif not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                                batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:

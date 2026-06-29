@@ -4750,3 +4750,171 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - `gpu_memory_utilization=0.9` 不解决主瓶颈，且显存风险明显升高；后续不要继续往更高 `gpu_memory_utilization` 堆。
     - 当前剩余缺口约 `9.364s/step`。按阶段分解，`generate_sequences ~=23.3s` 已经稳定，`gen-generate_sequences ~=11.4s` 和 `update_actor ~=9.3s` 是主要可疑固定开销；下一步应直接改/测 rollout sharding manager 的 wake/sleep/cache 路径或 actor update token/microbatch 结构，而不是继续微调显存。
     - 运行结束后 worker `976664` 日志再次出现 `Fail to open /proc/self/stat`，需要确认 procfs；若 `/proc/self` 缺失，按规则 kill 后重新申请唯一新 worker。
+- 2026-06-30 05:48 CST throughput exp 12 invalid：`tput_tp2_10step` first attempt
+  - 目的：固定当前最佳 `tput_gmu09_10step`，只改 `actor_rollout_ref.rollout.tensor_model_parallel_size=2`，测试 rollout TP=2 是否能降低 `generate_sequences` 或 sharding/generation 开销。
+  - 命令：
+    - `EXP_NAME=tput_tp2_10step RAY_DIR=/tmp/tp2 MASTER_PORT=29650 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 actor_rollout_ref.rollout.tensor_model_parallel_size=2`
+  - 结果：无训练 step，`generate_sequences` 首次进入 TP>1 preprocess 路径即失败，不计入吞吐对比。
+    - 错误：`AttributeError: module 'vllm.distributed.parallel_state' has no attribute 'get_tensor_model_parallel_group'`
+    - 失败位置：`verl/workers/sharding_manager/fsdp_vllm.py` 的 `preprocess_data()` 中 TP>1 分支。
+    - 本地 vLLM API 探测结论：当前环境有 `get_tp_group()`、`get_tensor_model_parallel_rank()`、`get_tensor_model_parallel_world_size()`，没有旧接口 `get_tensor_model_parallel_group()`。
+  - 兼容补丁：
+    - 在 `verl/workers/sharding_manager/fsdp_vllm.py` 添加 `_get_vllm_tensor_model_parallel_device_group()`：
+      - 优先使用旧接口 `get_tensor_model_parallel_group().device_group`。
+      - 否则 fallback 到当前 vLLM 的 `get_tp_group().device_group`。
+    - `preprocess_data()` 的 TP>1 分支改为调用该 helper。
+    - 静态检查已通过：`python -m py_compile /opt/tiger/TTRL/verl/verl/workers/sharding_manager/fsdp_vllm.py`；`git diff --check`。
+  - 结论：
+    - 第一次 TP=2 是 vLLM API 兼容性失败，不是吞吐结论。
+    - 下一步在唯一健康 worker `976684` 上重跑同一 TP=2 单变量实验；若产生有效提升，再提交兼容补丁与文档。若无效或负向，只记录结果，不作为 improvement commit。
+- 2026-06-30 05:54 CST throughput exp 12 retry invalid：`tput_tp2_10step`
+  - worker：唯一 worker `976684`，worker 内 `/proc/self` 与 `/proc/meminfo` 正常；实验前 8 张 B200 空闲。
+  - 目的：验证 `fsdp_vllm.py` 的 vLLM TP group 兼容补丁后，TP=2 是否能跑通，并测试 TP=2 + 当前最佳 gmu0.9 是否降低 generation 开销。
+  - 命令：
+    - `EXP_NAME=tput_tp2_10step RAY_DIR=/tmp/tp2 MASTER_PORT=29650 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 actor_rollout_ref.rollout.tensor_model_parallel_size=2`
+  - 结果：无训练 step；这次已经越过上次的 `get_tensor_model_parallel_group` API 错误，说明兼容补丁生效，但在 vLLM `wake_up(tags=["kv_cache"])` 阶段 OOM。
+    - 错误：`RuntimeError: CUDA Error: out of memory at /workspace/csrc/cumem_allocator.cpp:122`
+    - 失败位置：`vllm/device_allocator/cumem.py` 的 `create_and_map(handle)`，由 `fsdp_vllm.py::__enter__()` 中 `self.inference_engine.wake_up(tags=["kv_cache"])` 触发。
+    - 产物：`/opt/tiger/TTRL/verl/tput_tp2_10step.log`，`/opt/tiger/TTRL/verl/tput_tp2_10step_gpu.csv`；无有效 `_throughput_summary.txt`。
+  - 收尾：
+    - OOM 后残留一个 `ray::WorkerDict` 占用 GPU5，已 kill；随后 8 张 GPU 显存归零。
+    - worker `976684` 的 `/proc/self` 与 `/proc/meminfo` 仍正常，可继续实验。
+  - 结论：
+    - TP=2 compatibility patch 是必要且有效的，但 TP=2 + `gpu_memory_utilization=0.9` 显存过紧，不能作为吞吐结论。
+    - 下一步用短新实验名跑 TP=2 + `gpu_memory_utilization=0.8`：保留当前 best 的 logprob/ref/actor micro batch，单独评估 TP=2 是否可行并是否改善 step time。
+- 2026-06-30 05:59 CST throughput exp 13：`tput_tp2g08_10step`
+  - 目的：在 TP=2 compatibility patch 生效后，将 `gpu_memory_utilization` 从 0.9 回退到 0.8，测试 TP=2 本身是否能改善 generation 或 step time。
+  - 命令：
+    - `EXP_NAME=tput_tp2g08_10step RAY_DIR=/tmp/tp2g08 MASTER_PORT=29651 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.8 actor_rollout_ref.rollout.tensor_model_parallel_size=2`
+  - 配置差异：
+    - 对比 `tput_gmu09_10step`：`tensor_model_parallel_size=1 -> 2`，`gpu_memory_utilization=0.9 -> 0.8`。
+    - 对比 `tput_logprob8_actor4_10step`：仅 `tensor_model_parallel_size=1 -> 2`，其他关键 micro batch 与 gmu0.8 一致。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_tp2g08_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_tp2g08_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_tp2g08_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_tp2g08_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_tp2g08_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=50.693`
+    - `perf/total_num_tokens=699908.800`
+    - whole-machine throughput `=13806.786 token/s`
+    - `timing_s/gen=35.569`
+    - `timing_s/generate_sequences=25.811`
+    - `timing_s/old_log_prob=2.493`
+    - `timing_s/ref=2.224`
+    - `timing_s/update_actor=9.562`
+    - `response_length/mean=2642.356`
+    - `response_length/clip_ratio=0.548`
+    - GPU summary: `gpu_util_mean_pct=64.736`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=83325.757`，`gpu_mem_used_max_mib=166464.000`，`gpu_power_mean_w=615.501`
+  - 对比：
+    - 对比当前最佳 `tput_gmu09_10step`：step time 变慢 `49.364 -> 50.693`；整机吞吐下降 `14184.102 -> 13806.786 token/s`；`generate_sequences` 变慢 `23.319 -> 25.811`。
+    - 对比同 gmu0.8 的 `tput_logprob8_actor4_10step`：step time 变慢 `49.445 -> 50.693`；整机吞吐下降 `14103.925 -> 13806.786 token/s`；`generate_sequences` 变慢 `23.340 -> 25.811`。
+  - 结论：
+    - TP=2 能跑通，但不是改善方向：generation 主耗时增加约 2.5s，整体 step time 变慢。
+    - 不做 improvement commit；`fsdp_vllm.py` 兼容补丁暂保留为必要兼容性修复，但只有在后续需要 TP>1 继续探索或形成有效结果时再提交。
+    - 当前 best 仍是 `tput_gmu09_10step`：`49.364s/step`，`14184.102 token/s`。
+    - 下一步继续围绕 `gen-generate_sequences ~=11.4s` 的固定开销探索，优先检查 `free_cache_engine`/vLLM wake-sleep/cache 路径，而不是 TP。
+- 2026-06-30 06:14 CST throughput exp 14：`tput_dynbsz7168_10step`
+  - 目的：固定当前最佳 `tput_gmu09_10step` 的 micro batch 与 gmu0.9，启用 actor dynamic batch size，并将 actor/rollout/ref token cap 调到 7168，测试是否减少 logprob/ref/update 的动态切分和 padding 浪费。
+  - 命令：
+    - `EXP_NAME=tput_dynbsz7168_10step RAY_DIR=/tmp/dyn7168 MASTER_PORT=29652 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 actor_rollout_ref.actor.use_dynamic_bsz=True actor_rollout_ref.actor.ppo_max_token_len_per_gpu=7168 actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=7168 actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=7168`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_dynbsz7168_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_dynbsz7168_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_dynbsz7168_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_dynbsz7168_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_dynbsz7168_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=52.644`
+    - `perf/total_num_tokens=701577.300`
+    - whole-machine throughput `=13326.773 token/s`
+    - `timing_s/gen=35.907`
+    - `timing_s/generate_sequences=23.556`
+    - `timing_s/old_log_prob=2.489`
+    - `timing_s/ref=2.576`
+    - `timing_s/update_actor=10.824`
+    - `response_length/mean=2648.874`
+    - `response_length/clip_ratio=0.541`
+    - GPU summary: `gpu_util_mean_pct=67.271`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=80766.412`，`gpu_mem_used_max_mib=175910.000`，`gpu_power_mean_w=638.583`
+  - 对比当前最佳 `tput_gmu09_10step`：
+    - step time 变慢：`49.364 -> 52.644`。
+    - 整机吞吐下降：`14184.102 -> 13326.773 token/s`。
+    - `generate_sequences` 小幅变慢：`23.319 -> 23.556`。
+    - `old_log_prob` 变慢：`2.294 -> 2.489`。
+    - `ref` 变慢：`2.183 -> 2.576`。
+    - `update_actor` 明显变慢：`9.340 -> 10.824`。
+  - 结论：
+    - `actor.use_dynamic_bsz=True` + token cap 7168 不是提升，dynamic bsz 在当前 batch/sequence 分布下增加了调度/重排开销。
+    - 不做 improvement commit；当前 best 仍是 `tput_gmu09_10step`：`49.364s/step`，`14184.102 token/s`。
+    - 下一步转向减少重复 forward：SPS 生成阶段已经拿到 all-K rollout logprob 和 base/ref logprob；在 rollout 温度与 ref 温度一致时，可以用可配置方式把 selected rollout/ref logprob 传到训练 batch，跳过同一步重复 `old_log_prob`/`ref` forward，先做 10-step throughput 验证并检查 rollout-vs-actor logprob diff 风险。
+- 2026-06-30 06:27 CST infra patch under test：SPS selected logprob reuse switches
+  - 目的：减少同一 step 内重复 forward。SPS 生成阶段已经计算 all-K `rollout_log_probs`，并为 SPS scoring 计算 all-K base/ref `ref_log_prob`；经过 selection 后 `gen_batch_output` 会同步切片到 selected train rollouts。因此在温度和来源一致时，可复用 selected logprob，跳过后续 `old_log_prob` 和 `ref` forward。
+  - 代码改动：
+    - `verl/trainer/config/ppo_trainer_ttrl.yaml` 新增默认关闭开关：
+      - `ttrl.sps_reuse_rollout_log_probs_as_old: false`
+      - `ttrl.sps_reuse_base_log_probs_as_ref: false`
+    - `verl/trainer/ppo/ray_trainer.py`：
+      - 当 `sps_reuse_base_log_probs_as_ref=True` 时，在 SPS scoring 后把 all-K `base_lp.batch["ref_log_prob"]` 写入 `gen_batch_output` 的 `sps_base_ref_log_probs`，selection 后自然保留 selected 行。
+      - 后续 `old_log_prob` 阶段若 `sps_reuse_rollout_log_probs_as_old=True`，直接把 selected `rollout_log_probs` 作为 `old_log_probs`，跳过 `actor_rollout_wg.compute_log_prob(batch)`。
+      - 后续 `ref` 阶段若 `sps_reuse_base_log_probs_as_ref=True`，直接把 selected `sps_base_ref_log_probs` 作为 `ref_log_prob`，跳过 `compute_ref_log_prob(batch)`。
+      - 保护条件：仅 SPS 启用时生效；复用 old logprob 要求 `rollout.temperature==1.0` 且 `ttrl.sps_proposal_temperature==1.0`；复用 ref logprob 要求 `sps_base_logprob_source=ref` 且 `rollout.temperature==1.0`，否则直接 `ValueError`，避免隐式语义漂移。
+    - `verl/workers/sharding_manager/fsdp_vllm.py` 仍保留 TP group API 兼容 helper，供 TP>1 路径使用。
+  - 静态检查：
+    - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/workers/sharding_manager/fsdp_vllm.py`
+    - `git -C /opt/tiger/TTRL diff --check -- verl/verl/trainer/ppo/ray_trainer.py verl/verl/trainer/config/ppo_trainer_ttrl.yaml verl/verl/workers/sharding_manager/fsdp_vllm.py TTRL_SPS_HANDOFF.md`
+  - 待测命令：
+    - `EXP_NAME=tput_reuselogp_10step RAY_DIR=/tmp/reuselogp MASTER_PORT=29653 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 预期验证点：
+    - `timing_s/old_log_prob` 和 `timing_s/ref` 应显著下降；若 step time 有明确提升且 correctness 语义条件满足，再做 improvement commit。
+    - 若 step time 未提升、触发保护条件、或训练指标异常，只记录负结果，不提交。
+- 2026-06-30 06:29 CST throughput exp 15 invalid：`tput_reuselogp_10step` first attempt
+  - 目的：验证 SPS selected logprob reuse patch，尝试跳过同一步重复 `old_log_prob` 与 `ref` forward。
+  - 命令：
+    - `EXP_NAME=tput_reuselogp_10step RAY_DIR=/tmp/reuselogp MASTER_PORT=29653 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 结果：无有效 10-step summary，不计入吞吐对比。
+    - 错误：`KeyError: 'temperature'`，发生在 `dp_actor.py::update_policy()` 读取 `data.meta_info["temperature"]`。
+    - 根因：复用 `rollout_log_probs` 跳过 `compute_log_prob()` 后，没有像原 `compute_log_prob()` 返回路径一样给训练 batch 保留 `meta_info["temperature"]`。
+  - 修复：
+    - `ray_trainer.py` 的 `sps_reuse_rollout_log_probs_as_old` 分支在写入 `old_log_probs` 后补 `batch.meta_info["temperature"] = rollout_temperature`。
+  - worker 状态：
+    - 失败后 worker `976684` 出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，日志中有 `Fail to open /proc/self/stat` 等错误。
+    - 按长期规则，`976684` 不可继续用于 GPU 实验；需要先 kill 坏 worker，再申请唯一新 8-GPU worker 后重跑修复后的 `tput_reuselogp_10step`。
+- 2026-06-30 06:39 CST throughput exp 15 retry：`tput_reuselogp_10step`
+  - worker 管理：
+    - 坏 worker `976684` 已 kill；`mlx worker list` 为空后才 launch 新 worker，保持单 worker 约束。
+    - 新 worker `976722` ready 后自动 login；实验前 worker 内 `/proc/self` 与 `/proc/meminfo` 正常，8 张 B200 空闲，`/tmp` 约 `2.9T` 可用。
+  - 目的：验证修复 `temperature` meta_info 后，SPS selected logprob reuse 是否能稳定跳过 `old_log_prob` 与 `ref` forward，并改善 step time。
+  - 命令：
+    - `EXP_NAME=tput_reuselogp_10step RAY_DIR=/tmp/reuselogp MASTER_PORT=29653 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=45.524`
+    - `perf/total_num_tokens=699211.000`
+    - whole-machine throughput `=15359.139 token/s`
+    - `timing_s/gen=35.288`
+    - `timing_s/generate_sequences=23.765`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.384`
+    - `response_length/mean=2639.630`
+    - `response_length/clip_ratio=0.541`
+    - GPU summary: `gpu_util_mean_pct=63.738`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=84518.836`，`gpu_mem_used_max_mib=175960.000`，`gpu_power_mean_w=639.901`
+    - 复用检查：每步都有 `training/reused_rollout_log_probs_as_old=1.000` 与 `training/reused_base_log_probs_as_ref=1.000`；`training/rollout_probs_diff_* = 0`，符合复用 old logprob 的预期。
+  - 对比当前最佳 `tput_gmu09_10step`：
+    - step time 明显改善：`49.364 -> 45.524`（`-3.840s`，约 `7.8%`）。
+    - 整机吞吐提升：`14184.102 -> 15359.139 token/s`。
+    - `old_log_prob` 基本消除：`2.294 -> 0.006`。
+    - `ref` 基本消除：`2.183 -> 0.000`。
+    - `update_actor` 基本持平：`9.340 -> 9.384`。
+    - `gen` 略慢：`34.704 -> 35.288`；`generate_sequences` 略慢：`23.319 -> 23.765`，但被 logprob/ref 复用收益抵消。
+  - 结论：
+    - 这是新的最佳 infra 配置，整机吞吐继续超过 `10k token/s`，但 step time `45.524s` 仍未达到 `<=40s`，active goal 未完成。
+    - 这是明确提升，应保存 local git commit。
+    - 剩余缺口约 `5.524s/step`。当前瓶颈重新集中到 `gen ~=35.3s`，其中 `generate_sequences ~=23.8s` 和 SPS scoring/selection 固定开销约 `11.5s`；其次是 `update_actor ~=9.4s`。
+    - 实验结束后 worker `976722` 再次出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，需 kill 后重新申请唯一新 worker 才能继续 GPU 实验。

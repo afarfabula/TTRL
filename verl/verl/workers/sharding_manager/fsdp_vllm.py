@@ -52,6 +52,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _get_vllm_tensor_model_parallel_device_group():
+    if hasattr(vllm_ps, "get_tensor_model_parallel_group"):
+        return vllm_ps.get_tensor_model_parallel_group().device_group
+    return vllm_ps.get_tp_group().device_group
+
+
 class FSDPVLLMShardingManager(BaseShardingManager):
     @check_device_is_available()
     def __init__(
@@ -249,7 +255,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             return data
 
         # TODO: Current impl doesn't consider FSDP with torch micro-dp
-        group = vllm_ps.get_tensor_model_parallel_group().device_group
+        group = _get_vllm_tensor_model_parallel_device_group()
 
         all_gather_data_proto(data=data, process_group=group)
         return data
