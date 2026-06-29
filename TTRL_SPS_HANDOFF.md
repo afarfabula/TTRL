@@ -4181,3 +4181,446 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - 也高于 Qwen3-8B 50-step best v22 `mean@4=0.7796780684104627`，但该对比 step 数不同。
     - 由于 v26 310-step 是当前 Qwen3-8B 最好长跑结果且由算法/runner修复产生有效提升，应按用户要求做本地 git commit 记录。
   - 需要继续优化：最终目标仍未完成；下一轮需要针对 0.90 缺口优化，而不是 mark goal complete。
+- 2026-06-29 20:27 CST 启动准备 25：Qwen3-8B v27 parseable-first support projection 310-step
+  - goal 状态核对：
+    - 当前目标仍未完成；v26 310-step `val-core/MATH-TTT/acc/mean@4=0.8938631790744467`，目标是 `>=0.90`，缺口约 `0.0061368209255533`。
+    - v26 的 `maj@4=0.9006881287726359` 已经过 90%，但 `mean@4` 和 `worst@4=0.8452917505030182` 偏低，说明 majority answer distribution 已足够强，剩余瓶颈在四个 individual samples 的可解析性/有效性与尾部质量，而不是继续提高多数簇一致性。
+  - v27 设计动机：
+    - v24 证明 hard majority-cluster-first 会伤害难 prompt；v25 证明 soft bonus 不足以阻止截断候选；v26 用 `nonclip_parseable_bucket` 明显提升到当前最好长跑结果。
+    - v26 final 的 `format_score/mean@4=0.9285714285714286` 仍低于 `format_score/maj@4=0.9331549295774648`，且 `mean@4 < maj@4`，因此下一步把 PowerFlow-style support projection 从“先 non-clipped，再 parseable”改为“先 parseable boxed answer，再 non-clipped，再 majority cluster，再 reference-reweighted quality”。
+    - 理论解释：这仍是无监督内部反馈的分布锐化，不引入 true label。先投影到 answer-bearing support，避免无效/不可解析轨迹进入 PPO 的四样本训练分布；再在该支撑集内按非截断、answer cluster 和 reference-reweighted quality 做 distribution matching / sharpening。目标是提升 individual-sample mean@4，而不是只提升 maj@4。
+  - 代码改动：
+    - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 新增 `selection_priority="parseable_nonclip_cluster_bucket"`。
+    - 默认 `selection_priority="score"` 保持不变；v26 的 `nonclip_parseable_bucket` 也保持不变，确保历史结果可复现。
+    - 新排序 key：`(parseable, non-clipped, in_cluster, reference-reweighted quality)`，仅由模型输出 parseability、长度截断状态、内部 majority cluster 和 ref/actor logprob 组成，不用 Math500 true answer。
+  - runner：
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_parseable_bucket_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v27.sh`
+    - 日志：`/opt/tiger/TTRL/verl/sps_parseable_bucket_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v27.log`
+    - Ray 目录：`/tmp/r27_310`
+    - metrics snapshot：`/opt/tiger/TTRL/verl/sps_parseable_bucket_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v27_metrics.txt`
+  - 训练配置：
+    - 模型：复用 worker-local `/tmp/qwen3_8b_local_v21_answer_sharpen`；若不存在才从 `/opt/tiger/qwen3_8b` copy 到 `/tmp`。不写 HDFS，不新增 `/opt/tiger` 权重副本。
+    - 主干保持 v26/v14：`answer_rule_conf_weight`，`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，`answer_sharpen_beta=2.0`，`answer_sharpen_capacity=False`，`actor.use_kl_loss=True`，`sps_format_reward_coef=0.0`。
+    - v27 特有 override：`ttrl.sps_selection_priority=parseable_nonclip_cluster_bucket`。
+    - final-only：`trainer.total_epochs=5`，`trainer.total_training_steps=310`，`trainer.test_freq=310`，`trainer.val_before_train=False`。`total_epochs=5` 继承 v26 修复，避免 MATH-TTT dataloader 62 batch 后提前退出。
+  - worker 状态：
+    - 复用单个 worker `975102`，不 launch 新 worker。
+    - 健康检查：`/proc/self` 与 `/proc/meminfo` 存在；8 张 `NVIDIA B200` 均空闲，显存 `0/183359 MiB`，util `0%`。
+  - 判定规则：
+    - 若 v27 310-step final `val-core/MATH-TTT/acc/mean@4 >= 0.90`，goal 的核心指标达成，随后做 completion audit。
+    - 若 v27 超过 v26 `0.8938631790744467` 但仍未到 0.90，作为改进结果按用户要求 commit，并继续下一轮优化。
+    - 若 v27 不超过 v26，不作为 improved commit；保留 handoff 与日志供后续诊断。
+- 2026-06-29 21:30 CST v27 early-stop result：parseable-first support projection 不是改进
+  - v27 已在同一 worker `975102` 上中断，未跑 final validation；停止后无 `main_ppo`/`ray::TaskRunner`/`raylet` 残留，8 张 B200 显存均 `0 MiB`。
+  - 中断原因：50-step 代理指标弱于 v26 同窗口，继续跑 310-step 大概率浪费 GPU，不符合“持续优化”的效率目标。
+  - v27 step 50 训练代理窗口：
+    - step 50：`selected_parseable_rate=0.875`，`selected_clip_rate=0.281`，`ground_truth_reward=0.875`，`pass@32=0.875`，`timing_s/step=59.098`，`perf/throughput=1156.602 token/s`。
+    - steps 1-50 平均：`selected_parseable_rate=0.7081`，`selected_clip_rate=0.4346`，`ground_truth_reward=0.7032`，`pass@32=0.820`，`perf/throughput=1347.5 token/s`。
+    - steps 21-50 平均：`selected_parseable_rate=0.7638`，`selected_clip_rate=0.3911`，`ground_truth_reward=0.7634`，`pass@32=0.8667`。
+  - v26 对照同窗口：
+    - steps 1-50 平均：`selected_parseable_rate=0.7155`，`selected_clip_rate=0.4223`，`pass@32=0.825`。
+  - 结论：
+    - v27 的 parseable-first bucket 没有降低截断，反而略降 parseable、略升 clip；说明在 Qwen3-8B 早期训练中，长度支撑仍比 parseability 更接近可学习支撑的第一约束。
+    - 负向经验：下一版不要把 parseable 放在 nonclip 之前；应回到 v26 的 `nonclip_parseable_bucket`，再针对 v26 的 `maj@4 > mean@4` 问题做更局部的 quality/weight 调整。
+    - v27 不做 improved commit；代码中的新 priority 可以保留为负向消融能力，但后续 runner 不再使用。
+- 2026-06-29 21:34 CST 启动准备 26：Qwen3-8B v28 support-capacity gated v26 310-step
+  - v28 设计动机：
+    - v27 证明“parseable first”不是正确方向；v26 的 nonclip-first support projection 仍是当前最强选择策略。
+    - v26 的问题不是 majority 不够强（`maj@4=0.9006881287726359` 已达标），而是个别低支撑/高截断 prompt 仍参与相同强度的 PPO 更新，拖低 individual-sample `mean@4` 和 `worst@4`。
+    - PowerFlow-style 解释：先投影到可学习支撑（non-clipped + parseable），再用该支撑质量控制每个 prompt 对分布匹配目标的“容量”。当选出的训练分布自身低 parseable 或高 clip 时，降低该 prompt 的更新强度，而不是让噪声支撑强行锐化。
+  - 代码改动：
+    - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml` 新增默认关闭配置：
+      - `ttrl.sps_selection_capacity: false`
+      - `ttrl.sps_selection_capacity_floor: 0.5`
+      - `ttrl.sps_selection_capacity_power: 1.0`
+    - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 在 `sharpened_cluster` selection 后，如果 `sps_selection_capacity=True`，计算：
+      - `support_capacity = selected_parseable_rate * (1 - selected_clip_rate)`
+      - `support_capacity = clip(support_capacity, floor, 1.0) ** power`
+      - 将该 prompt-level capacity 乘到已有 `sps_train_weight_list` 上。
+    - 该信号完全来自模型输出的可解析率、截断率和 selection 结果，不使用 true answer；默认关闭以保持 v26/v14 可复现。
+  - runner：
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_capacity_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v28.sh`
+    - 日志：`/opt/tiger/TTRL/verl/sps_bucket_capacity_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v28.log`
+    - Ray 目录：`/tmp/r28_310`
+    - metrics snapshot：`/opt/tiger/TTRL/verl/sps_bucket_capacity_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v28_metrics.txt`
+  - v28 训练配置：
+    - 回到 v26 selection：`ttrl.sps_selection_priority=nonclip_parseable_bucket`。
+    - 新增：`ttrl.sps_selection_capacity=True`，`ttrl.sps_selection_capacity_floor=0.55`，`ttrl.sps_selection_capacity_power=0.5`。
+    - 其余保持 v26：`answer_rule_conf_weight`，`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，`answer_sharpen_beta=2.0`，`answer_sharpen_capacity=False`，`actor.use_kl_loss=True`，`sps_format_reward_coef=0.0`。
+    - final-only：`trainer.total_epochs=5`，`trainer.total_training_steps=310`，`trainer.test_freq=310`，`trainer.val_before_train=False`。
+  - 判定规则：
+    - 若 v28 early proxy 明显低于 v26 1-50 且低于 v27，不继续烧满 310；记录负结果并切下一版。
+    - 若 v28 early proxy 接近或优于 v26，则跑满 310-step final validation。
+    - 若 final `mean@4` 超过 v26 或达到 `>=0.90`，按用户要求保存 local git commit。
+- 2026-06-29 22:34 CST v28 运行进度：
+  - v28 已在同一 worker `975102` 启动，未 launch 新 worker；启动前 `/proc/self` 与 `/proc/meminfo` 正常，8 张 B200 空闲。
+  - Hydra/Ray 日志确认：
+    - `sps_selection_capacity=True`
+    - `sps_selection_capacity_floor=0.55`
+    - `sps_selection_capacity_power=0.5`
+    - `Size of train dataloader: 62, Size of val dataloader: 1`
+    - `Total training steps: 310`
+  - step 1 已记录 `train/sps/selection_capacity=0.839`，说明 support-capacity 乘子生效。
+  - 早期监控：
+    - step 10：steps 1-10 平均 `selected_parseable_rate=0.6042`，`selected_clip_rate=0.5360`，`selection_capacity=0.8463`，`pass@32=0.7625`。
+    - step 20：steps 1-20 平均 `selected_parseable_rate=0.6255`，`selected_clip_rate=0.4971`，`selection_capacity=0.8614`，`pass@32=0.7500`。
+    - step 50：steps 1-50 平均 `selected_parseable_rate=0.7060`，`selected_clip_rate=0.4305`，`selection_capacity=0.8775`，`pass@32=0.8225`。
+    - step 54：steps 1-54 平均 `selected_parseable_rate=0.7150`，`selected_clip_rate=0.4184`，`selection_capacity=0.8807`，`pass@32=0.8287`；last20 steps 35-54 为 `selected_parseable_rate=0.7781`，`selected_clip_rate=0.3477`，`pass@32=0.8688`。
+  - 对比 v26 early proxy：
+    - v26 steps 1-50：`selected_parseable_rate=0.7155`，`selected_clip_rate=0.4223`，`pass@32=0.825`。
+    - v28 到 step 54 后已接近/略优于 v26 同窗口，尤其 clip 更低、pass@32 略高；不止损，继续跑满 310-step final validation。
+  - 当前判断：v28 capacity 没有像 v27 一样明显负向；继续观察中后段是否能把 v26 已达标的 `maj@4` 转化为更高 `mean@4`。
+- 2026-06-29 23:23 CST v28 运行进度：
+  - 已到 `training/global_step=100/310`，无中途 validation，符合 final-only 设置。
+  - 已跨过 dataloader epoch 边界 step 62，说明 `trainer.total_epochs=5` 生效，没有复发 v26 首次 62-step 早停问题。
+  - step 100 当前值：`selected_parseable_rate=1.000`，`selected_clip_rate=0.125`，`selection_capacity=0.968`，`ground_truth_reward=1.000`，`pass@32=1.000`，`timing_s/step=60.444`，`perf/throughput=1040.078 token/s`。
+  - 最近 20 步（81-100）平均：`selected_parseable_rate=0.9040`，`selected_clip_rate=0.2263`，`selection_capacity=0.9358`，`ground_truth_reward=0.9008`，`pass@32=0.9625`，`timing_s/step=63.48`。
+  - 最近 50 步（51-100）平均：`selected_parseable_rate=0.8519`，`selected_clip_rate=0.2922`，`selection_capacity=0.9165`，`ground_truth_reward=0.8410`，`pass@32=0.9125`。
+  - steps 1-100 累计：`selected_parseable_rate=0.7790`，`selected_clip_rate=0.3614`，`selection_capacity=0.8970`，`pass@32=0.8675`。
+  - 判断：v28 前 20 step 偏弱，但 step 50 后进入强段；最近 20/50 step 的 clip 明显低、pass@32 高。继续跑满 310-step final validation。
+- 2026-06-30 00:17 CST v28 中段进度：
+  - 已到 `training/global_step=151/310`，无中途 validation，训练稳定。
+  - step 151 当前值：`selected_parseable_rate=0.840`，`selected_clip_rate=0.250`，`selection_capacity=0.935`，`ground_truth_reward=0.840`，`pass@32=1.000`，`timing_s/step=62.933`，`perf/throughput=1031.822 token/s`。
+  - steps 101-150 平均：`selected_parseable_rate=0.9125`，`selected_clip_rate=0.2218`，`selection_capacity=0.9346`，`ground_truth_reward=0.8897`，`pass@32=0.9450`，`timing_s/step=63.49`。
+  - steps 51-150 平均：`selected_parseable_rate=0.8822`，`selected_clip_rate=0.2570`，`selection_capacity=0.9255`，`ground_truth_reward=0.8653`，`pass@32=0.9287`。
+  - steps 1-150 累计：`selected_parseable_rate=0.8235`，`selected_clip_rate=0.3148`，`selection_capacity=0.9095`，`ground_truth_reward=0.8109`，`pass@32=0.8933`。
+  - GPU 状态：8 张 B200 利用率约 `94-97%`，训练仍处于稳态。
+  - 判断：v28 中段代理指标明显强于早期，低 clip / 高 pass@32 信号持续；继续等待 step 310 final validation。
+- 2026-06-30 00:39 CST v28 继续运行 + 吞吐优化新优先级准备：
+  - 当前用户优先级更新：先让 v28 跑完；随后暂停算法升级，把训练 infra 吞吐作为第一 goal。目标以当前 TTRL 链路为基准，整机训练吞吐达到 `10k token/s`；每次 infra 改动都只跑 10 step，记录每步时间和吞吐。
+  - worker 状态：仍只使用单个 worker `975102`，未 launch 新 worker；`/proc/self` 和 `/proc/meminfo` 正常。
+  - v28 当前状态：Ray task 仍在运行，最新解析到 `training/global_step=172/310`，无 final validation；GPU 利用率大多 `76-100%`，不是 hang。
+  - 最近 10 step（163-172）训练基线：
+    - `timing_s/step=63.434`
+    - `timing_s/gen=41.086`
+    - `timing_s/generate_sequences=18.010`
+    - `timing_s/update_actor=12.520`
+    - `timing_s/ref=5.793`
+    - `timing_s/old_log_prob=2.893`
+    - `perf/total_num_tokens=547943.9 tokens/step`
+    - `perf/throughput=1082.020 token/s`
+    - `response_length/mean=2055.431`
+    - `response_length/clip_ratio=0.204`
+  - 吞吐口径修正：
+    - 当前日志里的 `perf/throughput` 是近似每 GPU 口径，约等于 `perf/total_num_tokens / timing_s/step / 8`。
+    - 用户定义的“整台机器吞吐量”应按 `perf/total_num_tokens / timing_s/step` 计算。
+    - v28 最近 10 step 整机吞吐约 `547943.9 / 63.434 = 8638 token/s`；离 `10k token/s` 目标约差 `15.8%`。
+  - 初步瓶颈判断：
+    - 主要瓶颈是 rollout/generation：`timing_s/gen ~= 41.1s/step`，其中真正 `generate_sequences ~= 18.0s`，剩余包含 rollout 后处理、logprob 组织、同步/reshard 等。
+    - 次要瓶颈是 actor update：`~12.5s/step`。
+    - ref logprob 和 old logprob 合计约 `8.7s/step`，可通过 micro-batch、padding、offload 和 logprob 路径调优压缩。
+  - v28 结束后的吞吐实验规则：
+    - 不改变算法目标时，先固定 v28/v26 算法相关参数，只调 infra 参数。
+    - 每个候选配置单独跑 10 step、无 validation、同一模型/数据/seed 风格，记录 last 10 step 的 `timing_s/step`、`perf/total_num_tokens`、整机 token/s、`timing_s/gen`、`generate_sequences`、`old_log_prob`、`ref`、`update_actor`、GPU 利用率。
+    - 优先尝试低风险 infra 参数：提高 rollout `max_num_batched_tokens` / `gpu_memory_utilization`，提高 actor/ref/rollout logprob micro-batch，评估 `free_cache_engine` 开销，必要时检查 TP/sequence packing 与 FSDP offload 对 B200 的浪费。
+- 2026-06-30 00:49 CST 吞吐实验 harness 准备：
+  - active goal 已切换为 infra throughput：v28 跑完并记录 final validation 后，先把整机吞吐优化到 `>=10k token/s` 且常规 step `<=40s`，再继续算法目标。
+  - 代码事实确认：`/opt/tiger/TTRL/verl/verl/trainer/ppo/metric_utils.py` 中 `compute_throughout_metrics` 注释和实现均说明 `perf/throughput = total_tokens / (step_time * n_gpus)`，所以它是 per-GPU 口径；整机吞吐必须用 `perf/total_num_tokens / timing_s/step`。
+  - 新增通用 10-step 吞吐实验 runner：
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh`
+    - 默认固定 v28 算法参数：`nonclip_parseable_bucket` + `sps_selection_capacity=True` + `floor=0.55` + `power=0.5`，只通过命令行追加 infra overrides。
+    - 默认 `trainer.total_training_steps=10`，`trainer.test_freq=-1`，`trainer.val_before_train=False`，避免 validation 污染 step time。
+    - 自动采样 GPU 利用率到 `${EXP_NAME}_gpu.csv`，复制 Ray TaskRunner log，生成 `${EXP_NAME}_throughput_summary.txt`。
+  - 新增解析工具：
+    - `/opt/tiger/TTRL/verl/examples/ttrl/parse_ttrl_throughput.py`
+    - 输出 last-N 的 `timing_s/step`、`perf/total_num_tokens`、`whole_machine_tokens_per_s`、stage timing、response length/clip、GPU 平均利用率。
+  - 静态/只读验证：
+    - `bash -n worker_run_sps_tput_qwen3_8b_10step.sh` 通过。
+    - `git diff --check` 通过。
+    - 用 v26 310-step log 做解析自测通过；注意 v26 last 10 包含 final validation，所以只验证 parser，不作为吞吐目标基线。
+  - v28 当前仍运行中，约 `180/310`；未启动任何 10-step 吞吐实验，避免打断正在跑的 final-only v28。
+  - 只读解析 v28 当前 Ray log 的最近 10 step（174-183）：`timing_s/step=61.695`，`timing_s/gen=39.463`，`generate_sequences=17.452`，`old_log_prob=2.854`，`ref=5.786`，`update_actor=12.455`，`perf/total_num_tokens=532713.5`，整机吞吐 `8634.630 token/s`。
+  - v28 结束后的第一批 10-step 吞吐实验矩阵：
+    - `tput_baseline_v28_alg_10step`：不加 infra override，确认无 validation 的 10-step 基线。
+    - `tput_mnbt8192_10step`：只改 `actor_rollout_ref.rollout.max_num_batched_tokens=8192`。
+    - `tput_mnbt12288_10step`：只改 `max_num_batched_tokens=12288`。
+    - `tput_mnbt8192_gmu09_10step`：在 `max_num_batched_tokens=8192` 基础上改 `gpu_memory_utilization=0.9`。
+    - `tput_logprob_mb2_10step`：在最佳 batching 配置基础上改 `actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2` 与 `actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2`。
+    - `tput_actor_mb2_10step`：在最佳 logprob 配置基础上试 `actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2`。
+    - `tput_freecache_false_10step`：单独评估 `actor_rollout_ref.rollout.free_cache_engine=False` 是否减少 per-step cache 重建/释放开销。
+  - 每轮只保留明确改善项进入下一轮组合；若某配置 OOM、hang、或 step time 变差，记录为负向结果并回退。
+  - 代码路径补充：
+    - `metric_utils.py` 已确认 `perf/throughput` 为 per-GPU 口径。
+    - `verl/workers/sharding_manager/fsdp_vllm.py` 中 `free_cache_engine=True` 会在进入 rollout sharding manager 时 `wake_up(weights)`、同步参数、再 `wake_up(kv_cache)`，退出时 `sleep(level=1)`，并伴随 `empty_cache()`。
+    - `verl/workers/fsdp_workers.py` 中 `timing_s/gen` 包含 rollout sharding manager 的 `reshard` timing 与真正的 `generate_sequences`；因此当前 `gen - generate_sequences` 的 20s+ 差值很可能来自权重同步/引擎 wake-sleep/reshard，而不只是采样本身。
+    - 后续 `tput_freecache_false_10step` 必须单独跑，不能与 batching/microbatch 混合，否则无法归因。
+  - harness 细节修正：
+    - GPU 采样命令使用 `nvidia-smi --format=csv,nounits`，避免 `%`、`MiB`、`W` 单位进入 CSV 值。
+    - `parse_ttrl_throughput.py` 同时兼容带单位和不带单位的 `nvidia-smi` CSV 列名/值；已用临时 CSV 做本地解析自测。
+- 2026-06-30 01:58 CST 吞吐实验 harness 小修：
+  - 修正 `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh` 的 Ray TaskRunner log 选择逻辑。
+  - 新逻辑只在 `worker-*-01000000-*.out` 中按文件大小倒序寻找包含 `training/global_step:10` 的日志，避免误抓启动期短 worker log。
+  - 该改动只影响实验结果收集，不改变训练算法或 infra 配置；静态检查 `bash -n` 与 `git diff --check` 均通过。
+- 2026-06-30 03:07 CST final result：Qwen3-8B v28 support-capacity gated v26 310-step final-only
+  - run 正常结束：wrapper marker `WORKER_QWEN3_8B_V28_310_EXIT status=0 2026-06-30 03:07:06`。
+  - 结束后无 `main_ppo` / `ray::TaskRunner` / `raylet` 残留；8 张 B200 显存均回到 `0 MiB`。
+  - metrics snapshot 已生成：
+    - `/opt/tiger/TTRL/verl/sps_bucket_capacity_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v28_metrics.txt`
+    - `/opt/tiger/TTRL/verl/sps_bucket_capacity_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v28_ray_taskrunner.log`
+  - step 310 final train proxy：`selected_parseable_rate=1.000`，`selected_clip_rate=0.129`，`selection_capacity=0.955`，`ground_truth_reward=0.996`，`pass@32=1.000`，`response_length/clip_ratio=0.129`。
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.8762575452716298`（console rounded `0.876`）
+    - `val-core/MATH-TTT/acc/best@4/mean=0.9171408450704226`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.8794949698189135`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.8296881287726359`
+    - `val-aux/MATH-TTT/acc/best@2/mean=0.9008792756539236`
+    - `val-aux/MATH-TTT/acc/maj@2/mean=0.8763883299798794`
+    - `val-aux/MATH-TTT/acc/worst@2/mean=0.8516519114688128`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.8963782696177063`
+    - `val-aux/MATH-TTT/format_score/best@4/mean=0.9372696177062374`
+    - `val-aux/MATH-TTT/format_score/maj@4/mean=0.8987263581488935`
+  - validation timing: `timing_s/testing=174.641`，final step including validation `timing_s/step=238.279`。
+  - last non-validation 10 training steps（300-309）：
+    - `timing_s/step=61.568`
+    - `perf/total_num_tokens=568794.6`
+    - whole-machine throughput `=9238.418 token/s`
+    - `timing_s/gen=39.317`
+    - `timing_s/generate_sequences=18.956`
+    - `timing_s/old_log_prob=2.896`
+    - `timing_s/ref=5.792`
+    - `timing_s/update_actor=12.506`
+    - `response_length/mean=2136.629`
+    - `response_length/clip_ratio=0.194`
+  - 结果判断：
+    - v28 低于 v26 `mean@4=0.8938631790744467`，也低于 0.90 目标；support-capacity gated v26 不是算法提升。
+    - v28 不做 improved commit；保留代码能力和日志作为负向消融记录。
+    - 按最新 active goal，算法优化暂停，下一步启动 10-step infra throughput baseline：`tput_baseline_v28_alg_10step`。
+- 2026-06-30 03:22 CST throughput exp 01：`tput_baseline_v28_alg_10step`
+  - 目的：固定 v28 算法参数，跑无 validation 的 10-step 吞吐 baseline，作为后续 infra 单变量调参对照。
+  - 命令：
+    - `EXP_NAME=tput_baseline_v28_alg_10step MASTER_PORT=29640 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh`
+  - 配置：
+    - model `/tmp/qwen3_8b_local_v21_answer_sharpen`
+    - `trainer.total_training_steps=10`
+    - `trainer.test_freq=-1`
+    - `trainer.val_before_train=False`
+    - `actor_rollout_ref.rollout.max_num_batched_tokens=3584`
+    - `actor_rollout_ref.rollout.gpu_memory_utilization=0.8`
+    - `actor_rollout_ref.rollout.free_cache_engine=True`
+    - rollout/ref logprob micro batch `1`
+    - actor PPO micro batch `1`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_baseline_v28_alg_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_baseline_v28_alg_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_baseline_v28_alg_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_baseline_v28_alg_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_baseline_v28_alg_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=61.404`
+    - `perf/total_num_tokens=698620.400`
+    - whole-machine throughput `=11377.441 token/s`
+    - `timing_s/gen=39.485`
+    - `timing_s/generate_sequences=23.377`
+    - `timing_s/old_log_prob=3.139`
+    - `timing_s/ref=4.806`
+    - `timing_s/update_actor=13.127`
+    - `response_length/mean=2637.323`
+    - `response_length/clip_ratio=0.537`
+    - GPU summary: `gpu_util_mean_pct=70.075`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=67417.234`，`gpu_mem_used_max_mib=155252.000`，`gpu_power_mean_w=608.516`
+  - 观察：
+    - baseline 已达到整机吞吐 `>=10k token/s`，但 step time `61.404s` 远高于 `<=40s`，active goal 未完成。
+    - GPU 平均利用率只有 `70.1%`，主要因为 GPU CSV 覆盖 Ray/vLLM 初始化、收尾和训练全过程；训练中手动观测 GPU util 为 `100%`，后续仍以 last-10 step timing 为主，GPU CSV 只作辅助。
+    - 当前瓶颈仍是 `timing_s/gen=39.485s`，其中实际 `generate_sequences=23.377s`；`gen - generate_sequences` 约 `16.1s`，需要继续查 rollout wake/sleep、reshard、logprob/cache 行为。
+    - 下一步按计划跑单变量：`tput_mnbt8192_10step`，只改 `actor_rollout_ref.rollout.max_num_batched_tokens=8192`。
+- 2026-06-30 03:23 CST throughput exp 02 attempt：`tput_mnbt8192_10step` 未开始，worker procfs 损坏
+  - 命令：
+    - `EXP_NAME=tput_mnbt8192_10step MASTER_PORT=29641 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.max_num_batched_tokens=8192`
+  - 结果：runner 在健康检查处立即退出，没有进入 Ray/training。
+  - 证据：
+    - `ls: cannot access '/proc/self': No such file or directory`
+    - `ls: cannot access '/proc/meminfo': No such file or directory`
+    - `/proc` 变成普通空目录样式：`drwxr-xr-x 2 root root 4096 Jun 10 15:16 /proc`
+  - 判断：
+    - 命中长期 worker 使用规则：如果 `/proc` 为空或 `/proc/self`、`/proc/meminfo` 不存在，该 worker 已不可用。
+    - 该 attempt 不算 infra 参数实验结果，不纳入 mnbt8192 对比。
+    - 下一步必须在 master 侧 kill 当前 worker `975102`，再 launch 一个新的单 8-GPU worker；不能在 worker 内 launch，也不能同时保留两个 worker。
+- 2026-06-30 03:27 CST worker recovery：
+  - 在 master 侧确认只有 `975102` 一个 worker 后执行 `NO_COLOR=1 TERM=dumb mlx worker kill 975102`。
+  - 等 `mlx worker list` 不再显示 active worker 后，用指定命令重新申请单个 8-GPU worker：
+    - `NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`
+  - 新 worker：`976591`，host `trial-301443426-trialrun-301443426-worker-0`。
+  - 健康检查通过：`/proc/self` 与 `/proc/meminfo` 存在；8 张 B200 初始 `0 MiB` 显存、`0%` util；`/tmp` 可用约 `3.1T`。
+  - 新 worker 的 `/tmp/qwen3_8b_local_v21_answer_sharpen` 不存在，后续 runner 从 `/opt/tiger/qwen3_8b` 复制到 `/tmp`，未写 HDFS。
+- 2026-06-30 03:44 CST throughput exp 02：`tput_mnbt8192_10step`
+  - 目的：单变量提高 rollout batching 上限，只改 `actor_rollout_ref.rollout.max_num_batched_tokens=8192`。
+  - 命令：
+    - `EXP_NAME=tput_mnbt8192_10step MASTER_PORT=29641 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.max_num_batched_tokens=8192`
+  - 配置差异：
+    - baseline: `max_num_batched_tokens=3584`
+    - this run: `max_num_batched_tokens=8192`
+    - 其他保持 baseline：`gpu_memory_utilization=0.8`，`free_cache_engine=True`，rollout/ref logprob micro batch `1`，actor PPO micro batch `1`。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_mnbt8192_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_mnbt8192_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_mnbt8192_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_mnbt8192_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_mnbt8192_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=64.804`
+    - `perf/total_num_tokens=697330.000`
+    - whole-machine throughput `=10760.535 token/s`
+    - `timing_s/gen=41.720`
+    - `timing_s/generate_sequences=23.196`
+    - `timing_s/old_log_prob=3.131`
+    - `timing_s/ref=5.907`
+    - `timing_s/update_actor=13.214`
+    - `response_length/mean=2632.283`
+    - `response_length/clip_ratio=0.541`
+    - GPU summary: `gpu_util_mean_pct=70.281`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=66159.943`，`gpu_mem_used_max_mib=155212.000`，`gpu_power_mean_w=585.901`
+  - 对比 baseline：
+    - step time 变差：`61.404 -> 64.804`（`+3.400s`）。
+    - 整机吞吐变差：`11377.441 -> 10760.535 token/s`。
+    - `timing_s/gen` 变差：`39.485 -> 41.720`。
+    - `timing_s/ref` 变差：`4.806 -> 5.907`。
+  - 结论：`max_num_batched_tokens=8192` 不是提升，不进入组合；负向记录，不 commit。
+  - 下一步：优先跑更可能影响 `gen - generate_sequences` 的单变量 `tput_freecache_false_10step`，只改 `actor_rollout_ref.rollout.free_cache_engine=False`。
+- 2026-06-30 03:59 CST throughput exp 03：`tput_freecache_false_10step`
+  - 目的：单变量关闭 vLLM cache sleep/free 路径，验证 `free_cache_engine=True` 是否造成 `gen - generate_sequences` 的主要开销。
+  - 命令：
+    - `EXP_NAME=tput_freecache_false_10step MASTER_PORT=29642 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.free_cache_engine=False`
+  - 配置差异：
+    - baseline: `actor_rollout_ref.rollout.free_cache_engine=True`
+    - this run: `actor_rollout_ref.rollout.free_cache_engine=False`
+    - 其他保持 baseline：`max_num_batched_tokens=3584`，`gpu_memory_utilization=0.8`，rollout/ref logprob micro batch `1`，actor PPO micro batch `1`。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_freecache_false_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_freecache_false_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_freecache_false_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_freecache_false_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_freecache_false_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=63.145`
+    - `perf/total_num_tokens=700996.400`
+    - whole-machine throughput `=11101.341 token/s`
+    - `timing_s/gen=39.986`
+    - `timing_s/generate_sequences=23.314`
+    - `timing_s/old_log_prob=3.120`
+    - `timing_s/ref=5.346`
+    - `timing_s/update_actor=13.850`
+    - `response_length/mean=2646.605`
+    - `response_length/clip_ratio=0.539`
+    - GPU summary: `gpu_util_mean_pct=70.836`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=126263.497`，`gpu_mem_used_max_mib=182608.000`，`gpu_power_mean_w=601.632`
+  - 对比 baseline：
+    - step time 变差：`61.404 -> 63.145`（`+1.741s`）。
+    - 整机吞吐变差：`11377.441 -> 11101.341 token/s`。
+    - `timing_s/gen` 基本持平略差：`39.485 -> 39.986`。
+    - `timing_s/ref` 变差：`4.806 -> 5.346`。
+    - `timing_s/update_actor` 变差：`13.127 -> 13.850`。
+    - 显存占用显著增加：mean `67.4GiB -> 126.3GiB`，max `155.3GiB -> 182.6GiB`。
+  - 结论：`free_cache_engine=False` 不是提升，且显存接近上限；不进入组合，不 commit。
+  - 下一步：跑 `tput_logprob_mb2_10step`，只改 rollout/ref `log_prob_micro_batch_size_per_gpu=2`，目标压缩 `old_log_prob + ref`。
+- 2026-06-30 04:13 CST throughput exp 04：`tput_logprob_mb2_10step`
+  - 目的：单变量提高 rollout/ref logprob micro batch，压缩 `old_log_prob + ref`。
+  - 命令：
+    - `EXP_NAME=tput_logprob_mb2_10step MASTER_PORT=29643 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2`
+  - 配置差异：
+    - baseline: rollout/ref logprob micro batch `1`
+    - this run: `actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2`，`actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2`
+    - 其他保持 baseline：`max_num_batched_tokens=3584`，`gpu_memory_utilization=0.8`，`free_cache_engine=True`，actor PPO micro batch `1`。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_logprob_mb2_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob_mb2_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob_mb2_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_logprob_mb2_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_logprob_mb2_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=56.809`
+    - `perf/total_num_tokens=698674.900`
+    - whole-machine throughput `=12298.752 token/s`
+    - `timing_s/gen=36.535`
+    - `timing_s/generate_sequences=23.333`
+    - `timing_s/old_log_prob=2.830`
+    - `timing_s/ref=3.473`
+    - `timing_s/update_actor=13.130`
+    - `response_length/mean=2637.536`
+    - `response_length/clip_ratio=0.544`
+    - GPU summary: `gpu_util_mean_pct=70.037`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=70656.535`，`gpu_mem_used_max_mib=155252.000`，`gpu_power_mean_w=640.909`
+  - 对比 baseline：
+    - step time 改善：`61.404 -> 56.809`（`-4.595s`，约 `7.5%`）。
+    - 整机吞吐改善：`11377.441 -> 12298.752 token/s`。
+    - `timing_s/gen` 改善：`39.485 -> 36.535`。
+    - `timing_s/old_log_prob` 改善：`3.139 -> 2.830`。
+    - `timing_s/ref` 明显改善：`4.806 -> 3.473`。
+    - `timing_s/update_actor` 基本持平：`13.127 -> 13.130`。
+  - 结论：
+    - 这是当前最好的 infra 配置，已经满足整机吞吐 `>=10k token/s`，但 step time `56.809s` 仍未达到 `<=40s`，active goal 未完成。
+    - 因为该改动是明确吞吐提升，应在形成可复现代码/文档检查后做本地 git commit 记录。
+    - 下一步跑组合 `tput_logprob_actor_mb2_10step`：保留 rollout/ref logprob micro batch `2`，再试 `actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2`，目标压缩 `update_actor`。
+- 2026-06-30 04:28 CST throughput exp 05：`tput_logprob_actor_mb2_10step`
+  - 目的：在当前最佳 `logprob_mb2` 基础上，提高 actor PPO micro batch，压缩 `update_actor`。
+  - 命令：
+    - `EXP_NAME=tput_logprob_actor_mb2_10step MASTER_PORT=29644 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2`
+  - 配置差异：
+    - baseline: rollout/ref logprob micro batch `1`，actor PPO micro batch `1`
+    - this run: rollout/ref logprob micro batch `2`，actor PPO micro batch `2`
+    - 其他保持 baseline：`max_num_batched_tokens=3584`，`gpu_memory_utilization=0.8`，`free_cache_engine=True`。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb2_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb2_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb2_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb2_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb2_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=54.109`
+    - `perf/total_num_tokens=699156.400`
+    - whole-machine throughput `=12921.354 token/s`
+    - `timing_s/gen=36.550`
+    - `timing_s/generate_sequences=23.314`
+    - `timing_s/old_log_prob=2.742`
+    - `timing_s/ref=3.182`
+    - `timing_s/update_actor=10.768`
+    - `response_length/mean=2639.417`
+    - `response_length/clip_ratio=0.539`
+    - GPU summary: `gpu_util_mean_pct=66.727`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=71987.383`，`gpu_mem_used_max_mib=156926.000`，`gpu_power_mean_w=630.788`
+  - 对比 baseline：
+    - step time 改善：`61.404 -> 54.109`（`-7.295s`，约 `11.9%`）。
+    - 整机吞吐改善：`11377.441 -> 12921.354 token/s`。
+    - `timing_s/gen` 改善：`39.485 -> 36.550`。
+    - `timing_s/old_log_prob` 改善：`3.139 -> 2.742`。
+    - `timing_s/ref` 改善：`4.806 -> 3.182`。
+    - `timing_s/update_actor` 改善：`13.127 -> 10.768`。
+  - 对比 `tput_logprob_mb2_10step`：
+    - step time 继续改善：`56.809 -> 54.109`（`-2.700s`）。
+    - `update_actor` 明显改善：`13.130 -> 10.768`。
+    - `ref` 小幅改善：`3.473 -> 3.182`。
+  - 结论：
+    - 这是当前最佳 infra 配置，整机吞吐已达标，但 step time `54.109s` 仍未达 `<=40s`，active goal 未完成。
+    - 这是明确提升，应保存本地 git commit 记录。
+    - 下一步继续沿 micro-batch 方向试更激进配置，优先 `tput_logprob_actor_mb4_10step`：rollout/ref logprob micro batch `4`，actor PPO micro batch `4`；若 OOM 或变慢则回退到 mb2。
+- 2026-06-30 04:44 CST throughput exp 06：`tput_logprob_actor_mb4_10step`
+  - 目的：在当前最佳 `logprob_actor_mb2` 基础上，继续增大 rollout/ref logprob micro batch 与 actor PPO micro batch，测试是否能进一步压缩 `old_log_prob`、`ref` 与 `update_actor`。
+  - 命令：
+    - `EXP_NAME=tput_logprob_actor_mb4_10step MASTER_PORT=29645 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4`
+  - 配置差异：
+    - baseline: rollout/ref logprob micro batch `1`，actor PPO micro batch `1`
+    - this run: rollout/ref logprob micro batch `4`，actor PPO micro batch `4`
+    - 其他保持 baseline：`max_num_batched_tokens=3584`，`gpu_memory_utilization=0.8`，`free_cache_engine=True`。
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb4_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb4_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb4_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb4_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_logprob_actor_mb4_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=50.074`
+    - `perf/total_num_tokens=699481.300`
+    - whole-machine throughput `=13968.980 token/s`
+    - `timing_s/gen=34.995`
+    - `timing_s/generate_sequences=23.346`
+    - `timing_s/old_log_prob=2.460`
+    - `timing_s/ref=2.364`
+    - `timing_s/update_actor=9.417`
+    - `response_length/mean=2640.686`
+    - `response_length/clip_ratio=0.535`
+    - GPU summary: `gpu_util_mean_pct=66.022`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=75424.857`，`gpu_mem_used_max_mib=157708.000`，`gpu_power_mean_w=625.159`
+  - 对比 `tput_logprob_actor_mb2_10step`：
+    - step time 改善：`54.109 -> 50.074`（`-4.035s`，约 `7.5%`）。
+    - 整机吞吐改善：`12921.354 -> 13968.980 token/s`。
+    - `timing_s/gen` 改善：`36.550 -> 34.995`。
+    - `timing_s/old_log_prob` 改善：`2.742 -> 2.460`。
+    - `timing_s/ref` 改善：`3.182 -> 2.364`。
+    - `timing_s/update_actor` 改善：`10.768 -> 9.417`。
+  - 结论：
+    - 这是当前最佳 infra 配置，整机吞吐已超过 `10k token/s`，但 step time `50.074s` 仍未达到 `<=40s`，active goal 未完成。
+    - 运行结束后 worker `976591` 出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，并在 log 中出现 `Fail to open /proc/self/stat` 等错误。按长期规则，该 worker 不可继续用于 GPU 实验，需先 kill 坏 worker 再重新申请唯一的新 8-GPU worker。
+    - 下一步继续固定 v28 算法参数，只调 infra。优先尝试降低 generation 主耗时和 actor/ref/logprob 开销，例如在新 worker 上跑 `gpu_memory_utilization`、更高 micro batch、FSDP/offload 或 vLLM cache/batching 相关的单变量 10-step 实验。
