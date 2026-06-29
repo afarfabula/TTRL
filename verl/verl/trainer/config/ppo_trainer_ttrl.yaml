@@ -72,6 +72,13 @@ ttrl:
   sps_clip_penalty: 0.0
   sps_weight_power: 1.0
 
+  # Answer-cluster distribution sharpening. beta=1 and capacity=false preserve
+  # the historical v14 behavior. beta>1 sharpens the per-prompt answer target
+  # distribution after logZ normalization; capacity=true uses that sharpened
+  # agreement confidence in the prompt-level training capacity.
+  sps_answer_sharpen_beta: 1.0
+  sps_answer_sharpen_capacity: false
+
   # Source for the base/internal logprob used by SPS confidence weighting.
   # "ref" keeps the historical behavior and uses the reference-policy worker.
   # "actor" avoids an independent ref worker and scores with the current actor.
@@ -81,8 +88,23 @@ ttrl:
   # Downsampling policy after n_votes_per_prompt rollouts are used for voting.
   # "first" keeps the historical behavior. "majority_first" prioritizes
   # rollouts whose extracted answer matches the majority pseudo label.
+  # "sharpened_cluster" additionally ranks candidates by parseability,
+  # non-clipping, and reference-reweighted sequence score within the answer
+  # cluster, sharpening the train distribution without true labels.
   sps_rollout_selection: first
+  sps_selection_temperature: ${ttrl.sps_weight_temperature_base}
+  sps_selection_require_majority: true
+  sps_selection_cluster_bonus: 4.0
+  sps_selection_parseable_bonus: 2.0
+  sps_selection_nonclip_bonus: 1.0
+  sps_selection_priority: score
 
   # Optional unsupervised self-consistency reward mixed into SPS modes. This is
   # the 0/1 reward against the rollout majority pseudo label, not true labels.
   sps_majority_reward_coef: 0.0
+
+  # Optional unsupervised format anchor. Adds the reward function's format_score
+  # to the pseudo-label reward before SPS prompt weighting. For MATH-TTT this is
+  # 1 when a boxed answer can be parsed and 0 otherwise; it does not use the
+  # true answer.
+  sps_format_reward_coef: 0.0

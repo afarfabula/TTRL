@@ -2435,6 +2435,114 @@ Worker 使用规则更新
   - 先跑 `Qwen2.5-Math-7B` 184-step v14 final-only。
   - 再跑 `Qwen3-8B` 184-step v14 final-only。
 
+追加记录：Qwen2.5-Math-7B v14 184-step 启动
+- 2026-06-29 02:50 CST，在 worker `975077` 启动：
+  - 脚本：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen25_math_7b_8_184step_v14.sh`
+  - 源模型：`/opt/tiger/qwen2.5_math_7b`
+  - worker 本地 copy：`/tmp/qwen2.5_math_7b_local_184_v14`
+  - Ray 目录：`/tmp/r184_v14_qwen25_math_7b`
+  - 主日志：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen25_math_7b_8_184step_v14.log`
+  - 参数确认：`trainer.total_training_steps=184`，`trainer.test_freq=184`，`trainer.val_before_train=False`。
+  - v14 参数确认：`ttrl.sps_weight_floor=0.15`，`ttrl.sps_clip_penalty=0.5`，`ttrl.sps_weight_power=1.5`，`ttrl.sps_base_logprob_source=ref`，`actor_rollout_ref.actor.use_kl_loss=True`。
+- 运行状态：
+  - 02:51 CST 模型 copy 到 `/tmp` 完成；`/tmp` 可用约 2.9T，未继续挤 `/opt/tiger` 系统盘。
+  - 02:54 CST 日志显示 `WorkerDict.actor_rollout_generate_sequences -> ref_compute_ref_log_prob -> actor_rollout_compute_log_prob -> actor_rollout_update_actor`，已进入训练步。
+  - step 1：`timing_s/step=51.053`，`perf/throughput=720.623`，`train_weight=0.321`，`ground_truth_reward=0.336`。
+  - step 2：`timing_s/step=41.037`，`perf/throughput=847.618`，`train_weight=0.251`，`ground_truth_reward=0.305`。
+  - step 3：`timing_s/step=41.964`，`perf/throughput=811.155`，`train_weight=0.353`，`ground_truth_reward=0.414`。
+  - 未出现中途 validation；预期唯一 validation 在 step 184。
+- 03:01 CST 监控到 step 10：
+  - step 4：`timing_s/step=39.776`，`perf/throughput=1031.635`，`train_weight=0.305`，`ground_truth_reward=0.301`。
+  - step 5：`timing_s/step=41.119`，`perf/throughput=1040.747`，`train_weight=0.296`，`ground_truth_reward=0.332`。
+  - step 6：`timing_s/step=46.472`，`perf/throughput=815.281`，`train_weight=0.442`，`ground_truth_reward=0.492`。
+  - step 7：`timing_s/step=40.826`，`perf/throughput=873.676`，`train_weight=0.529`，`ground_truth_reward=0.555`。
+  - step 8：`timing_s/step=41.902`，`perf/throughput=760.323`，`train_weight=0.529`，`ground_truth_reward=0.539`。
+  - step 9：`timing_s/step=40.722`，`perf/throughput=818.678`，`train_weight=0.502`，`ground_truth_reward=0.586`。
+  - step 10：`timing_s/step=38.727`，`perf/throughput=892.119`，`train_weight=0.439`，`ground_truth_reward=0.605`。
+  - `/proc/self` 与 `/proc/meminfo` 仍存在；无中途 validation。
+- 03:08 CST 监控到 step 20：
+  - step 13：`timing_s/step=36.317`，`train_weight=0.626`，`ground_truth_reward=0.676`。
+  - step 14：`timing_s/step=38.178`，`train_weight=0.524`，`ground_truth_reward=0.562`。
+  - step 16：`timing_s/step=37.049`，`train_weight=0.561`，`ground_truth_reward=0.598`。
+  - step 18：`timing_s/step=39.816`，`train_weight=0.666`，`ground_truth_reward=0.758`。
+  - step 20：`timing_s/step=38.972`，`train_weight=0.558`，`ground_truth_reward=0.586`。
+  - `/proc/self` 与 `/proc/meminfo` 仍存在；仍无 validation 记录。
+- 03:20 CST 监控到 step 40：
+  - step 22：`timing_s/step=36.577`，`train_weight=0.591`，`ground_truth_reward=0.613`。
+  - step 24：`timing_s/step=38.006`，`train_weight=0.644`，`ground_truth_reward=0.676`。
+  - step 28：`timing_s/step=38.144`，`train_weight=0.649`，`ground_truth_reward=0.703`。
+  - step 31：`timing_s/step=41.174`，`train_weight=0.487`，`ground_truth_reward=0.598`。
+  - step 35：`timing_s/step=37.184`，`train_weight=0.531`，`ground_truth_reward=0.617`。
+  - step 40：`timing_s/step=38.154`，`train_weight=0.838`，`ground_truth_reward=0.844`。
+  - 仍无 validation 记录；符合 `trainer.test_freq=184`。
+- 03:27 CST 监控到 step 50：
+  - step 45：`timing_s/step=39.656`，`train_weight=0.528`，`ground_truth_reward=0.598`。
+  - step 50：`timing_s/step=36.271`，`train_weight=0.767`，`ground_truth_reward=0.816`。
+  - `/proc/self` 与 `/proc/meminfo` 仍存在；step 50 未触发 validation，确认 final-only 配置仍正常。
+- 03:51 CST 监控到 step 88：
+  - step 55：`timing_s/step=34.826`，`train_weight=0.703`，`ground_truth_reward=0.770`。
+  - step 64：`timing_s/step=36.008`，`train_weight=0.772`，`ground_truth_reward=0.824`。
+  - step 72：`timing_s/step=35.621`，`train_weight=0.777`，`ground_truth_reward=0.820`。
+  - step 80：`timing_s/step=38.747`，`train_weight=0.606`，`ground_truth_reward=0.535`。
+  - step 88：`timing_s/step=37.539`，`train_weight=0.836`，`ground_truth_reward=0.840`。
+  - 仍无 validation 记录，训练主链路正常。
+- 04:10 CST 监控到 step 119：
+  - step 97：`timing_s/step=37.600`，`train_weight=0.715`，`ground_truth_reward=0.777`。
+  - step 105：`timing_s/step=36.706`，`train_weight=0.698`，`ground_truth_reward=0.699`。
+  - step 111：`timing_s/step=34.103`，`train_weight=0.883`，`ground_truth_reward=0.910`。
+  - step 119：`timing_s/step=35.616`，`train_weight=0.759`，`ground_truth_reward=0.797`。
+  - `/proc/self` 与 `/proc/meminfo` 仍存在；仍无 validation 记录。
+- 04:30 CST 监控到 step 153：
+  - step 128：`timing_s/step=33.961`，`train_weight=0.946`，`ground_truth_reward=0.836`。
+  - step 136：`timing_s/step=38.434`，`train_weight=0.826`，`ground_truth_reward=0.840`。
+  - step 145：`timing_s/step=35.585`，`train_weight=0.653`，`ground_truth_reward=0.770`。
+  - step 153：`timing_s/step=33.737`，`train_weight=0.946`，`ground_truth_reward=0.961`。
+  - `/proc/self` 与 `/proc/meminfo` 仍存在；仍无 validation 记录。
+- Qwen2.5-Math-7B v14 184-step 最终结果：
+  - 2026-06-29 04:50 CST，worker `975077` 完成，`WORKER_QWEN25_MATH_7B_V14_184_EXIT status=0`。
+  - 运行完整性：
+    - `trainer.val_before_train=False`，`trainer.test_freq=184`，step 50/100 等中途均无 validation。
+    - 唯一 validation 在 step 184 触发；`timing_s/testing=140.237`，`timing_s/step=176.360`。
+  - step 184 训练诊断：
+    - `train/sps/effective_K=63.910`
+    - `train/sps/weighted_label_confidence=0.940`
+    - `train/sps/train_weight=0.920`
+    - `train/ground_truth_reward=0.871`
+    - `train/pass@32=0.875`
+    - `train/majority_ratio=0.932`
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.8435613682092555`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8692736418511067`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.8476639839034205`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.8131247484909456`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.988`
+  - 结果文件：
+    - 主日志：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen25_math_7b_8_184step_v14.log`
+    - Ray taskrunner 快照：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen25_math_7b_8_184step_v14_ray_taskrunner.log`
+    - metrics 快照：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen25_math_7b_8_184step_v14_metrics.txt`
+  - worker 后置状态：
+    - 训练退出后 worker `975077` 出现空 `/proc`：`/proc/self` 与 `/proc/meminfo` 缺失，`find /proc -maxdepth 1 | wc -l = 1`。
+    - 按 worker 规则，该 worker 不能继续用于 Qwen3-8B；需要先 kill，再申请/登录一个新的单 worker。
+- worker 切换：
+  - 2026-06-29 04:55 CST，已执行 `NO_COLOR=1 TERM=dumb mlx worker kill 975077`，输出 `killing 1 workers: 975077`。
+  - kill 后复查 `mlx worker list` 为空，再申请新 worker；未同时保留两个 worker。
+
+追加记录：Qwen3-8B v14 184-step 启动
+- 2026-06-29 04:57 CST，新 worker `975102` Ready 并自动 login。
+- worker 健康检查：
+  - hostname：`trial-301427146-trialrun-301427146-worker-0`
+  - `/proc/self` 与 `/proc/meminfo` 存在，`find /proc -maxdepth 1 | wc -l = 71`。
+  - GPU：8x NVIDIA B200，GPU 0-7 均可见。
+  - 磁盘：`/opt/tiger` 可用约 6.7G，`/tmp` 可用约 2.9T；训练仍复制模型到 `/tmp`，不继续挤系统盘。
+  - `/opt/tiger/qwen3_8b` 在 worker 内用 `/opt/tiger/modelchef/.venv/bin/python` 离线 `AutoConfig` / `AutoTokenizer` 校验通过：`qwen3`，`Qwen3ForCausalLM`，`hidden_size=4096`，`num_hidden_layers=36`，`max_position_embeddings=40960`，tokenizer length `151669`。
+- 2026-06-29 04:58 CST 启动：
+  - 脚本：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_184step_v14.sh`
+  - 源模型：`/opt/tiger/qwen3_8b`
+  - worker 本地 copy：`/tmp/qwen3_8b_local_184_v14`
+  - Ray 目录：`/tmp/r184_v14_qwen3_8b`
+  - 主日志：`/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_184step_v14.log`
+  - 参数同 v14：`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，`actor.use_kl_loss=True`，`trainer.total_training_steps=184`，`trainer.test_freq=184`，`val_before_train=False`。
+
 追加记录：best-v14 185-step rerun 监控
 - 2026-06-28 19:39 CST，fixed best-v14 185-step rerun 仍在 worker `974803` 上健康运行。
 - worker 与运行完整性：
@@ -3209,3 +3317,867 @@ v18 最终结果
   - 若 final `val-core/MATH-TTT/acc/mean@4 >= 0.85`，立即以同方案启动 185-step 实验。
   - 若高于 v14 但仍低于 0.85，保存 local improvement commit。
   - 若低于 v14，不做 commit。
+
+新模型迁移：Qwen3-8B v14 184-step early status
+- 2026-06-29 05:04 CST，继续监控 worker `975102` 上的 Qwen3-8B v14 184-step final-only run。
+- 单 worker 状态：
+  - `NO_COLOR=1 TERM=dumb mlx worker list` 只显示一个 worker：`975102`，8x NVIDIA-B200。
+  - worker hostname: `trial-301427146-trialrun-301427146-worker-0`。
+  - worker `/proc` 健康：`find /proc -maxdepth 1 | wc -l = 365`，`/proc/self` 和 `/proc/meminfo` 均存在。
+  - worker `/tmp` 仍有约 2.9T 可用；`/opt/tiger` 仍约 6.7G 可用，不再写入模型权重。
+- 运行状态：
+  - main log: `/opt/tiger/TTRL/verl/sps_rule_conf_weight_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_184step_v14.log`。
+  - Ray taskrunner log: `/tmp/r184_v14_qwen3_8b/ray/session_latest/logs/worker-e0d213b8f821e40e6f3222eb35667955d95c441f4ed201ea99388ea4-01000000-33296.out`。
+  - `trainer.total_training_steps=184`，`trainer.test_freq=184`，`trainer.val_before_train=False`。
+  - step 1 已出现，说明训练已进入正常 GPU 执行而非卡在启动阶段。
+- step 1 指标：
+  - `training/global_step=1.000`
+  - `train/sps/effective_K=63.899`
+  - `train/sps/weighted_label_confidence=0.750`
+  - `train/sps/train_weight=0.517`
+  - `train/ground_truth_reward=0.469`
+  - `train/pass@32=0.750`
+  - `train/majority_ratio=0.477`
+  - `timing_s/step=67.393`
+  - `perf/throughput=1230.693`
+  - 当前未出现中途 validation。
+  - step 2-3 更新：
+    - step 2：`weighted_label_confidence=0.835`，`train_weight=0.556`，`ground_truth_reward=0.570`，`timing_s/step=59.236`，`perf/throughput=1519.868`。
+    - step 3：`weighted_label_confidence=0.875`，`train_weight=0.590`，`ground_truth_reward=0.602`，`timing_s/step=60.239`，`perf/throughput=1477.745`。
+    - GPU 侧检查：8x B200 显存约 155GB/183GB，利用率 100%，训练正常推进。
+    - 早期现象：`train/sps/effective_K` 持续约 `63.89`，`softmax_weight_entropy` 约 `4.158 ~= log(64)`，说明 Qwen3-8B 上 trajectory-level ref-vs-rollout SPS 权重几乎是平的；v14 真正起作用的是答案簇一致性、SPS-majority agreement 与 prompt-level capacity gating。
+- step 4-11 监控摘要：
+  - step 4：`effective_K=63.865`，`weighted_conf=0.497`，`train_weight=0.344`，`ground_truth_reward=0.355`，`timing_s/step=59.393`。
+  - step 5：`effective_K=63.896`，`weighted_conf=0.704`，`train_weight=0.405`，`ground_truth_reward=0.289`，`timing_s/step=57.722`。
+  - step 6：`effective_K=63.891`，`weighted_conf=0.856`，`train_weight=0.488`，`ground_truth_reward=0.426`，`timing_s/step=64.729`。
+  - step 7：`effective_K=63.899`，`weighted_conf=0.603`，`train_weight=0.447`，`ground_truth_reward=0.543`，`timing_s/step=60.296`。
+  - step 8：`effective_K=63.879`，`weighted_conf=0.625`，`train_weight=0.517`，`ground_truth_reward=0.531`，`timing_s/step=63.604`。
+  - step 9：`effective_K=63.924`，`weighted_conf=0.875`，`train_weight=0.613`，`ground_truth_reward=0.680`，`timing_s/step=58.237`。
+  - step 10：`effective_K=63.933`，`weighted_conf=1.000`，`train_weight=0.606`，`ground_truth_reward=0.723`，`timing_s/step=59.135`。
+  - step 11：`effective_K=63.887`，`weighted_conf=0.250`，`train_weight=0.234`，`ground_truth_reward=0.250`，`timing_s/step=63.915`。
+  - 观察：step 11 这种低一致性 batch 会被现有 v14 容量算法压低，但 `effective_K` 仍接近 64；后续改动应显式锐化 answer cluster target/capacity，而不是期待 trajectory SPS 权重自然变尖。
+- step 12-22 监控摘要：
+  - step 12：`effective_K=63.911`，`weighted_conf=0.750`，`train_weight=0.587`，`ground_truth_reward=0.504`，`timing_s/step=63.860`。
+  - step 13：`effective_K=63.917`，`weighted_conf=0.817`，`train_weight=0.541`，`ground_truth_reward=0.551`，`timing_s/step=59.150`。
+  - step 14：`effective_K=63.917`，`weighted_conf=0.875`，`train_weight=0.648`，`ground_truth_reward=0.734`，`timing_s/step=58.799`。
+  - step 15：`effective_K=63.939`，`weighted_conf=0.875`，`train_weight=0.769`，`ground_truth_reward=0.773`，`timing_s/step=57.511`。
+  - step 16：`effective_K=63.935`，`weighted_conf=0.500`，`train_weight=0.500`，`ground_truth_reward=0.500`，`timing_s/step=58.302`。
+  - step 17：`effective_K=63.954`，`weighted_conf=1.000`，`train_weight=0.744`，`ground_truth_reward=0.750`，`timing_s/step=58.390`。
+  - step 18：`effective_K=63.937`，`weighted_conf=0.977`，`train_weight=0.738`，`ground_truth_reward=0.703`，`timing_s/step=57.624`。
+  - step 19：`effective_K=63.933`，`weighted_conf=0.750`，`train_weight=0.586`，`ground_truth_reward=0.598`，`timing_s/step=58.382`。
+  - step 20：`effective_K=63.910`，`weighted_conf=0.730`，`train_weight=0.556`，`ground_truth_reward=0.531`，`timing_s/step=58.214`。
+  - step 21：`effective_K=63.924`，`weighted_conf=1.000`，`train_weight=0.579`，`ground_truth_reward=0.473`，`timing_s/step=64.054`。
+  - step 22：`effective_K=63.939`，`weighted_conf=0.875`，`train_weight=0.665`，`ground_truth_reward=0.691`，`timing_s/step=58.452`。
+  - 运行完整性：截至 step 22 仍无中途 validation；只有 Ray dashboard/log_monitor 的已知非阻断 warning。
+- step 23-30 监控摘要：
+  - step 23：`effective_K=63.915`，`weighted_conf=0.750`，`train_weight=0.401`，`ground_truth_reward=0.410`，`timing_s/step=59.607`。
+  - step 24：`effective_K=63.953`，`weighted_conf=1.000`，`train_weight=0.789`，`ground_truth_reward=0.875`，`timing_s/step=58.740`。
+  - step 25：`effective_K=63.943`，`weighted_conf=0.998`，`train_weight=0.818`，`ground_truth_reward=0.871`，`timing_s/step=57.362`。
+  - step 26：`effective_K=63.959`，`weighted_conf=1.000`，`train_weight=0.761`，`ground_truth_reward=0.816`，`timing_s/step=57.928`。
+  - step 27：`effective_K=63.930`，`weighted_conf=0.875`，`train_weight=0.682`，`ground_truth_reward=0.715`，`timing_s/step=59.780`。
+  - step 28：`effective_K=63.956`，`weighted_conf=1.000`，`train_weight=0.674`，`ground_truth_reward=0.703`，`timing_s/step=58.918`。
+  - step 29：`effective_K=63.960`，`weighted_conf=1.000`，`train_weight=0.867`，`ground_truth_reward=0.906`，`timing_s/step=58.147`。
+  - step 30：`effective_K=63.922`，`weighted_conf=0.875`，`train_weight=0.720`，`ground_truth_reward=0.766`，`timing_s/step=63.694`。
+  - 观察：step 24-30 多数 batch 进入高一致性阶段，`train_weight` 明显上升；但 `effective_K` 仍接近 64，继续支持“trajectory 权重不尖、answer cluster 容量在起主要作用”的判断。
+- step 31-57 监控摘要：
+  - step 31-39：`effective_K` 继续约 `63.93-63.96`；`train_weight` 多数在 `0.60-0.75`，低一致性 step 35 降到 `0.402`。
+  - step 40：`effective_K=63.928`，`weighted_conf=0.875`，`train_weight=0.838`，`ground_truth_reward=0.852`，`timing_s/step=62.502`。
+  - step 45：`effective_K=63.942`，`weighted_conf=1.000`，`train_weight=0.629`，`ground_truth_reward=0.641`，`timing_s/step=60.840`。
+  - step 50：`effective_K=63.961`，`weighted_conf=1.000`，`train_weight=0.809`，`ground_truth_reward=0.828`，`timing_s/step=57.358`。
+  - step 51：`effective_K=63.964`，`weighted_conf=0.975`，`train_weight=0.846`，`ground_truth_reward=0.867`，`timing_s/step=56.461`。
+  - step 54：`effective_K=63.961`，`weighted_conf=1.000`，`train_weight=0.881`，`ground_truth_reward=0.844`，`timing_s/step=59.691`。
+  - step 56：`effective_K=63.961`，`weighted_conf=1.000`，`train_weight=0.913`，`ground_truth_reward=0.875`，`timing_s/step=58.653`。
+  - step 57：`effective_K=63.969`，`weighted_conf=1.000`，`train_weight=0.827`，`ground_truth_reward=0.938`，`timing_s/step=58.968`。
+  - 运行完整性：step 50 未触发 validation，确认 `test_freq=184` 生效；截至 step 57 仍为 final-only 训练。
+- step 58-106 监控摘要：
+  - step 60：`effective_K=63.958`，`weighted_conf=0.992`，`train_weight=0.733`，`ground_truth_reward=0.871`，`timing_s/step=59.582`。
+  - step 72：`effective_K=63.952`，`weighted_conf=1.000`，`train_weight=0.859`，`ground_truth_reward=0.879`，`timing_s/step=55.782`。
+  - step 84：`effective_K=63.848`，`weighted_conf=0.982`，`train_weight=0.893`，`ground_truth_reward=0.957`，`timing_s/step=56.563`。
+  - step 91：`effective_K=63.954`，`weighted_conf=0.996`，`train_weight=0.917`，`ground_truth_reward=0.902`，`timing_s/step=55.981`。
+  - step 96：`effective_K=63.952`，`weighted_conf=1.000`，`train_weight=0.950`，`ground_truth_reward=0.988`，`timing_s/step=56.388`。
+  - step 100：`effective_K=63.964`，`weighted_conf=0.996`，`train_weight=0.916`，`ground_truth_reward=0.922`，`timing_s/step=55.575`。
+  - step 106：`effective_K=63.940`，`weighted_conf=0.817`，`train_weight=0.643`，`ground_truth_reward=0.590`，`timing_s/step=58.610`。
+  - 观察：后半段许多 batch 的 `train_weight` 超过 `0.85`，但 `effective_K` 仍贴近 64；这进一步说明 v14 的有效信号是 answer-level capacity，而非 trajectory-level SPS softmax 自然锐化。
+  - 运行完整性：step 100 仍未 validation，符合 `test_freq=184`。
+- step 107-146 监控摘要：
+  - step 108：`effective_K=63.945`，`weighted_conf=0.996`，`train_weight=0.993`，`ground_truth_reward=1.000`，`timing_s/step=48.990`。
+  - step 120：`effective_K=63.905`，`weighted_conf=0.997`，`train_weight=0.989`，`ground_truth_reward=0.992`，`timing_s/step=48.903`。
+  - step 124：`effective_K=63.908`，`weighted_conf=1.000`，`train_weight=1.000`，`ground_truth_reward=1.000`，`timing_s/step=50.177`。
+  - step 130：`effective_K=63.921`，`weighted_conf=0.990`，`train_weight=0.979`，`ground_truth_reward=0.992`，`timing_s/step=53.462`。
+  - step 138：`effective_K=63.898`，`weighted_conf=1.000`，`train_weight=0.996`，`ground_truth_reward=0.992`，`timing_s/step=47.766`。
+  - step 143：`effective_K=63.927`，`weighted_conf=1.000`，`train_weight=0.981`，`ground_truth_reward=0.996`，`timing_s/step=52.788`。
+  - step 146：`effective_K=63.904`，`weighted_conf=0.994`，`train_weight=0.872`，`ground_truth_reward=0.926`，`timing_s/step=59.865`。
+  - 观察：训练后段多次出现 `train_weight ~= 1.0` 且诊断 ground-truth reward 接近 1 的 batch；这显示 v14 的 confidence/capacity 机制能识别强 prompt，但仍没有 trajectory-level distribution sharpening。
+- Qwen3-8B v14 184-step final 结果：
+  - 2026-06-29 08:05 CST，worker `975102` 上正常完成，`WORKER_QWEN3_8B_V14_184_EXIT status=0`。
+  - 运行完整性：
+    - 8x NVIDIA B200，`trainer.total_training_steps=184`，`trainer.test_freq=184`，`trainer.val_before_train=False`。
+    - 没有中途 validation；唯一 validation 在 step 184 触发。
+    - 完成后 worker `/proc` 仍健康：`find /proc -maxdepth 1 | wc -l = 77`，`/proc/self` 与 `/proc/meminfo` 存在。
+    - 完成后 GPU 0-7 显存占用 0 MiB，worker 可继续用于下一轮实验。
+  - step 184 训练诊断：
+    - `train/sps/effective_K=63.918`
+    - `train/sps/weighted_label_confidence=0.992`
+    - `train/sps/train_weight=0.902`
+    - `train/ground_truth_reward=0.863`
+    - `train/pass@32=0.875`
+    - `train/majority_ratio=0.869`
+    - `timing_s/testing=165.686`
+    - `timing_s/step=223.708`（含 final validation）
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.8742454728370221`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.9084225352112676`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.876682092555332`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.8364748490945674`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.8948692152917505`
+  - 对比与结论：
+    - Qwen3-8B v14 184-step 明显高于 Qwen2.5-Math-7B v14 184-step 的 `mean@4=0.8435613682092555`，但仍低于本 goal 要求的 Qwen3-8B 50-step `mean@4 >= 0.90`。
+    - 继续按已准备的 v21 answer target distribution sharpening 方案跑 Qwen3-8B 50-step final-only 实验。
+
+下一版 Qwen3-8B 50-step 优化方向：answer target distribution sharpening
+- 设计来源：
+  - SPS 现象：v14 在 Qwen3-4B 上有效，来自“多数票 pseudo label + SPS agreement confidence + 容量 gating”；Qwen3-8B 早期日志显示 rollout trajectory softmax 不尖锐，不能继续只依赖原始 trajectory logprob 权重。
+  - PowerFlow 启发：PowerFlow 的 `delta = log_z + avg_log_prob_current - beta * adjusted_ref_reward_term` 可以理解为匹配 `reward-reweighted reference distribution`；其中 `beta` 控制锐化强度，`log_z` 是 per-prompt normalizer。
+- 候选算法：
+  - 在 `apply_sps_weighted_ttrl_gt` 的 answer cluster 层面引入更显式的目标分布锐化，而不是只调 `floor/clip/power`。
+  - 对每个 prompt，先按答案簇聚合当前已有的 SPS score：`A(a)=logsumexp_i(score_i/temp)`。
+  - 再构造 sharpened target：`p_sharp(a)=softmax(beta_answer * (A(a)-logZ))`，其中 `logZ=logsumexp_a(A(a))` 是 prompt 内 normalizer，`beta_answer > 1` 对应 PowerFlow 的 distribution sharpening / reward-reweighted reference 强度。
+  - pseudo label 仍采用 majority label 或 SPS-majority agreement 保护，不引入真实答案；但训练容量从 `max(majority_ratio, agreement_confidence)` 改为结合 `p_sharp(majority_gt)`、`p_sharp(weighted_gt)`、agreement 与 clip penalty。
+  - 重点指标：新增记录 `answer_entropy`、`answer_effective_K`、`answer_sharp_confidence`、`answer_logZ`、`answer_beta`，用于证明分布确实被锐化。
+- 初始实验建议：
+  - 从保守版本开始：保持 v14 的 `floor=0.15`、`clip_penalty=0.5`、`base_logprob_source=ref`、actor fp32、8 GPU、50 step final-only。
+  - 新增 `sps_answer_sharpen_beta=2.0` 或等价温度参数，优先只改变 answer cluster target/capacity，不改变 rollout K、学习率和 validation 频率。
+  - 若 50-step `mean@4 >= 0.90`，直接按同方案跑 184/185-step final-only；若高于 Qwen3-8B v14 50-step baseline 或显示更优早期诊断，再保存 local git commit。
+- 2026-06-29 05:18 CST 代码准备状态：
+  - 已在 `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 中增加 answer-cluster sharpen 计算：`sps_answer_sharpen_beta`、`sps_answer_sharpen_capacity`，以及 `answer_sharp_confidence`、`answer_entropy`、`answer_effective_K`、`answer_logZ`、`majority_sharp_confidence` 诊断数组。
+  - 已在 `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 中把上述参数接入 `apply_sps_weighted_ttrl_gt`，并记录 `train/sps/answer_*` 指标。
+  - 已在 `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml` 中加入默认配置；默认 `beta=1.0` 且 `capacity=false`，保持 v14 行为不变。
+  - 已新增待跑脚本 `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_answer_sharpen_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v21.sh`。
+  - 静态检查通过：`py_compile` 检查 `ttrl_utils.py` / `ray_trainer.py`，`bash -n` 检查 v21 脚本。
+  - v21 已在 Qwen3-8B v14 184-step baseline 完成后启动。
+
+启动尝试 19：Qwen3-8B v21 answer sharpen 50-step
+- 2026-06-29 08:11 CST，在同一健康 worker `975102` 上启动 v21；未 launch 第二个 worker。
+- 启动前 worker 状态：
+  - v14 完成后 `/proc` 健康，GPU 0-7 空闲。
+  - `/opt/tiger` 约 5.7G 可用，系统盘很紧；v21 仍只把 `/opt/tiger/qwen3_8b` 复制到 worker `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - `/tmp` 约 2.9T 可用。
+- 脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_answer_sharpen_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v21.sh`
+  - 日志：`/opt/tiger/TTRL/verl/sps_answer_sharpen_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v21.log`
+  - Ray 目录：`/tmp/r21_qwen3_8b_answer_sharpen`
+- 配置：
+  - 保持 v14 主干：`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，8 GPU。
+  - 新增：`ttrl.sps_answer_sharpen_beta=2.0`，`ttrl.sps_answer_sharpen_capacity=True`。
+  - `trainer.total_training_steps=50`，`trainer.test_freq=50`，`trainer.val_before_train=False`。
+- step 1 状态：
+  - `training/global_step=1.000`
+  - `train/sps/effective_K=63.899`
+  - `train/sps/weighted_label_confidence=0.750`
+  - `train/sps/train_weight=0.517`
+  - `train/sps/answer_sharpen_beta=2.000`
+  - `train/sps/answer_sharpen_capacity=1.000`
+  - `train/sps/answer_sharp_confidence=0.750`
+  - `train/sps/answer_entropy=0.000`
+  - `train/sps/answer_effective_K=0.750`
+  - `train/sps/answer_logz=2.350`
+  - `train/sps/majority_sharp_confidence=0.750`
+  - `train/ground_truth_reward=0.469`
+  - `timing_s/step=67.751`
+  - 观察：step 1 与 v14 基本一致，原因是该 batch 多数 prompt 只有单一答案簇；v21 的差异要看多答案簇 batch 与 step 50 final validation。
+
+Qwen3-8B v21 answer sharpen 50-step final 结果
+- 2026-06-29 09:07 CST，在 worker `975102` 上正常完成，`WORKER_QWEN3_8B_V21_EXIT status=0`。
+- 运行完整性：
+  - 8x NVIDIA B200，`trainer.total_training_steps=50`，`trainer.test_freq=50`，`trainer.val_before_train=False`。
+  - 没有中途 validation；唯一 validation 在 step 50 触发。
+  - 日志：`/opt/tiger/TTRL/verl/sps_answer_sharpen_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v21.log`。
+  - Ray task 日志：`/tmp/r21_qwen3_8b_answer_sharpen/ray/session_latest/logs/worker-2494a947835881c8c4456b070e02320c3d7f3c33ab6fc2f3617e08d7-01000000-75772.out`。
+- 配置：
+  - v14 主干：`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，8 GPU。
+  - 新增 answer-cluster sharpening：`ttrl.sps_answer_sharpen_beta=2.0`，`ttrl.sps_answer_sharpen_capacity=True`。
+- step 50 训练诊断：
+  - `train/sps/effective_K=63.955`
+  - `train/sps/weighted_label_confidence=0.875`
+  - `train/sps/train_weight=0.764`
+  - `train/sps/answer_sharpen_beta=2.000`
+  - `train/sps/answer_sharpen_capacity=1.000`
+  - `train/sps/answer_sharp_confidence=0.875`
+  - `train/sps/answer_entropy=0.000`
+  - `train/sps/answer_effective_K=0.875`
+  - `train/sps/answer_logz=3.366`
+  - `train/sps/majority_sharp_confidence=0.875`
+  - `train/ground_truth_reward=0.820`
+  - `train/pass@32=0.875`
+  - `train/majority_ratio=0.828`
+  - `timing_s/testing=172.307`
+  - `timing_s/step=229.392`（含 final validation）
+- final validation：
+  - `val-core/MATH-TTT/acc/mean@4=0.7655935613682092`
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8170221327967808`
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7662575452716297`
+  - `val-aux/MATH-TTT/acc/worst@4/mean=0.713271629778672`
+  - `val-aux/MATH-TTT/format_score/mean@4=0.7731388329979879`
+- 结论：
+  - v21 明显劣于 Qwen3-8B v14 主干，不是可提交改进，暂不 commit。
+  - 失败原因倾向于：`sps_answer_sharpen_capacity=True` 把 sharpened answer confidence 直接作为容量信号，过强地压低了有效训练面，且 final format score 从 v14 184-step 的 `0.8949` 级别掉到 `0.7731`，说明该容量公式破坏了生成格式和泛化。
+  - 下一版不要继续增强 answer-capacity；优先保留可解释的 sharpen diagnostics，但训练容量回到 v14 的 SPS agreement/capacity 主干，或者只用更保守的 residual 形式做小幅调制。
+
+启动尝试 20：Qwen3-8B v22 answer-sharpen diagnostic 50-step
+- 设计动机：
+  - v21 证明“直接用 sharpened answer confidence 替代 v14 容量”会明显伤害 50-step final 指标和格式分数。
+  - v22 回到 v14 的训练容量公式：`prompt_weight=max(majority_ratio, weighted_confidence if SPS label agrees with majority else 0)`，再乘 clip penalty 和 `power=1.5`。
+  - 同时保留 PowerFlow-style answer distribution sharpening 诊断：`beta=2.0`、`answer_logz`、`answer_entropy`、`answer_effective_K`、`majority_sharp_confidence`，用于观察分布锐化信号，但不让它直接改变训练权重。
+  - 这不是最终算法增强，而是为了建立 Qwen3-8B 50-step 的可比 v14 主干上限，并避免继续沿 v21 的过强容量方向浪费 GPU。
+- 配置：
+  - 脚本：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_answer_sharpen_diag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v22.sh`
+  - 日志：`/opt/tiger/TTRL/verl/sps_answer_sharpen_diag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v22.log`
+  - Ray 目录：`/tmp/r22_qwen3_8b_answer_sharpen_diag`
+  - 模型：优先复用 worker `/tmp/qwen3_8b_local_v21_answer_sharpen`；若不存在才从 `/opt/tiger/qwen3_8b` copy 到 `/tmp`，不占用系统盘新权重空间。
+  - 训练：8 GPU，50 step，`trainer.test_freq=50`，`trainer.val_before_train=False`，final-only validation。
+  - 主干：`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，`actor.use_kl_loss=True`。
+  - sharpen 诊断：`ttrl.sps_answer_sharpen_beta=2.0`，`ttrl.sps_answer_sharpen_capacity=False`。
+- 2026-06-29 09:19 CST 启动于 worker `975102`，未 launch 新 worker。
+- 启动前/启动中状态：
+  - worker `/proc` 健康，`/proc/self` 与 `/proc/meminfo` 存在。
+  - GPU 0-7 为空闲 B200；训练进入 GPU 阶段后显存约 147GB/卡，利用率约 98-100%。
+  - `/opt/tiger` 可用约 4.6G，`/tmp` 可用约 2.9T；模型 copy 复用 `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - Ray dashboard `HistoryServerHead` 与 log monitor 仍有历史一致的非阻断报错；task runner 正常进入训练。
+- step 1 状态：
+  - task log：`/tmp/r22_qwen3_8b_answer_sharpen_diag/ray/session_latest/logs/worker-aba7a5306e604529f0d15264f0d373d71bb2603595787e59496bc238-01000000-115216.out`
+  - `training/global_step=1.000`
+  - `train/sps/effective_K=63.899`
+  - `train/sps/weighted_label_confidence=0.750`
+  - `train/sps/train_weight=0.517`
+  - `train/sps/answer_sharpen_beta=2.000`
+  - `train/sps/answer_sharpen_capacity=0.000`
+  - `train/sps/answer_sharp_confidence=0.750`
+  - `train/sps/answer_entropy=0.000`
+  - `train/sps/answer_effective_K=0.750`
+  - `train/sps/answer_logz=2.350`
+  - `train/sps/majority_sharp_confidence=0.750`
+  - `train/ground_truth_reward=0.469`
+  - `train/pass@32=0.750`
+  - `train/majority_ratio=0.477`
+  - `timing_s/step=68.164`
+  - 观察：step 1 与 v14/v21 的基础诊断一致，说明 v22 没有改变训练容量，只新增 sharpen 诊断；需要看 step 50 final validation 作为 Qwen3-8B 50-step v14 主干可比基线。
+- step 2-10 监控摘要：
+  - step 2：`weighted_conf=0.846`，`train_weight=0.570`，`answer_sharp_confidence=0.865`，`answer_entropy=0.035`，`ground_truth_reward=0.559`，`pass@32=0.875`，`timing_s/step=60.458`。
+  - step 4：低一致性 batch，`weighted_conf=0.375`，`train_weight=0.308`，`answer_sharp_confidence=0.375`，`ground_truth_reward=0.363`，`pass@32=0.375`，`timing_s/step=61.348`。
+  - step 8：`weighted_conf=0.625`，`train_weight=0.495`，`answer_sharp_confidence=0.625`，`ground_truth_reward=0.539`，`pass@32=0.625`，`timing_s/step=66.214`。
+  - step 10：高一致性 batch，`weighted_conf=1.000`，`train_weight=0.609`，`answer_sharp_confidence=1.000`，`ground_truth_reward=0.695`，`pass@32=1.000`，`timing_s/step=62.422`。
+  - 观察：v22 训练容量确实回到了 v14 主干；answer sharpen 指标只在多答案簇时提供额外分布形状信号，没有直接替换 `train_weight`。
+- step 15-20 监控摘要：
+  - step 15：`weighted_conf=0.875`，`train_weight=0.772`，`answer_sharp_confidence=0.875`，`ground_truth_reward=0.766`，`pass@32=0.875`，`timing_s/step=59.284`。
+  - step 20：`weighted_conf=0.727`，`train_weight=0.560`，`answer_sharp_confidence=0.744`，`answer_entropy=0.025`，`ground_truth_reward=0.562`，`pass@32=0.750`，`timing_s/step=60.118`。
+  - 运行完整性：截至 step 20 没有中途 validation，符合 `trainer.test_freq=50`；GPU 利用率正常。
+- step 25-30 监控摘要：
+  - step 25：强 batch，`weighted_conf=0.989`，`train_weight=0.825`，`answer_sharp_confidence=0.999`，`ground_truth_reward=0.887`，`pass@32=1.000`，`majority_ratio=0.881`，`timing_s/step=59.287`。
+  - step 30：`weighted_conf=0.875`，`train_weight=0.738`，`answer_sharp_confidence=0.875`，`ground_truth_reward=0.773`，`pass@32=0.875`，`majority_ratio=0.771`，`timing_s/step=65.158`。
+  - 观察：中段多个 batch 的 `train_weight` 进入 `0.7-0.8+`，与 v14 后半程容量上升现象一致；v22 仍没有中途 validation。
+- step 35-40 监控摘要：
+  - step 35：低一致/高截断 batch，`weighted_conf=0.750`，`train_weight=0.459`，`ground_truth_reward=0.438`，`pass@32=0.625`，`majority_ratio=0.451`，`response_length/clip_ratio=0.688`，`timing_s/step=61.149`。
+  - step 40：强 batch，`weighted_conf=0.875`，`train_weight=0.849`，`ground_truth_reward=0.863`，`pass@32=0.875`，`majority_ratio=0.859`，`response_length/clip_ratio=0.156`，`timing_s/step=64.652`。
+  - 观察：v14 的 clip penalty 在 step 35 这类高截断 batch 上继续起保护作用；step 40 表明后半程强 prompt 的训练容量正常抬升。
+- Qwen3-8B v22 answer-sharpen diagnostic 50-step final 结果：
+  - 2026-06-29 10:17 CST，worker `975102` 上正常完成，`WORKER_QWEN3_8B_V22_EXIT status=0`。
+  - 运行完整性：
+    - 8x NVIDIA B200，`trainer.total_training_steps=50`，`trainer.test_freq=50`，`trainer.val_before_train=False`。
+    - 没有中途 validation；唯一 validation 在 step 50 触发。
+    - Ray task snapshot：`/opt/tiger/TTRL/verl/sps_answer_sharpen_diag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_v22_ray_taskrunner.log`。
+    - metrics snapshot：`/opt/tiger/TTRL/verl/sps_answer_sharpen_diag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_v22_metrics.txt`。
+  - step 45 训练诊断：
+    - `train/sps/weighted_label_confidence=1.000`
+    - `train/sps/train_weight=0.647`
+    - `train/sps/answer_sharp_confidence=1.000`
+    - `train/label_accuracy=0.750`
+    - `train/ground_truth_reward=0.711`
+    - `train/pass@32=1.000`
+    - `train/majority_ratio=0.705`
+    - `response_length/clip_ratio=0.527`
+    - `timing_s/step=63.432`
+  - step 50 训练诊断：
+    - `train/sps/effective_K=63.960`
+    - `train/sps/weighted_label_confidence=1.000`
+    - `train/sps/train_weight=0.822`
+    - `train/sps/answer_sharpen_beta=2.000`
+    - `train/sps/answer_sharpen_capacity=0.000`
+    - `train/sps/answer_sharp_confidence=1.000`
+    - `train/sps/answer_entropy=0.000`
+    - `train/sps/answer_effective_K=1.000`
+    - `train/sps/answer_logz=3.345`
+    - `train/sps/majority_sharp_confidence=1.000`
+    - `train/label_accuracy=1.000`
+    - `train/ground_truth_reward=0.840`
+    - `train/pass@32=1.000`
+    - `train/majority_ratio=0.836`
+    - `response_length/clip_ratio=0.266`
+    - `timing_s/testing=175.039`
+    - `timing_s/step=234.394`（含 final validation）
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.7796780684104627`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8343802816901409`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.7809315895372234`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.7231046277665997`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.7887323943661971`
+  - 结论：
+    - v22 作为“v14 主干 + sharpen 诊断、不启用 sharpen capacity”的 50-step 对照，仍远低于目标 `mean@4 >= 0.90`，且只略高于失败的 v21 `0.7656`。
+    - 这说明当前 50-step 主要瓶颈不是 answer-level capacity 是否用 sharpen confidence，而是 Qwen3-8B 在短训练内仍存在明显格式/截断问题：final `format_score/mean@4=0.7887`，step 35/45 仍有高 clip ratio batch。
+    - 下一版应优先解决 early format/length 稳定性，同时保持 SPS 内部反馈和 PowerFlow-style 锐化解释：例如引入无监督 format/clip-aware capacity 或 curriculum，而不是继续直接加强 answer-sharpen capacity。
+    - v22 不是改进，不做 local commit。
+
+启动尝试 21：Qwen3-8B v23 format-anchor + sharpen diagnostics 50-step
+- 设计动机：
+  - v21 证明直接使用 sharpened answer confidence 替代容量会伤害格式和泛化。
+  - v22 证明回到 v14 容量并只保留 sharpen 诊断仍只有 `mean@4=0.7797`，核心短训瓶颈是 format/clip 稳定性不足，而不是 answer capacity 公式本身。
+  - 早期历史 v5b 证明“dense SPS reward + majority reward mix”会破坏有效信号，因此 v23 不使用 `sps_majority_reward_coef`，不把 `sps_reward` union 回 `answer_rule_conf_weight` 训练路径。
+- 算法：
+  - 保持 v14 的有效主干：majority/SPS pseudo-label 的 rule-based 0/1 reward，乘以 SPS agreement/capacity 和 clip penalty。
+  - 保持 v22 的 PowerFlow-style answer sharpen 诊断：`beta=2.0`，记录 `answer_logz`、`answer_entropy`、`answer_effective_K`，但不让 sharpen confidence 直接控制容量。
+  - 新增小系数无监督 format anchor：`token_reward = pseudo_label_reward + 0.2 * format_score`，随后再乘 v14 的 prompt-level SPS `train_weight`。
+  - `format_score` 来自当前 reward parser 是否能抽取 `\boxed{}` answer；它不使用真实答案，只是内部格式信号。目标是提升 50-step 的可解析率，避免短训阶段 format score 只有 `0.79`。
+- 代码改动：
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml` 新增默认 `ttrl.sps_format_reward_coef: 0.0`，默认保持历史行为。
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 在 `answer_conf_filter` / `answer_conf_weight` / `answer_rule_conf_weight` 路径中，当 `format_score` 存在且 `sps_format_reward_coef>0` 时，把 `format_score` 加到最后一个有效 response token 的 reward 上，并记录：
+    - `train/sps_format_reward_coef`
+    - `train/sps_format_reward_mean`
+- 实验配置：
+  - 脚本：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_format_anchor_coef02_sharpdiag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v23.sh`
+  - 日志：`/opt/tiger/TTRL/verl/sps_format_anchor_coef02_sharpdiag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v23.log`
+  - Ray 目录：`/tmp/r23_qwen3_8b_format_anchor`
+  - 模型：复用 worker `/tmp/qwen3_8b_local_v21_answer_sharpen`，不存在时才 copy `/opt/tiger/qwen3_8b` 到 `/tmp`；不占用系统盘新权重空间。
+  - 训练：8 GPU，50 step，`trainer.test_freq=50`，`trainer.val_before_train=False`，final-only validation。
+  - 主干：`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，`actor.use_kl_loss=True`。
+  - 新增：`ttrl.sps_format_reward_coef=0.2`，`ttrl.sps_answer_sharpen_beta=2.0`，`ttrl.sps_answer_sharpen_capacity=False`。
+- 判定：
+  - 若 v23 50-step `val-core/MATH-TTT/acc/mean@4 >= 0.90`，直接启动同方案 184/185-step final-only。
+  - 若 v23 明显提升且 format score 恢复，但未到 0.90，再保存为候选方向并继续调 format anchor/长度策略。
+  - 若 v23 仍低于 v22 或 format score 没提升，不做 commit。
+- 2026-06-29 10:37 CST 在 worker `975102` 启动，未 launch 新 worker。
+- 启动状态：
+  - worker `/proc` 健康，`/proc/self` 与 `/proc/meminfo` 存在。
+  - 8x NVIDIA B200 启动前空闲；模型复用 `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - `/opt/tiger` 可用约 4.6G，`/tmp` 可用约 3.0T；没有新增系统盘权重。
+  - Ray dashboard `HistoryServerHead` 仍有历史一致的非阻断报错；Ray local instance 与 task runner 正常启动。
+- step 1 状态：
+  - task log：`/tmp/r23_qwen3_8b_format_anchor/ray/session_latest/logs/worker-ce7f5c1d2e656fddc72afd890964ae8ff6671c67d881246c2d7c5248-01000000-151814.out`
+  - `training/global_step=1.000`
+  - `train/sps/effective_K=63.899`
+  - `train/sps/weighted_label_confidence=0.750`
+  - `train/sps/train_weight=0.517`
+  - `train/sps/answer_sharpen_beta=2.000`
+  - `train/sps/answer_sharpen_capacity=0.000`
+  - `train/sps/answer_sharp_confidence=0.750`
+  - `train/sps/answer_entropy=0.000`
+  - `train/sps/answer_effective_K=0.750`
+  - `train/sps/answer_logz=2.350`
+  - `train/sps/majority_sharp_confidence=0.750`
+  - `train/sps_format_reward_coef=0.200`
+  - `train/sps_format_reward_mean=0.469`
+  - `critic/score/max=1.200`，确认 format anchor 已加入 reward。
+  - `train/ground_truth_reward=0.469`
+  - `train/pass@32=0.750`
+  - `train/majority_ratio=0.477`
+  - `response_length/clip_ratio=0.602`
+  - `timing_s/step=68.748`
+  - 观察：step 1 的 SPS capacity 与 v14/v22 一致，新增 format anchor 只改变 token reward 尾部锚点，不改变 answer label/capacity；继续看 step 50 final validation 是否改善 `format_score` 与 `mean@4`。
+- step 2-6 监控摘要：
+  - step 2：`train_weight=0.575`，`sps_format_reward_mean=0.570`，`ground_truth_reward=0.570`，`pass@32=0.875`，`response_length/clip_ratio=0.559`，`timing_s/step=60.744`。
+  - step 3：`train_weight=0.601`，`sps_format_reward_mean=0.625`，`ground_truth_reward=0.625`，`pass@32=0.875`，`response_length/clip_ratio=0.535`，`timing_s/step=62.199`。
+  - step 4：低一致/高截断 batch，`train_weight=0.302`，`sps_format_reward_mean=0.348`，`ground_truth_reward=0.348`，`pass@32=0.375`，`response_length/clip_ratio=0.738`，`timing_s/step=61.619`。
+  - step 5：`train_weight=0.364`，`sps_format_reward_mean=0.277`，`ground_truth_reward=0.262`，`pass@32=0.625`，`response_length/clip_ratio=0.750`，`timing_s/step=59.674`。
+  - step 6：`train_weight=0.471`，`sps_format_reward_mean=0.445`，`ground_truth_reward=0.422`，`pass@32=0.750`，`response_length/clip_ratio=0.715`，`timing_s/step=66.562`。
+  - 观察：format anchor 在可解析比例高的 batch 上提供小正锚点，但高截断/低一致 batch 仍被 v14 capacity 和 clip penalty 降权，没有变成 dense SPS reward 路径。
+- 2026-06-29 10:56-10:58 CST 监控快照：
+  - 当前终端先回到 master，未见 GPU；按 worker 规则只执行 `NO_COLOR=1 TERM=dumb mlx worker login 975102`，没有 launch 新 worker。
+  - worker `975102` hostname 仍为 `trial-301427146-trialrun-301427146-worker-0`。
+  - `/proc` 健康：`find /proc -maxdepth 1 | wc -l = 367`，`/proc/self` 与 `/proc/meminfo` 存在。
+  - 8x NVIDIA B200 均在训练中，显存约 `155GB/183GB`，GPU util `100%`。
+  - Ray task log 仍为 `/tmp/r23_qwen3_8b_format_anchor/ray/session_latest/logs/worker-ce7f5c1d2e656fddc72afd890964ae8ff6671c67d881246c2d7c5248-01000000-151814.out`。
+  - step 16：
+    - `train/sps/train_weight=0.588`
+    - `train/sps_format_reward_mean=0.500`
+    - `train/ground_truth_reward=0.500`
+    - `train/pass@32=0.500`
+    - `response_length/clip_ratio=0.500`
+    - `timing_s/step=60.043`
+    - `perf/throughput=1301.245`
+  - 尚无 final validation；继续监控到 step 50。
+- v23 完成状态（2026-06-29 11:36-11:37 CST）：
+  - 训练已结束，8 张 B200 均释放为 `0 MiB, 0%`，未残留 `verl.trainer.main_ppo` / `ray::TaskRunner` / `vllm` / `raylet` 进程。
+  - 已保存 worker Ray 日志快照：
+    - `/opt/tiger/TTRL/verl/sps_format_anchor_coef02_sharpdiag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_v23_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_format_anchor_coef02_sharpdiag_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_v23_metrics.txt`
+  - step 50 train/validation 状态：
+    - `train/sps/train_weight=0.777`
+    - `train/sps_format_reward_mean=0.836`
+    - `train/ground_truth_reward=0.836`
+    - `train/pass@32=0.875`
+    - `train/majority_voting_reward=0.907`
+    - `train/majority_ratio=0.834`
+    - `response_length/mean=1930.512`
+    - `response_length/clip_ratio=0.270`
+    - `timing_s/testing=171.009`
+    - `timing_s/step=230.487`（含 final validation）
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.7741448692152918`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8241971830985915`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.7747726358148893`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.7230503018108652`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.7811871227364185`
+    - `val-aux/MATH-TTT/format_score/best@4/mean=0.8298390342052313`
+    - `val-aux/MATH-TTT/format_score/maj@4/mean=0.7816941649899397`
+  - 对比 v22：
+    - v22 `mean@4=0.7796780684104627`，`format_score/mean@4=0.7887323943661971`。
+    - v23 `mean@4=0.7741448692152918`，`format_score/mean@4=0.7811871227364185`。
+  - 结论：
+    - v23 没有达到 50-step `mean@4 >= 0.90`，也没有超过 v22；format anchor 在训练 batch 中能把后期 `sps_format_reward_mean` 推到 `0.7-0.9`，但 final Math500/MATH-TTT format score 反而略低于 v22。
+    - 这说明“对已解析输出加小额正奖励”不会解决根本问题；可能只是强化了训练 batch 内 already-parseable 的样本，未改变验证集上高截断/不可解析尾部。
+    - v23 不是提升，不做 local git commit。
+    - 下一步应从负向长度/截断容量或采样分布锐化入手：把 PowerFlow-style sharpening 用在采样/候选选择或 clip-aware capacity 上，而不是只给 parseable format 加正锚点。
+
+启动尝试 22：Qwen3-8B v24 sharpened-cluster candidate selection 50-step
+- 设计动机：
+  - v23 证明给 parseable `format_score` 加小正 reward 只改善训练 batch 表面指标，没有迁移到 final validation。
+  - v21/v22 也说明直接改 prompt-level capacity 或只做 answer-sharpen 诊断不足。
+  - v24 把 PowerFlow-style distribution sharpening 从 reward 混合转移到“训练候选分布”本身：先用 64 个 rollouts 建立 majority/SPS pseudo label，再从同一 answer cluster 内优先选择 parseable、non-clipped、reference-reweighted score 更高的 32 个 rollouts 参与 PPO 更新。
+  - 这仍是无监督内部反馈：只使用模型候选的 boxed parseability、截断状态、majority answer cluster、ref/rollout logprob；不使用真实答案。
+- 算法：
+  - 保持 v14 主干：`answer_rule_conf_weight`，`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，`actor.use_kl_loss=True`。
+  - 保留 v22 answer-sharpen diagnostics：`sps_answer_sharpen_beta=2.0`，`sps_answer_sharpen_capacity=False`。
+  - 关闭 v23 format reward：`sps_format_reward_coef=0.0`。
+  - 新增 selection mode：`sps_rollout_selection=sharpened_cluster`。
+    - 首先尽量选择 extracted answer 等于 raw majority pseudo label 的候选。
+    - 在候选内按 `4 * in_cluster + 2 * parseable + non_clipped + (alpha*logp_ref-logq)/len` 排序。
+    - `sps_selection_temperature=0.4`，即 `alpha=2.5`，保持与 v14/v22 的 SPS base temperature 一致。
+    - 记录 `train/sps/selected_parseable_rate`、`train/sps/selected_clip_rate`、`train/sps/selected_cluster_rate`、`train/sps/selection_fallback_rate`。
+- 代码改动：
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 新增 `select_sharpened_cluster_per_prompt`。
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 接入 `sps_rollout_selection=sharpened_cluster` 并记录 selection diagnostics。
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml` 新增默认：
+    - `sps_selection_temperature: ${ttrl.sps_weight_temperature_base}`
+    - `sps_selection_require_majority: true`
+    - 默认 `sps_rollout_selection: first` 不变，历史行为可复现。
+- 实验配置：
+  - 脚本：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_sharpened_cluster_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v24.sh`
+  - 日志：`/opt/tiger/TTRL/verl/sps_sharpened_cluster_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v24.log`
+  - Ray 目录：`/tmp/r24_qwen3_8b_sharpened_cluster`
+  - 模型：复用 worker `/tmp/qwen3_8b_local_v21_answer_sharpen`，不存在时才 copy `/opt/tiger/qwen3_8b` 到 `/tmp`；不占用系统盘新权重空间。
+  - 训练：8 GPU，50 step，`trainer.test_freq=50`，`trainer.val_before_train=False`，final-only validation。
+- 静态检查：
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 通过。
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_sharpened_cluster_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v24.sh` 通过。
+  - `git diff --check` 针对 v24 相关文件通过。
+- 判定：
+  - 若 v24 50-step `val-core/MATH-TTT/acc/mean@4 >= 0.90`，直接启动同方案 184/185-step final-only。
+  - 若 v24 超过当前 Qwen3-8B 50-step best v22 `0.7796780684104627`，作为有效候选，按提升幅度决定是否 commit。
+  - 若 v24 低于 v22，不做 local commit。
+- v24 完成状态（2026-06-29 12:38-12:40 CST）：
+  - 训练正常结束，脚本退出 `status=0`。
+  - 已保存 worker Ray 日志快照：
+    - `/opt/tiger/TTRL/verl/sps_sharpened_cluster_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_v24_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/sps_sharpened_cluster_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_v24_metrics.txt`
+  - step 50 train/validation 状态：
+    - `train/sps/train_weight=0.763`
+    - `train/sps/selected_parseable_rate=0.875`
+    - `train/sps/selected_clip_rate=0.203`
+    - `train/sps/selected_cluster_rate=0.875`
+    - `train/sps/selection_fallback_rate=0.125`
+    - `train/ground_truth_reward=0.875`
+    - `train/pass@32=0.875`
+    - `train/majority_voting_reward=0.763`
+    - `train/majority_ratio=0.828`
+    - `response_length/mean=2033.516`
+    - `response_length/clip_ratio=0.203`
+    - `timing_s/testing=175.042`
+    - `timing_s/step=232.382`（含 final validation）
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.7540241448692153`
+    - `val-core/MATH-TTT/acc/best@4/mean=0.81161569416499`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.7551730382293762`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.694549295774648`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.7590543259557344`
+    - `val-aux/MATH-TTT/format_score/best@4/mean=0.8174164989939637`
+    - `val-aux/MATH-TTT/format_score/maj@4/mean=0.7595171026156942`
+  - 对比：
+    - v22 `mean@4=0.7796780684104627`，`format_score/mean@4=0.7887323943661971`。
+    - v23 `mean@4=0.7741448692152918`，`format_score/mean@4=0.7811871227364185`。
+    - v24 `mean@4=0.7540241448692153`，`format_score/mean@4=0.7590543259557344`。
+  - 结论：
+    - v24 没有达到 50-step `mean@4 >= 0.90`，也明显低于 v22/v23；不做 local git commit。
+    - 训练过程证明 selection path 生效：日志中 `selected_parseable_rate`、`selected_clip_rate`、`selected_cluster_rate`、`selection_fallback_rate` 正常记录。
+    - 失败原因：hard majority-cluster-first 会把许多高截断/低 parseable 的候选选入训练，尤其在低一致/难 prompt batch 中，早期 step 4/5/6 的 `selected_clip_rate=0.707/0.750/0.668`，`selected_parseable_rate=0.379/0.344/0.539`；这会把策略推向不稳定、长输出分布。
+    - v24 的经验是：candidate distribution sharpening 方向可行但优先级错了。下一版不应把 majority cluster 作为硬约束，应把 non-clipped/parseable 作为 hard priority，再在可解析非截断子集内用 answer cluster/SPS score 锐化。
+
+启动尝试 23：Qwen3-8B v25 parseable/nonclip-priority candidate selection 50-step
+- 设计动机：
+  - v24 证明候选分布选择路径生效，但 hard majority-cluster-first 会在难 prompt 上选择高截断、不可解析候选，导致 final `mean@4=0.7540`，低于 v22/v23。
+  - v25 直接验证 v24 失败假设：把 non-clipped 和 parseable 作为 candidate selection 的更高优先级，majority cluster 只作为加分项，不再是硬约束。
+  - 理论解释仍是 PowerFlow-style distribution sharpening：训练分布先向低截断、可解析的可学习支撑集投影，再在其中用 answer cluster 与 reference-reweighted score 做锐化；全程不使用真实答案。
+- 算法：
+  - 保持 v14 主干：`answer_rule_conf_weight`，`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，`actor.use_kl_loss=True`。
+  - 保留 v22/v24 answer-sharpen diagnostics：`sps_answer_sharpen_beta=2.0`，`sps_answer_sharpen_capacity=False`。
+  - 关闭 dense/format reward：`sps_format_reward_coef=0.0`。
+  - 复用 `sps_rollout_selection=sharpened_cluster`，但参数改为：
+    - `sps_selection_require_majority=False`
+    - `sps_selection_nonclip_bonus=4.0`
+    - `sps_selection_parseable_bonus=3.0`
+    - `sps_selection_cluster_bonus=1.0`
+    - `sps_selection_temperature=0.4`
+  - 目标是让 selected_clip_rate 显著低于 v24，并观察 final `format_score/mean@4` 是否回升。
+- 代码改动：
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 为 `select_sharpened_cluster_per_prompt` 增加可配置 `cluster_bonus_weight`、`parseable_bonus_weight`、`nonclip_bonus_weight`。
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 从 Hydra 配置读取这些 selection bonus。
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml` 新增默认：
+    - `sps_selection_cluster_bonus: 4.0`
+    - `sps_selection_parseable_bonus: 2.0`
+    - `sps_selection_nonclip_bonus: 1.0`
+    - 默认值保持 v24/历史可复现，v25 仅通过脚本覆盖。
+- 实验配置：
+  - 脚本：`/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_parseable_nonclip_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v25.sh`
+  - 日志：`/opt/tiger/TTRL/verl/sps_parseable_nonclip_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v25.log`
+  - Ray 目录：`/tmp/r25_qwen3_8b_parseable_nonclip_select`
+  - 模型：复用 worker `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - 训练：8 GPU，50 step，`trainer.test_freq=50`，`trainer.val_before_train=False`，final-only validation。
+- 静态检查：
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 通过。
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_parseable_nonclip_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v25.sh` 通过。
+  - `git diff --check` 针对 v25 相关文件通过。
+- 判定：
+  - 若 v25 50-step `val-core/MATH-TTT/acc/mean@4 >= 0.90`，直接启动同方案 184/185-step final-only。
+  - 若 v25 超过当前 Qwen3-8B 50-step best v22 `0.7796780684104627`，作为有效候选，按提升幅度决定是否 commit。
+  - 若 v25 低于 v22，不做 local commit。
+- 2026-06-29 12:43 CST 在现有 worker `975102` 启动，未 launch 新 worker。
+- 启动状态：
+  - 当前终端已通过 `NO_COLOR=1 TERM=dumb mlx worker login 975102` 进入同一个 worker；登录过程有 shell snapshot quote 警告，但 worker shell 正常可用。
+  - worker hostname：`trial-301427146-trialrun-301427146-worker-0`。
+  - `/proc` 健康：`/proc/self` 与 `/proc/meminfo` 存在。
+  - 8x NVIDIA B200 启动前空闲，显存 `0 MiB/183359 MiB`，GPU util `0%`。
+  - `/opt/tiger` 可用约 `4.6G`，`/tmp` 可用约 `3.0T`。
+  - 模型复用 `/tmp/qwen3_8b_local_v21_answer_sharpen`，大小约 `16G`；没有新增系统盘权重，也没有写 HDFS。
+  - 启动命令：`bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_parseable_nonclip_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v25.sh`。
+  - Hydra 命令中 base runner 的默认 `/mnt/hdfs/models/qwen3_4b` 被后续 override 正确覆盖为 `actor_rollout_ref.model.path=/tmp/qwen3_8b_local_v21_answer_sharpen`。
+- 首次启动失败：
+  - 失败发生在 Ray 初始化阶段，尚未开始训练。
+  - 原因：`RAY_TMPDIR=/tmp/r25_qwen3_8b_parseable_nonclip_select` 导致 plasma socket 路径超过 Unix socket 107 byte 限制：`validate_socket_filename failed: AF_UNIX path length cannot exceed 107 bytes`。
+  - 修复：将 v25 runner 中 `RAY_DIR` 改为短路径 `/tmp/r25`，其余算法与训练配置不变；随后在同一 worker `975102` 重新启动。
+- 重启状态：
+  - 2026-06-29 12:45 CST 在同一 worker `975102` 重新启动成功，Ray 使用短路径 `RAY_TMPDIR=/tmp/r25`。
+  - Ray task log：`/tmp/r25/ray/session_latest/logs/worker-f1b205ae9e56c905f56efcbfbe857bbacc119b1ff1bfb3419ada71e4-01000000-224649.out`。
+  - 配置确认：`sps_rollout_selection=sharpened_cluster`，`sps_selection_require_majority=False`，`nonclip/parseable/cluster bonus = 4.0/3.0/1.0`，`sps_format_reward_coef=0.0`。
+  - 训练数据与验证数据均为 MATH-TTT parquet，filter 后 `497` 条，`trainer.total_training_steps=50`，`trainer.test_freq=50`，`trainer.val_before_train=False`。
+- step 1 状态：
+  - `training/global_step=1.000`
+  - `train/sps/train_weight=0.517`
+  - `train/sps/weighted_label_confidence=0.750`
+  - `train/sps/selected_parseable_rate=0.578`
+  - `train/sps/selected_clip_rate=0.590`
+  - `train/sps/selected_cluster_rate=0.578`
+  - `train/sps/selection_fallback_rate=0.000`
+  - `train/ground_truth_reward=0.578`
+  - `train/pass@32=0.750`
+  - `train/majority_ratio=0.477`
+  - `response_length/clip_ratio=0.590`
+  - `timing_s/step=69.258`
+  - `perf/throughput=1170.521`
+  - 观察：parseable/nonclip priority selection 已生效且无 fallback；但 step 1 的 selected clip rate 仍较高，尚未证明 v25 能显著解决 v24 早期高截断问题，需要继续看 step 2-6 和 final validation。
+- step 2-4 监控摘要：
+  - step 2：`train_weight=0.579`，`selected_parseable_rate=0.652`，`selected_clip_rate=0.395`，`selected_cluster_rate=0.652`，`selection_fallback_rate=0.000`，`ground_truth_reward=0.652`，`pass@32=0.875`，`response_length/clip_ratio=0.395`，`timing_s/step=60.900`，`perf/throughput=1421.846`。
+  - step 3：`train_weight=0.587`，`selected_parseable_rate=0.770`，`selected_clip_rate=0.410`，`selected_cluster_rate=0.770`，`selection_fallback_rate=0.000`，`ground_truth_reward=0.770`，`pass@32=0.875`，`response_length/clip_ratio=0.410`，`timing_s/step=63.460`，`perf/throughput=1358.633`。
+  - step 4：低一致/难 prompt batch，`train_weight=0.297`，`selected_parseable_rate=0.375`，`selected_clip_rate=0.707`，`selected_cluster_rate=0.375`，`selection_fallback_rate=0.000`，`ground_truth_reward=0.375`，`pass@32=0.375`，`response_length/clip_ratio=0.707`，`timing_s/step=61.195`，`perf/throughput=1518.937`。
+  - 观察：v25 在 step 2/3 能把 clip rate 压到约 `0.40`，但 step 4 仍出现与 v24 类似的高截断坏 batch；说明“nonclip/parseable bonus”不是硬优先级，PowerFlow reference-reweighted score 仍可能在低一致 prompt 上把长截断候选选入训练。若 final 不提升，下一版应改成 lexicographic / bucketed support projection：先按 `nonclipped && parseable` 支撑集过滤或分桶，再在桶内用 answer cluster 和 reference-reweighted score 锐化。
+- step 5-6 监控摘要：
+  - step 5：`train_weight=0.369`，`selected_parseable_rate=0.332`，`selected_clip_rate=0.750`，`selected_cluster_rate=0.309`，`selection_fallback_rate=0.000`，`ground_truth_reward=0.309`，`pass@32=0.750`，`response_length/clip_ratio=0.750`，`timing_s/step=60.670`，`perf/throughput=1461.925`。
+  - step 6：`train_weight=0.470`，`selected_parseable_rate=0.574`，`selected_clip_rate=0.691`，`selected_cluster_rate=0.562`，`selection_fallback_rate=0.000`，`ground_truth_reward=0.531`，`pass@32=0.750`，`response_length/clip_ratio=0.691`，`timing_s/step=67.298`，`perf/throughput=1349.865`。
+  - 观察：v25 连续在 step 4/5/6 的低一致 batch 出现高截断选择，基本验证了“bonus 排序不够硬”的问题；继续跑完 v25 final，但已准备 v26 hard-priority bucket 方案。
+
+启动准备 24：Qwen3-8B v26 hard-priority support projection 50-step
+- 设计动机：
+  - v25 将 nonclip/parseable 从 v24 的弱优先级提高为较大 bonus，但 step 4/5/6 仍出现 `selected_clip_rate=0.707/0.750/0.691`，说明连续 score 加权仍会让 reference-reweighted quality 把长截断候选推上来。
+  - v26 将 PowerFlow-style distribution sharpening 分成两层：先做无监督可学习支撑集投影，优先选择 non-clipped、parseable 的候选；再在该支撑集内用 majority cluster 与 reference-reweighted score 做锐化。
+  - 这仍然不使用真实答案，只使用模型内部输出的截断状态、boxed parseability、self-consistency answer cluster、ref/rollout logprob。
+- 代码改动：
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 为 `select_sharpened_cluster_per_prompt` 新增 `selection_priority` 参数。
+  - 默认 `selection_priority="score"` 保持 v24/v25 的历史行为。
+  - 新增 `selection_priority="nonclip_parseable_bucket"`：按 `(nonclipped, parseable, in_cluster, reference-reweighted quality)` 字典序排序，实现 hard-priority support projection。
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 从 Hydra 读取 `ttrl.sps_selection_priority`。
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml` 新增默认 `sps_selection_priority: score`。
+- 实验脚本：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v26.sh`
+  - `RAY_TMPDIR=/tmp/r26`，`MASTER_PORT=29626`，复用 `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - 主干仍为 v14/v25：`answer_rule_conf_weight`，`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，`actor.use_kl_loss=True`。
+  - v26 特有 override：`ttrl.sps_selection_priority=nonclip_parseable_bucket`。
+- 静态检查：
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 通过。
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_50step_v26.sh` 通过。
+  - `git diff --check` 针对 v26 相关文件通过。
+- 执行计划：
+  - 不抢占当前 v25；等 v25 完成并记录 final validation。
+  - 若 v25 未超过当前 Qwen3-8B 50-step best v22 `0.7796780684104627`，立即在同一 worker 启动 v26。
+
+用户指令变更：直接跑 Qwen3-8B v26 hard-bucket 310-step
+- 2026-06-29 13:27 CST，用户要求“8b 的这一版先直接跑 310 个 step 看下”。
+- 解释口径：
+  - “这一版”按当前上下文理解为刚准备好的 v26 hard-priority support projection：`sps_selection_priority=nonclip_parseable_bucket`。
+  - 目标从先看 50-step 改为直接跑 310-step final-only；不做中途 validation。
+- 当前状态处理：
+  - v25 仍在 worker `975102` 上运行、占用 8 张 B200，尚未产生 final validation。
+  - 按用户新指令，已在 2026-06-29 13:28 CST 用 `pkill -TERM -f 'math-qwen3_8b-sps-parseable-nonclip-select'` 停止 v25。
+  - 停止后 8 张 B200 显存均为 `0 MiB`，GPU util `0%`。
+  - v25 因被用户新指令中断，没有 final validation，不作为候选最好结果，也不做 commit。
+- 新增 310-step runner：
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.sh`
+  - 日志：`/opt/tiger/TTRL/verl/sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.log`
+  - Ray 目录：`/tmp/r26_310`
+  - metrics snapshot：`/opt/tiger/TTRL/verl/sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26_metrics.txt`
+  - 模型：复用 `/tmp/qwen3_8b_local_v21_answer_sharpen`，不写 HDFS，不新增系统盘权重。
+  - 关键覆盖：
+    - `trainer.total_training_steps=310`
+    - `trainer.test_freq=310`
+    - `trainer.val_before_train=False`
+    - `ttrl.sps_selection_priority=nonclip_parseable_bucket`
+    - 其余主干保持 v26/v14：`answer_rule_conf_weight`，`floor=0.15`，`clip_penalty=0.5`，`weight_power=1.5`，`base_logprob_source=ref`，actor fp32，`actor.use_kl_loss=True`。
+- 静态检查：
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.sh` 通过。
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py` 通过。
+  - `git diff --check` 针对 v26 310-step 相关文件通过。
+- 启动状态：
+  - 2026-06-29 13:29 CST 在同一 worker `975102` 启动，未 launch 新 worker。
+  - worker hostname：`trial-301427146-trialrun-301427146-worker-0`，`/proc/self` 与 `/proc/meminfo` 存在。
+  - 启动前 `/opt/tiger` 可用约 `4.6G`，`/tmp` 可用约 `3.0T`。
+  - 复用模型 `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - 启动命令：`bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.sh`。
+  - Ray 使用短路径 `RAY_TMPDIR=/tmp/r26_310`，已正常启动，没有 Unix socket path 过长错误。
+  - Ray task log：`/tmp/r26_310/ray/session_latest/logs/worker-e12395bf769472bc109d7fda15de7cb5d7be950aa4e66b4b204c8807-01000000-261584.out`。
+  - 配置确认：
+    - `trainer.total_training_steps=310`
+    - `trainer.test_freq=310`
+    - `trainer.val_before_train=False`
+    - `ttrl.sps_rollout_selection=sharpened_cluster`
+    - `ttrl.sps_selection_priority=nonclip_parseable_bucket`
+    - `ttrl.sps_selection_require_majority=False`
+    - `ttrl.sps_selection_nonclip_bonus=4.0`
+    - `ttrl.sps_selection_parseable_bonus=3.0`
+    - `ttrl.sps_selection_cluster_bonus=1.0`
+  - 数据确认：MATH-TTT train/test parquet 均加载，filter 后 `497` 条；`Size of train dataloader: 62, Size of val dataloader: 1`。
+  - 2026-06-29 13:32 CST：8 张 B200 已加载模型，显存约 `146GB/GPU`，尚未刷出 step 1；继续监控。
+- step 1-3 监控摘要：
+  - step 1：`selected_parseable_rate=0.578`，`selected_clip_rate=0.590`，`selected_cluster_rate=0.578`，`selection_fallback_rate=0.000`，`train_weight=0.517`，`ground_truth_reward=0.578`，`pass@32=0.750`，`timing_s/step=70.167`，`perf/throughput=1155.368`。
+  - step 2：`selected_parseable_rate=0.645`，`selected_clip_rate=0.371`，`selected_cluster_rate=0.645`，`selection_fallback_rate=0.000`，`train_weight=0.587`，`ground_truth_reward=0.645`，`pass@32=0.875`，`timing_s/step=62.360`，`perf/throughput=1378.253`。
+  - step 3：`selected_parseable_rate=0.762`，`selected_clip_rate=0.383`，`selected_cluster_rate=0.762`，`selection_fallback_rate=0.000`，`train_weight=0.585`，`ground_truth_reward=0.762`，`pass@32=0.875`，`timing_s/step=65.292`，`perf/throughput=1312.111`。
+  - 初步观察：v26 正常训练；hard bucket 在 step 2/3 将 clip rate 压到 `0.37-0.38`，略低于 v25 同类 early batch，但 step 1 仍高，说明该 prompt batch 本身 non-clipped/parseable 候选不足。继续重点看 v25 曾失败的 step 4-6 区间。
+- step 4-7 监控摘要：
+  - step 4：`selected_parseable_rate=0.383`，`selected_clip_rate=0.684`，`selected_cluster_rate=0.383`，`selection_fallback_rate=0.000`，`train_weight=0.391`，`ground_truth_reward=0.379`，`pass@32=0.500`，`timing_s/step=63.235`，`perf/throughput=1473.544`。
+  - step 5：`selected_parseable_rate=0.312`，`selected_clip_rate=0.750`，`selected_cluster_rate=0.293`，`selection_fallback_rate=0.000`，`train_weight=0.401`，`ground_truth_reward=0.293`，`pass@32=0.750`，`timing_s/step=61.485`，`perf/throughput=1446.225`。
+  - step 6：`selected_parseable_rate=0.539`，`selected_clip_rate=0.684`，`selected_cluster_rate=0.535`，`selection_fallback_rate=0.000`，`train_weight=0.487`，`ground_truth_reward=0.504`，`pass@32=0.750`，`timing_s/step=68.021`，`perf/throughput=1340.434`。
+  - step 7：`selected_parseable_rate=0.625`，`selected_clip_rate=0.500`，`selected_cluster_rate=0.613`，`selection_fallback_rate=0.000`，`train_weight=0.440`，`ground_truth_reward=0.625`，`pass@32=0.625`，`timing_s/step=65.228`，`perf/throughput=1368.276`。
+  - 观察：hard-priority bucket 相比 v25 在 step 4/6 略低，但 step 5 仍为 `selected_clip_rate=0.750`；这说明部分低一致 prompt 的 64 candidates 中可解析非截断支撑集本身不足，单靠重排无法完全修复。按用户指令继续 310-step，不中途改方案，最终以 step 310 final validation 判定。
+- 2026-06-29 13:56 CST 速度诊断：
+  - worker `975102` 仍健康：hostname `trial-301427146-trialrun-301427146-worker-0`，`/proc/self` 与 `/proc/meminfo` 存在。
+  - 训练进度已到 `training/global_step=21`，没有卡在 validation/checkpoint；当前仍是 final-only 配置。
+  - 最近 20 个普通训练 step 平均 `timing_s/step=64.18`，最近 10 个平均 `63.47`，最近 5 个平均 `63.36`。
+  - 最近 10 个 step 的耗时分解：`timing_s/gen=40.71`，`timing_s/update_actor=13.07`，`timing_s/ref=5.89`，`timing_s/old_log_prob=3.00`，`timing_s/generate_sequences=22.01`。
+  - 最近 10 个 step 平均处理约 `651609` tokens/step，`response_length/mean=2452.3`，`response_length/clip_ratio=0.442`，`perf/throughput=1283.6`。
+  - GPU 使用正常：8 张 B200 监控时 `utilization.gpu=94-97%`，显存约 `38-44GB/GPU`，功耗约 `473-560W`。
+  - 判断：60-70s/step 偏慢但合理，主要由 Qwen3-8B + 每 prompt 多采样 + 长输出上限导致；瓶颈在 rollout 生成和长 response，而不是 GPU 闲置、Ray 卡死或中途 validation。
+  - 粗略 ETA：若保持 `63-64s/step`，step 21 到 step 310 还需约 `5.1h` 纯训练，最后 Math500/MATH-TTT final validation 预计再增加约数分钟。
+- 2026-06-29 14:04 CST 进度：
+  - 任务仍在 worker `975102` 上运行，未 launch 新 worker。
+  - Ray task log：`/tmp/r26_310/ray/session_latest/logs/worker-e12395bf769472bc109d7fda15de7cb5d7be950aa4e66b4b204c8807-01000000-261584.out`。
+  - 已到 `training/global_step=30`，`val_hits=0`，说明仍未触发中途 validation，符合 `trainer.test_freq=310`。
+  - 最近 20 step 平均 `timing_s/step=63.71`，最近 5 step 平均 `64.07`；最近 20 step 平均 `response_length/mean=2468.1`，`response_length/clip_ratio=0.420`，`perf/throughput=1287.6`。
+  - step 26：`selected_parseable_rate=0.879`，`selected_clip_rate=0.324`，`ground_truth_reward=0.879`，`pass@32=1.000`，`timing_s/step=62.500`。
+  - step 27：`selected_parseable_rate=0.770`，`selected_clip_rate=0.383`，`ground_truth_reward=0.770`，`pass@32=0.875`，`timing_s/step=64.360`。
+  - step 28：`selected_parseable_rate=0.773`，`selected_clip_rate=0.492`，`ground_truth_reward=0.773`，`pass@32=1.000`，`timing_s/step=63.082`。
+  - step 29：`selected_parseable_rate=0.934`，`selected_clip_rate=0.164`，`ground_truth_reward=0.934`，`pass@32=1.000`，`timing_s/step=62.001`。
+  - step 30：`selected_parseable_rate=0.797`，`selected_clip_rate=0.336`，`ground_truth_reward=0.797`，`pass@32=0.875`，`timing_s/step=68.428`。
+  - GPU 状态：8 张 B200 均 `utilization.gpu=100%`，显存约 `155GB/GPU`，训练处于稳态。
+- 2026-06-29 14:16 CST 进度：
+  - 已到 `training/global_step=41`，`val_hits=0`，仍符合 final-only 310-step 设置。
+  - 最近 40 step 平均 `timing_s/step=63.90`，平均 `657654` tokens/step，`response_length/mean=2476.9`，`response_length/clip_ratio=0.422`，`perf/throughput=1287.0`。
+  - 最近 20 step 平均 `timing_s/step=63.63`，平均 `635174` tokens/step，`response_length/mean=2393.0`，`response_length/clip_ratio=0.350`，`perf/throughput=1248.5`。
+  - 最近 10 step 平均 `timing_s/step=63.71`，平均 `615214` tokens/step，`response_length/mean=2319.8`，`response_length/clip_ratio=0.328`，`perf/throughput=1208.3`。
+  - step 35 为低质量/高截断 batch：`selected_parseable_rate=0.535`，`selected_clip_rate=0.668`，`ground_truth_reward=0.535`，`pass@32=0.750`。
+  - step 36 恢复到强 batch：`selected_parseable_rate=1.000`，`selected_clip_rate=0.113`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 41：`selected_parseable_rate=1.000`，`selected_clip_rate=0.371`，`ground_truth_reward=1.000`，`pass@32=1.000`，`timing_s/step=64.783`。
+  - 观察：step 35 这类低一致/高截断 batch 仍存在，但 30-41 区间大部分 batch 的 `selected_clip_rate` 比最早 step 4-6 低；继续跑完 310 step 后以 final validation 判断。
+- 2026-06-29 14:25 CST 进度：
+  - 已到 `training/global_step=50/310`，`val_hits=0`；step 50 未 validation 是预期行为，因为本 run 设置 `trainer.test_freq=310`。
+  - 最近 20 step 平均 `timing_s/step=63.76`，ETA 约 `4.61h` 到 step 310，不含 final validation。
+  - step 44：`selected_parseable_rate=0.766`，`selected_clip_rate=0.348`，`ground_truth_reward=0.766`，`pass@32=0.875`。
+  - step 47：`selected_parseable_rate=0.836`，`selected_clip_rate=0.238`，`ground_truth_reward=0.836`，`pass@32=0.875`。
+  - step 50：`selected_parseable_rate=0.875`，`selected_clip_rate=0.266`，`ground_truth_reward=0.875`，`pass@32=0.875`。
+  - 观察：30-50 区间相比 early step 4-6，selected clip rate 明显回落；继续监控 310-step final validation。
+- 2026-06-29 14:37 CST 进度：
+  - 已到 `training/global_step=61/310`，`val_hits=0`，仍无中途 validation。
+  - 最近 20 step 平均 `timing_s/step=63.44`，ETA 约 `4.39h` 到 step 310，不含 final validation。
+  - step 55：`selected_parseable_rate=0.746`，`selected_clip_rate=0.590`，`ground_truth_reward=0.648`，`pass@32=0.875`；这是本段内较高截断 batch。
+  - step 58：`selected_parseable_rate=0.883`，`selected_clip_rate=0.250`，`ground_truth_reward=0.883`，`pass@32=1.000`。
+  - step 61：`selected_parseable_rate=0.891`，`selected_clip_rate=0.125`，`ground_truth_reward=0.891`，`pass@32=1.000`。
+  - 观察：50-61 区间仍有少量高截断 batch，但整体 selected parseable/ground-truth proxy 信号较强；继续运行。
+- 2026-06-29 14:49 CST 早停排查与 runner 修复：
+  - 14:46 发现训练不再推进，8 张 B200 显存均为 `0 MiB`，无 `verl.trainer` / `ray::TaskRunner` / `run_sps_rule_conf_weight` 训练进程。
+  - wrapper log 显示 `WORKER_QWEN3_8B_V26_310_EXIT status=0 2026-06-29 14:38:27`，不是 crash/OOM/NCCL 错误。
+  - Ray task log 最后有效训练 step 是 `training/global_step=62`；无 final validation，`val_hits=0`。
+  - Raylet 记录 `Driver ... is disconnected` 和 `Raylet graceful shutdown ... EXPECTED_TERMINATION`，说明是 driver 正常退出。
+  - 根因：底层 `/opt/tiger/TTRL/verl/examples/ttrl/run_sps_rule_conf_weight_math_qwen3_4b_50step_8gpu.sh` 固定传入 `trainer.total_epochs=1`。MATH-TTT train dataloader size 是 `62`，因此外层 trainer 只遍历一个 epoch 就自然结束；`trainer.total_training_steps=310` 只设置进度条/last-step 判定，不会让外层 loop 自动跨 epoch 继续。
+  - 代码确认：`/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` 中 `fit()` 使用 `for epoch in range(self.config.trainer.total_epochs)`，所以必须显式覆盖 epoch 数。
+  - 已归档本次 62-step 早停证据到 `/opt/tiger/TTRL/verl/archived_runs/v26_310_epoch1_early_exit_20260629_1438/`，包含 wrapper log、metrics snapshot、Ray taskrunner snapshot 和 `raylet.out`。
+  - 修复：更新 `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.sh`，新增 override `trainer.total_epochs=5`；因为 dataloader size 为 `62`，`62 * 5 = 310`，这会让当前 310-step final-only run 真正跑满 310 step。
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.sh` 通过。
+  - 这是 runner 修复，不改变算法；本次 62-step 早停无 final validation，不作为候选结果，不做 improvement commit。
+- 2026-06-29 14:50 CST 修复后重启：
+  - 同一 worker `975102`，未 launch 新 worker；重启前 `/proc/self` 与 `/proc/meminfo` 存在，8 张 B200 显存均为 `0 MiB`。
+  - 启动命令仍为 `bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26.sh`。
+  - wrapper log 已覆盖为新 run；旧 run 已在 `archived_runs/v26_310_epoch1_early_exit_20260629_1438/` 保留。
+  - 命令行确认 override 同时包含 `trainer.total_epochs=5 trainer.total_training_steps=310 trainer.test_freq=310 trainer.val_before_train=False`。
+  - 新 Ray task log：`/tmp/r26_310/ray/session_latest/logs/worker-bdf190b2e41cf21780f4a8b0ca58a6a95d79d7e24c05fcf8abc7febb-01000000-299004.out`。
+  - 新 run 已确认 `Size of train dataloader: 62, Size of val dataloader: 1` 与 `Total training steps: 310`。
+  - step 1 已完成：`selected_parseable_rate=0.578`，`selected_clip_rate=0.590`，`ground_truth_reward=0.578`，`pass@32=0.750`，`timing_s/step=65.504`，`perf/throughput=1237.599`。
+  - 监控时 8 张 B200 均 `utilization.gpu=100%`，显存约 `155GB/GPU`。
+- 2026-06-29 15:13 CST 修复后 run 进度：
+  - 新 run 已到 `training/global_step=19/310`，`val_hits=0`。
+  - 最近 20 step 平均约 `timing_s/step=62.18`，ETA 约 `5.03h` 到 step 310，不含 final validation。
+  - step 4：`selected_parseable_rate=0.375`，`selected_clip_rate=0.707`，`ground_truth_reward=0.375`，`pass@32=0.375`。
+  - step 10：`selected_parseable_rate=0.840`，`selected_clip_rate=0.512`，`ground_truth_reward=0.840`，`pass@32=1.000`。
+  - step 19：`selected_parseable_rate=0.645`，`selected_clip_rate=0.492`，`ground_truth_reward=0.645`，`pass@32=0.750`。
+  - 观察：重启后 early segment 的 batch-level 波动与上一轮基本一致；当前无错误，继续重点确认是否跨过 epoch 边界 `step 62`。
+- 2026-06-29 15:34 CST 修复后 run 进度：
+  - 已到 `training/global_step=39/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.76`，ETA 约 `4.65h` 到 step 310，不含 final validation。
+  - step 25：`selected_parseable_rate=0.906`，`selected_clip_rate=0.242`，`ground_truth_reward=0.906`，`pass@32=1.000`。
+  - step 30：`selected_parseable_rate=0.805`，`selected_clip_rate=0.316`，`ground_truth_reward=0.805`，`pass@32=0.875`。
+  - step 36：`selected_parseable_rate=1.000`，`selected_clip_rate=0.113`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 39：`selected_parseable_rate=0.727`，`selected_clip_rate=0.371`，`ground_truth_reward=0.727`，`pass@32=1.000`。
+  - 观察：当前速度略快于前一轮早停 run；继续等待跨过 `step 62` 验证 epoch 修复。
+- 2026-06-29 16:04 CST 修复确认：
+  - 新 run 已跨过上一轮早停边界，达到 `training/global_step=68/310`，进程未退出，`val_hits=0`。
+  - step 62：`selected_parseable_rate=0.590`，`selected_clip_rate=0.488`，`ground_truth_reward=0.590`，`pass@32=0.750`。
+  - step 65：`selected_parseable_rate=0.570`，`selected_clip_rate=0.473`，`ground_truth_reward=0.562`，`pass@32=0.625`。
+  - step 68：`selected_parseable_rate=0.891`，`selected_clip_rate=0.375`，`ground_truth_reward=0.875`，`pass@32=0.875`。
+  - 最近 20 step 平均 `timing_s/step=61.17`，ETA 约 `4.11h` 到 step 310，不含 final validation。
+  - 结论：`trainer.total_epochs=5` runner 修复已经生效；继续跑 310-step final-only。
+- 2026-06-29 16:22 CST 修复后 run 进度：
+  - 已到 `training/global_step=86/310`，`val_hits=0`，仍无中途 validation。
+  - 最近 20 step 平均 `timing_s/step=61.09`，ETA 约 `3.80h` 到 step 310，不含 final validation。
+  - step 74：`selected_parseable_rate=0.812`，`selected_clip_rate=0.336`，`ground_truth_reward=0.688`，`pass@32=0.875`。
+  - step 80：`selected_parseable_rate=0.816`，`selected_clip_rate=0.391`，`ground_truth_reward=0.762`，`pass@32=1.000`。
+  - step 83：`selected_parseable_rate=0.883`，`selected_clip_rate=0.125`，`ground_truth_reward=0.875`，`pass@32=0.875`。
+  - step 86：`selected_parseable_rate=0.938`，`selected_clip_rate=0.180`，`ground_truth_reward=0.938`，`pass@32=1.000`。
+  - 观察：跨 epoch 后没有异常，80 段 selected parseable/ground-truth proxy 较强；继续跑到 final validation。
+- 2026-06-29 16:37 CST 修复后 run 进度：
+  - 已到 `training/global_step=101/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.07`，ETA 约 `3.55h` 到 step 310，不含 final validation。
+  - step 89：`selected_parseable_rate=1.000`，`selected_clip_rate=0.043`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 92：`selected_parseable_rate=1.000`，`selected_clip_rate=0.145`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 95：`selected_parseable_rate=0.953`，`selected_clip_rate=0.125`，`ground_truth_reward=0.879`，`pass@32=1.000`。
+  - step 98：`selected_parseable_rate=0.703`，`selected_clip_rate=0.496`，`ground_truth_reward=0.680`，`pass@32=0.875`。
+  - step 101：`selected_parseable_rate=0.922`，`selected_clip_rate=0.129`，`ground_truth_reward=0.922`，`pass@32=1.000`。
+  - 观察：90-101 区间大部分 batch 很强，`selected_clip_rate` 多次低于 `0.15`；继续运行。
+- 2026-06-29 16:58 CST 修复后 run 进度：
+  - 已到 `training/global_step=121/310`，`val_hits=0`；训练进程仍在。
+  - 最近 20 step 平均 `timing_s/step=61.43`，ETA 约 `3.23h` 到 step 310，不含 final validation。
+  - step 110：`selected_parseable_rate=1.000`，`selected_clip_rate=0.219`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 112：`selected_parseable_rate=1.000`，`selected_clip_rate=0.090`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 115：`selected_parseable_rate=0.867`，`selected_clip_rate=0.250`，`ground_truth_reward=0.867`，`pass@32=1.000`。
+  - step 121：`selected_parseable_rate=1.000`，`selected_clip_rate=0.148`，`ground_truth_reward=0.875`，`pass@32=0.875`，`timing_s/step=64.272`。
+  - 监控时部分 GPU 显存/利用率短时不均匀，但 Ray task log mtime 持续刷新、训练进程存在，判断为 rollout/FSDP 阶段切换，不是停滞。
+- 2026-06-29 17:02 CST 修复后 run 进度：
+  - 已到 `training/global_step=125/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=60.73`，`perf/throughput=1107.0 token/s`，ETA 约 `3.12h` 到 step 310，不含 final validation。
+  - step 122 最新吞吐查询时：`perf/throughput=1167.31 token/s`，`perf/total_num_tokens=557303`，`timing_s/step=59.678`，最近 20 step 平均 `1106.78 token/s`。
+  - step 125：`selected_parseable_rate=1.000`，`selected_clip_rate=0.168`，`ground_truth_reward=0.996`，`pass@32=1.000`。
+  - 观察：120 段训练稳定，吞吐约 `1.1k token/s`，继续等待 final validation。
+- 2026-06-29 17:17 CST 修复后 run 进度：
+  - 已到 `training/global_step=140/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.03`，`perf/throughput=1117.7 token/s`，ETA 约 `2.88h` 到 step 310，不含 final validation。
+  - step 131：`selected_parseable_rate=0.984`，`selected_clip_rate=0.359`，`ground_truth_reward=0.941`，`pass@32=1.000`。
+  - step 134：`selected_parseable_rate=0.984`，`selected_clip_rate=0.145`，`ground_truth_reward=0.984`，`pass@32=1.000`。
+  - step 137：`selected_parseable_rate=1.000`，`selected_clip_rate=0.180`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 140：`selected_parseable_rate=0.918`，`selected_clip_rate=0.172`，`ground_truth_reward=0.879`，`pass@32=1.000`。
+  - 观察：130-140 区间整体强，`pass@32` 连续为 `1.0`；继续运行。
+- 2026-06-29 17:38 CST 修复后 run 进度：
+  - 已到 `training/global_step=160/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.65`，`perf/throughput=1136.4 token/s`，ETA 约 `2.57h` 到 step 310，不含 final validation。
+  - step 146：`selected_parseable_rate=1.000`，`selected_clip_rate=0.195`，`ground_truth_reward=0.992`，`pass@32=1.000`。
+  - step 149：`selected_parseable_rate=1.000`，`selected_clip_rate=0.000`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 154：`selected_parseable_rate=1.000`，`selected_clip_rate=0.156`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 160：`selected_parseable_rate=0.945`，`selected_clip_rate=0.148`，`ground_truth_reward=0.777`，`pass@32=0.875`。
+  - 观察：150 段仍强，selected clip rate 多数低；继续运行到 final validation。
+- 2026-06-29 17:59 CST 修复后 run 进度：
+  - 已到 `training/global_step=181/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=60.83`，`perf/throughput=1110.2 token/s`，ETA 约 `2.18h` 到 step 310，不含 final validation。
+  - step 169：`selected_parseable_rate=1.000`，`selected_clip_rate=0.125`，`ground_truth_reward=0.988`，`pass@32=1.000`。
+  - step 172：`selected_parseable_rate=0.918`，`selected_clip_rate=0.125`，`ground_truth_reward=0.914`，`pass@32=1.000`。
+  - step 175：`selected_parseable_rate=1.000`，`selected_clip_rate=0.000`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 178：`selected_parseable_rate=1.000`，`selected_clip_rate=0.059`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 181：`selected_parseable_rate=0.977`，`selected_clip_rate=0.141`，`ground_truth_reward=0.973`，`pass@32=1.000`。
+  - 观察：170-181 区间非常强，clip 明显低；继续等待 final validation。
+- 2026-06-29 18:20 CST 修复后 run 进度：
+  - 已到 `training/global_step=202/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.42`，`perf/throughput=1136.1 token/s`，ETA 约 `1.84h` 到 step 310，不含 final validation。
+  - step 184：`selected_parseable_rate=0.875`，`selected_clip_rate=0.125`，`ground_truth_reward=0.875`，`pass@32=0.875`；超过之前 v14 184-step 对比点，但本 run final-only 不在此处 validation。
+  - step 190：`selected_parseable_rate=0.977`，`selected_clip_rate=0.113`，`ground_truth_reward=0.879`，`pass@32=1.000`。
+  - step 196：`selected_parseable_rate=1.000`，`selected_clip_rate=0.004`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 199：`selected_parseable_rate=1.000`，`selected_clip_rate=0.125`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 202：`selected_parseable_rate=0.914`，`selected_clip_rate=0.125`，`ground_truth_reward=0.914`，`pass@32=1.000`。
+  - 观察：180-202 区间继续强，clip 低；继续运行到 step 310 final validation。
+- 2026-06-29 18:38 CST 修复后 run 进度：
+  - 已到 `training/global_step=220/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=60.04`，`perf/throughput=1092.5 token/s`，ETA 约 `1.50h` 到 step 310，不含 final validation。
+  - step 208：`selected_parseable_rate=1.000`，`selected_clip_rate=0.000`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 214：`selected_parseable_rate=0.875`，`selected_clip_rate=0.363`，`ground_truth_reward=0.844`，`pass@32=0.875`。
+  - step 217：`selected_parseable_rate=1.000`，`selected_clip_rate=0.004`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 220：`selected_parseable_rate=1.000`，`selected_clip_rate=0.004`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - 观察：200-220 区间继续强，仍无中途 validation；继续运行。
+- 2026-06-29 19:02 CST 修复后 run 进度：
+  - 已到 `training/global_step=243/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.30`，`perf/throughput=1152.1 token/s`，ETA 约 `1.14h` 到 step 310，不含 final validation。
+  - step 226：`selected_parseable_rate=0.910`，`selected_clip_rate=0.238`，`ground_truth_reward=0.895`，`pass@32=1.000`。
+  - step 231：`selected_parseable_rate=1.000`，`selected_clip_rate=0.121`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 237：`selected_parseable_rate=1.000`，`selected_clip_rate=0.113`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 240：`selected_parseable_rate=0.875`，`selected_clip_rate=0.176`，`ground_truth_reward=0.625`，`pass@32=0.625`。
+  - step 243：`selected_parseable_rate=0.875`，`selected_clip_rate=0.156`，`ground_truth_reward=0.750`，`pass@32=0.750`。
+  - 观察：230-243 区间有两个较弱 batch，但 selected clip 仍低；继续跑到 final validation。
+- 2026-06-29 19:20 CST 修复后 run 进度：
+  - 已到 `training/global_step=261/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.52`，`perf/throughput=1153.0 token/s`，ETA 约 `0.84h` 到 step 310，不含 final validation。
+  - step 249：`selected_parseable_rate=0.973`，`selected_clip_rate=0.227`，`ground_truth_reward=0.969`，`pass@32=1.000`。
+  - step 252：`selected_parseable_rate=1.000`，`selected_clip_rate=0.277`，`ground_truth_reward=0.875`，`pass@32=0.875`。
+  - step 255：`selected_parseable_rate=0.945`，`selected_clip_rate=0.391`，`ground_truth_reward=0.805`，`pass@32=0.875`。
+  - step 258：`selected_parseable_rate=1.000`，`selected_clip_rate=0.352`，`ground_truth_reward=0.875`，`pass@32=0.875`。
+  - step 261：`selected_parseable_rate=1.000`，`selected_clip_rate=0.125`，`ground_truth_reward=0.875`，`pass@32=0.875`。
+  - 观察：240-261 区间略弱于 170-220 区间，但仍无异常；继续等待 final validation。
+- 2026-06-29 19:38 CST 修复后 run 进度：
+  - 已到 `training/global_step=278/310`，`val_hits=0`。
+  - 最近 20 step 平均 `timing_s/step=61.66`，`perf/throughput=1144.6 token/s`，ETA 约 `0.55h` 到 step 310，不含 final validation。
+  - step 264：`selected_parseable_rate=0.984`，`selected_clip_rate=0.191`，`ground_truth_reward=0.984`，`pass@32=1.000`。
+  - step 266：`selected_parseable_rate=1.000`，`selected_clip_rate=0.125`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - step 272：`selected_parseable_rate=1.000`，`selected_clip_rate=0.281`，`ground_truth_reward=0.988`，`pass@32=1.000`。
+  - step 275：`selected_parseable_rate=0.801`，`selected_clip_rate=0.625`，`ground_truth_reward=0.777`，`pass@32=0.875`；这是本段内的高截断 batch。
+  - step 278：`selected_parseable_rate=1.000`，`selected_clip_rate=0.086`，`ground_truth_reward=1.000`，`pass@32=1.000`。
+  - 观察：临近 final 前整体仍强，但仍有个别高截断 batch；继续等待 step 310 final validation。
+- 2026-06-29 20:13 CST final result：Qwen3-8B v26 hard-priority bucket 310-step final-only
+  - run 正常结束：wrapper marker `WORKER_QWEN3_8B_V26_310_EXIT status=0 2026-06-29 20:12:47`。
+  - 无残留训练进程；metrics snapshot 已生成：
+    - `/opt/tiger/TTRL/verl/sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26_metrics.txt`
+    - `/opt/tiger/TTRL/verl/sps_bucket_select_beta20_floor015_clip05_power15_refbase_localfp32_qwen3_8b_8_310step_v26_ray_taskrunner.log`
+  - step 310 final train proxy：`selected_parseable_rate=1.000`，`selected_clip_rate=0.020`，`ground_truth_reward=1.000`，`pass@32=1.000`，`response_length/clip_ratio=0.020`。
+  - final validation：
+    - `val-core/MATH-TTT/acc/mean@4=0.8938631790744467`（console rounded `0.894`）
+    - `val-core/MATH-TTT/acc/best@4/mean=0.931`
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.901`
+    - `val-aux/MATH-TTT/acc/worst@4/mean=0.845`
+    - `val-aux/MATH-TTT/acc/best@2/mean=0.9181971830985916`
+    - `val-aux/MATH-TTT/acc/maj@2/mean=0.8942354124748491`
+    - `val-aux/MATH-TTT/acc/worst@2/mean=0.869913480885312`
+    - `val-aux/MATH-TTT/format_score/mean@4=0.929`
+    - `val-aux/MATH-TTT/format_score/best@4/mean=0.962`
+    - `val-aux/MATH-TTT/format_score/maj@4=0.933`
+  - validation timing: `timing_s/testing=174.859`，final step including validation `timing_s/step=235.187`。
+  - 结果判断：
+    - 未达到用户目标 `mean@4 >= 0.90`，差 `0.0061368209255533`。
+    - 明显优于当前 Qwen3-8B 184-step v14 baseline `mean@4=0.8742454728370221`，提升约 `+0.0196177062374246`。
+    - 也高于 Qwen3-8B 50-step best v22 `mean@4=0.7796780684104627`，但该对比 step 数不同。
+    - 由于 v26 310-step 是当前 Qwen3-8B 最好长跑结果且由算法/runner修复产生有效提升，应按用户要求做本地 git commit 记录。
+  - 需要继续优化：最终目标仍未完成；下一轮需要针对 0.90 缺口优化，而不是 mark goal complete。

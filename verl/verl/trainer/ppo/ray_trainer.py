@@ -1201,6 +1201,7 @@ class RayPPOTrainer:
                                 from verl.trainer.ppo.ttrl_utils import (
                                     apply_sps_weighted_ttrl_gt,
                                     select_majority_first_per_prompt,
+                                    select_sharpened_cluster_per_prompt,
                                     select_top_k_per_prompt,
                                 )
 
@@ -1225,6 +1226,8 @@ class RayPPOTrainer:
                                     weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
                                     clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
                                     weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
+                                    answer_sharpen_beta=self.config.ttrl.get("sps_answer_sharpen_beta", 1.0),
+                                    answer_sharpen_capacity=self.config.ttrl.get("sps_answer_sharpen_capacity", False),
                                 )
                                 sps_reward_tensor, sps_info = compute_sps_reward(
                                     ref_log_prob=base_lp.batch["ref_log_prob"],
@@ -1259,6 +1262,27 @@ class RayPPOTrainer:
                                 sps_info["sps/train_weight"] = float(
                                     batch.non_tensor_batch["sps_train_weight_list"].mean()
                                 )
+                                sps_info["sps/answer_sharpen_beta"] = float(
+                                    self.config.ttrl.get("sps_answer_sharpen_beta", 1.0)
+                                )
+                                sps_info["sps/answer_sharpen_capacity"] = float(
+                                    self.config.ttrl.get("sps_answer_sharpen_capacity", False)
+                                )
+                                sps_info["sps/answer_sharp_confidence"] = float(
+                                    batch.non_tensor_batch["sps_answer_sharp_confidence_list"].mean()
+                                )
+                                sps_info["sps/answer_entropy"] = float(
+                                    batch.non_tensor_batch["sps_answer_entropy_list"].mean()
+                                )
+                                sps_info["sps/answer_effective_K"] = float(
+                                    batch.non_tensor_batch["sps_answer_effective_k_list"].mean()
+                                )
+                                sps_info["sps/answer_logz"] = float(
+                                    batch.non_tensor_batch["sps_answer_logz_list"].mean()
+                                )
+                                sps_info["sps/majority_sharp_confidence"] = float(
+                                    batch.non_tensor_batch["sps_majority_sharp_confidence_list"].mean()
+                                )
                                 if sps_mode != "answer_rule_conf_weight":
                                     gen_batch_output = gen_batch_output.union(
                                         DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
@@ -1274,6 +1298,48 @@ class RayPPOTrainer:
                                     )
                                     sps_info["sps/selected_majority_ratio"] = float(
                                         selected_majority_ratio.mean()
+                                    )
+                                elif selection_mode == "sharpened_cluster":
+                                    gen_batch_output, selection_info = select_sharpened_cluster_per_prompt(
+                                        data=gen_batch_output,
+                                        n_votes_per_prompt=K,
+                                        n_samples_per_prompt=self.config.ttrl.n_samples_per_prompt,
+                                        tokenizer=self.tokenizer,
+                                        majority_gt_list=batch.non_tensor_batch["sps_raw_majority_gt_list"],
+                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                        response_mask=response_mask,
+                                        ref_log_prob=base_lp.batch["ref_log_prob"],
+                                        selection_temperature=self.config.ttrl.get(
+                                            "sps_selection_temperature",
+                                            self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                        ),
+                                        require_majority=self.config.ttrl.get(
+                                            "sps_selection_require_majority", True
+                                        ),
+                                        cluster_bonus_weight=self.config.ttrl.get(
+                                            "sps_selection_cluster_bonus", 4.0
+                                        ),
+                                        parseable_bonus_weight=self.config.ttrl.get(
+                                            "sps_selection_parseable_bonus", 2.0
+                                        ),
+                                        nonclip_bonus_weight=self.config.ttrl.get(
+                                            "sps_selection_nonclip_bonus", 1.0
+                                        ),
+                                        selection_priority=self.config.ttrl.get(
+                                            "sps_selection_priority", "score"
+                                        ),
+                                    )
+                                    sps_info["sps/selected_parseable_rate"] = float(
+                                        selection_info["parseable_rate"].mean()
+                                    )
+                                    sps_info["sps/selected_clip_rate"] = float(
+                                        selection_info["clip_rate"].mean()
+                                    )
+                                    sps_info["sps/selected_cluster_rate"] = float(
+                                        selection_info["cluster_rate"].mean()
+                                    )
+                                    sps_info["sps/selection_fallback_rate"] = float(
+                                        selection_info["fallback_rate"].mean()
                                     )
                                 else:
                                     gen_batch_output = select_top_k_per_prompt(
@@ -1449,6 +1515,34 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if (
+                            self.config.get("ttrl", {}).get("enable", False)
+                            and self.config.ttrl.get("sps_enable", False)
+                            and self.config.ttrl.get("sps_reward_mode", "group_norm_base")
+                            in ("answer_conf_filter", "answer_conf_weight", "answer_rule_conf_weight")
+                            and "format_score" in batch.non_tensor_batch
+                        ):
+                            format_reward_coef = float(self.config.ttrl.get("sps_format_reward_coef", 0.0))
+                            if format_reward_coef > 0:
+                                format_score = torch.as_tensor(
+                                    batch.non_tensor_batch["format_score"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert format_score.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                format_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                format_reward.scatter_(1, idx, format_score.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + format_reward_coef * format_reward
+                                )
+                                with torch.no_grad():
+                                    metrics["train/sps_format_reward_coef"] = format_reward_coef
+                                    metrics["train/sps_format_reward_mean"] = float(
+                                        format_score.to(torch.float32).mean().item()
+                                    )
 
                         if (
                             self.config.get("ttrl", {}).get("enable", False)

@@ -75,6 +75,143 @@ def select_majority_first_per_prompt(data, n_votes_per_prompt, n_samples_per_pro
     return data[selected_indices], np.array(majority_selected_counts, dtype=float) / float(n_samples_per_prompt)
 
 
+def select_sharpened_cluster_per_prompt(
+    data,
+    n_votes_per_prompt,
+    n_samples_per_prompt,
+    tokenizer,
+    majority_gt_list,
+    rollout_log_probs,
+    response_mask,
+    ref_log_prob=None,
+    selection_temperature=0.4,
+    require_majority=True,
+    cluster_bonus_weight=4.0,
+    parseable_bonus_weight=2.0,
+    nonclip_bonus_weight=1.0,
+    selection_priority="score",
+):
+    """
+    Select train rollouts from a sharpened answer cluster.
+
+    The score is internal and unsupervised: prefer parseable, non-clipped
+    candidates in the selected answer cluster, then rank by a PowerFlow-style
+    reference-reweighted score. This changes the training distribution instead
+    of adding a dense format reward.
+    """
+    assert len(data) % n_votes_per_prompt == 0, "data length must be divisible by n_votes_per_prompt"
+    num_prompts = len(data) // n_votes_per_prompt
+    assert len(majority_gt_list) == num_prompts, "majority_gt_list length must match prompt count"
+    assert rollout_log_probs.shape == response_mask.shape
+    if ref_log_prob is not None:
+        assert ref_log_prob.shape == rollout_log_probs.shape
+
+    mask_f = response_mask.to(torch.float32)
+    lengths = mask_f.sum(dim=-1).clamp(min=1.0)
+    q_seq = (rollout_log_probs.to(torch.float32) * mask_f).sum(dim=-1)
+    if ref_log_prob is not None:
+        base_seq = (ref_log_prob.to(torch.float32) * mask_f).sum(dim=-1)
+        alpha = 1.0 / max(float(selection_temperature), 1e-6)
+        score = (alpha * base_seq - q_seq) / lengths
+    else:
+        score = -q_seq / lengths
+    score = score.detach().cpu()
+    lengths_cpu = lengths.detach().cpu()
+    max_response_len = response_mask.shape[-1]
+
+    selected_indices = []
+    selected_parseable_rates = []
+    selected_clip_rates = []
+    selected_cluster_rates = []
+    fallback_rates = []
+    for i in range(num_prompts):
+        start = i * n_votes_per_prompt
+        prompt_indices = list(range(start, start + n_votes_per_prompt))
+        majority_gt = majority_gt_list[i]
+        ranked = []
+        for idx in prompt_indices:
+            data_item = data[idx]
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            parseable = answer is not None
+            if parseable:
+                answer = simplify_expression_string(answer)
+            in_cluster = parseable and answer == majority_gt
+            clipped = float(lengths_cpu[idx].item() >= max_response_len)
+            cluster_bonus = 1.0 if in_cluster else 0.0
+            parse_bonus = 1.0 if parseable else 0.0
+            clip_bonus = 1.0 - clipped
+            quality = (
+                float(cluster_bonus_weight) * cluster_bonus
+                + float(parseable_bonus_weight) * parse_bonus
+                + float(nonclip_bonus_weight) * clip_bonus
+                + float(score[idx].item())
+            )
+            ranked.append((quality, idx, parseable, clipped, in_cluster))
+
+        cluster_ranked = [item for item in ranked if item[4]]
+        if require_majority and cluster_ranked:
+            candidate_ranked = cluster_ranked
+            fallback = 0.0
+        else:
+            candidate_ranked = ranked
+            fallback = 1.0 if require_majority else 0.0
+        if selection_priority == "nonclip_parseable_bucket":
+            # Project onto the learnable support first; sharpen within each bucket.
+            candidate_ranked = sorted(
+                candidate_ranked,
+                key=lambda item: (
+                    1.0 - item[3],  # non-clipped
+                    item[2],        # parseable boxed answer
+                    item[4],        # majority answer cluster
+                    item[0],        # reference-reweighted quality
+                ),
+                reverse=True,
+            )
+        else:
+            candidate_ranked = sorted(candidate_ranked, key=lambda item: item[0], reverse=True)
+        chosen = candidate_ranked[:n_samples_per_prompt]
+        if len(chosen) < n_samples_per_prompt:
+            chosen_set = {idx for _, idx, _, _, _ in chosen}
+            fill_candidates = [item for item in ranked if item[1] not in chosen_set]
+            if selection_priority == "nonclip_parseable_bucket":
+                fill = sorted(
+                    fill_candidates,
+                    key=lambda item: (
+                        1.0 - item[3],
+                        item[2],
+                        item[4],
+                        item[0],
+                    ),
+                    reverse=True,
+                )
+            else:
+                fill = sorted(fill_candidates, key=lambda item: item[0], reverse=True)
+            chosen.extend(fill[: n_samples_per_prompt - len(chosen)])
+        assert len(chosen) == n_samples_per_prompt
+
+        selected_indices.extend(idx for _, idx, _, _, _ in chosen)
+        selected_parseable_rates.append(float(np.mean([parseable for _, _, parseable, _, _ in chosen])))
+        selected_clip_rates.append(float(np.mean([clipped for _, _, _, clipped, _ in chosen])))
+        selected_cluster_rates.append(float(np.mean([in_cluster for _, _, _, _, in_cluster in chosen])))
+        fallback_rates.append(fallback)
+
+    return (
+        data[selected_indices],
+        {
+            "parseable_rate": np.array(selected_parseable_rates, dtype=float),
+            "clip_rate": np.array(selected_clip_rates, dtype=float),
+            "cluster_rate": np.array(selected_cluster_rates, dtype=float),
+            "fallback_rate": np.array(fallback_rates, dtype=float),
+        },
+    )
+
+
 # === Ground Truth Manipulation ===
 
 
@@ -147,6 +284,8 @@ def apply_sps_weighted_ttrl_gt(
     weight_floor=0.25,
     clip_penalty=0.0,
     weight_power=1.0,
+    answer_sharpen_beta=1.0,
+    answer_sharpen_capacity=False,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -181,8 +320,14 @@ def apply_sps_weighted_ttrl_gt(
     sps_override_list = []
     sps_agreement_list = []
     sps_train_weight_list = []
+    answer_sharp_confidence_list = []
+    answer_entropy_list = []
+    answer_effective_k_list = []
+    answer_logz_list = []
+    majority_sharp_confidence_list = []
 
     temp = max(float(weight_temperature), 1e-6)
+    sharpen_beta = max(float(answer_sharpen_beta), 1e-6)
     max_response_len = response_mask.shape[-1]
     for i in range(num_prompts):
         answer_to_scores = {}
@@ -213,6 +358,11 @@ def apply_sps_weighted_ttrl_gt(
             sps_override_list.append(0.0)
             sps_agreement_list.append(0.0)
             sps_train_weight_list.append(0.0)
+            answer_sharp_confidence_list.append(0.0)
+            answer_entropy_list.append(0.0)
+            answer_effective_k_list.append(0.0)
+            answer_logz_list.append(0.0)
+            majority_sharp_confidence_list.append(0.0)
             continue
 
         answer_scores = {
@@ -220,13 +370,26 @@ def apply_sps_weighted_ttrl_gt(
             for answer, vals in answer_to_scores.items()
         }
         weighted_gt = max(answer_scores.items(), key=lambda item: item[1].item())[0]
+        answer_keys = list(answer_scores.keys())
         stacked = torch.stack(list(answer_scores.values()))
         probs = torch.softmax(stacked - stacked.max(), dim=0)
+        answer_logz = torch.logsumexp(stacked, dim=0)
+        sharp_logits = sharpen_beta * (stacked - answer_logz)
+        sharp_probs = torch.softmax(sharp_logits, dim=0)
 
         counter = Counter(answers)
         majority_gt, majority_count = counter.most_common(1)[0]
         majority_ratio = majority_count / n
         weighted_confidence = float(probs.max().item())
+        sharp_confidence = float(sharp_probs.max().item())
+        sharp_entropy = float((-(sharp_probs.clamp_min(1e-12).log() * sharp_probs).sum()).item())
+        sharp_effective_k = float((1.0 / sharp_probs.pow(2).sum().clamp_min(1e-12)).item())
+        sharp_prob_by_answer = {
+            answer: float(sharp_probs[idx].item())
+            for idx, answer in enumerate(answer_keys)
+        }
+        majority_sharp_confidence = sharp_prob_by_answer.get(majority_gt, 0.0)
+        weighted_sharp_confidence = sharp_prob_by_answer.get(weighted_gt, 0.0)
         prompt_lengths = lengths[start : start + n]
         prompt_clip_ratio = float((prompt_lengths >= max_response_len).to(torch.float32).mean().item())
 
@@ -249,8 +412,16 @@ def apply_sps_weighted_ttrl_gt(
         unique_answer_count_list.append(len(answer_to_scores))
         sps_override_list.append(float(weighted_gt != majority_gt and use_sps_label))
         sps_agreement_list.append(float(weighted_gt == majority_gt))
+        answer_sharp_confidence_list.append(sharp_confidence)
+        answer_entropy_list.append(sharp_entropy)
+        answer_effective_k_list.append(sharp_effective_k)
+        answer_logz_list.append(float(answer_logz.item()))
+        majority_sharp_confidence_list.append(majority_sharp_confidence)
         if confidence_weight:
-            agreement_confidence = weighted_confidence if weighted_gt == majority_gt else 0.0
+            if answer_sharpen_capacity:
+                agreement_confidence = weighted_sharp_confidence if weighted_gt == majority_gt else 0.0
+            else:
+                agreement_confidence = weighted_confidence if weighted_gt == majority_gt else 0.0
             prompt_weight = max(float(majority_ratio), float(agreement_confidence))
             if clip_penalty > 0:
                 prompt_weight *= max(0.0, 1.0 - float(clip_penalty) * prompt_clip_ratio)
@@ -284,6 +455,11 @@ def apply_sps_weighted_ttrl_gt(
     batch.non_tensor_batch["sps_override_list"] = np.array(sps_override_list, dtype=float)
     batch.non_tensor_batch["sps_agreement_list"] = np.array(sps_agreement_list, dtype=float)
     batch.non_tensor_batch["sps_train_weight_list"] = np.array(sps_train_weight_list, dtype=float)
+    batch.non_tensor_batch["sps_answer_sharp_confidence_list"] = np.array(answer_sharp_confidence_list, dtype=float)
+    batch.non_tensor_batch["sps_answer_entropy_list"] = np.array(answer_entropy_list, dtype=float)
+    batch.non_tensor_batch["sps_answer_effective_k_list"] = np.array(answer_effective_k_list, dtype=float)
+    batch.non_tensor_batch["sps_answer_logz_list"] = np.array(answer_logz_list, dtype=float)
+    batch.non_tensor_batch["sps_majority_sharp_confidence_list"] = np.array(majority_sharp_confidence_list, dtype=float)
     return batch
 
 
