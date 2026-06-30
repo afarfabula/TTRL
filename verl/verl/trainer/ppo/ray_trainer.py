@@ -1156,7 +1156,8 @@ class RayPPOTrainer:
                             )
                             sps_temp = self.config.ttrl.sps_proposal_temperature
                             gen_batch.meta_info["kwargs"] = {"n": K, "temperature": sps_temp}
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            with marked_timer("sps_generate_sequences_call", timing_raw, color="red"):
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                             assert len(gen_batch_output) == len(batch) * K
                             assert "rollout_log_probs" in gen_batch_output.batch, (
                                 "SPS requires actor_rollout_ref.rollout.calculate_log_probs=True"
@@ -1166,31 +1167,34 @@ class RayPPOTrainer:
                             # Build a fresh scoring proto so we never mutate the (locked)
                             # rollout output; also avoids leaking a temp-scaled ref_log_prob
                             # into the main batch (the real ref step recomputes at train temp).
-                            sps_score_batch = DataProto.from_dict(
-                                tensors={
-                                    "input_ids": gen_batch_output.batch["input_ids"],
-                                    "attention_mask": gen_batch_output.batch["attention_mask"],
-                                    "position_ids": gen_batch_output.batch["position_ids"],
-                                    "responses": gen_batch_output.batch["responses"],
-                                },
-                                meta_info={"ref_temperature_override": 1.0},
-                            )
+                            with marked_timer("sps_build_score_batch", timing_raw):
+                                sps_score_batch = DataProto.from_dict(
+                                    tensors={
+                                        "input_ids": gen_batch_output.batch["input_ids"],
+                                        "attention_mask": gen_batch_output.batch["attention_mask"],
+                                        "position_ids": gen_batch_output.batch["position_ids"],
+                                        "responses": gen_batch_output.batch["responses"],
+                                    },
+                                    meta_info={"ref_temperature_override": 1.0},
+                                )
                             sps_base_logprob_source = self.config.ttrl.get("sps_base_logprob_source", "ref")
-                            if sps_base_logprob_source == "actor":
-                                actor_lp = self.actor_rollout_wg.compute_log_prob(sps_score_batch)
-                                base_lp = DataProto.from_dict(
-                                    tensors={"ref_log_prob": actor_lp.batch["old_log_probs"]}
-                                )
-                            elif sps_base_logprob_source == "rollout":
-                                base_lp = DataProto.from_dict(
-                                    tensors={"ref_log_prob": gen_batch_output.batch["rollout_log_probs"]}
-                                )
-                            elif not self.ref_in_actor:
-                                base_lp = self.ref_policy_wg.compute_ref_log_prob(sps_score_batch)
-                            else:
-                                base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
+                            with marked_timer("sps_base_logprob", timing_raw, color="blue"):
+                                if sps_base_logprob_source == "actor":
+                                    actor_lp = self.actor_rollout_wg.compute_log_prob(sps_score_batch)
+                                    base_lp = DataProto.from_dict(
+                                        tensors={"ref_log_prob": actor_lp.batch["old_log_probs"]}
+                                    )
+                                elif sps_base_logprob_source == "rollout":
+                                    base_lp = DataProto.from_dict(
+                                        tensors={"ref_log_prob": gen_batch_output.batch["rollout_log_probs"]}
+                                    )
+                                elif not self.ref_in_actor:
+                                    base_lp = self.ref_policy_wg.compute_ref_log_prob(sps_score_batch)
+                                else:
+                                    base_lp = self.actor_rollout_wg.compute_ref_log_prob(sps_score_batch)
 
-                            response_mask = compute_response_mask(gen_batch_output)
+                            with marked_timer("sps_response_mask", timing_raw):
+                                response_mask = compute_response_mask(gen_batch_output)
                             reuse_base_log_probs_as_ref = self.config.ttrl.get(
                                 "sps_reuse_base_log_probs_as_ref", False
                             )
@@ -1206,11 +1210,12 @@ class RayPPOTrainer:
                                         "ttrl.sps_reuse_base_log_probs_as_ref only preserves ref semantics "
                                         "when rollout.temperature is 1.0"
                                     )
-                                gen_batch_output = gen_batch_output.union(
-                                    DataProto.from_dict(
-                                        tensors={"sps_base_ref_log_probs": base_lp.batch["ref_log_prob"]}
+                                with marked_timer("sps_reuse_ref_union", timing_raw):
+                                    gen_batch_output = gen_batch_output.union(
+                                        DataProto.from_dict(
+                                            tensors={"sps_base_ref_log_probs": base_lp.batch["ref_log_prob"]}
+                                        )
                                     )
-                                )
                             if sps_mode in (
                                 "answer_weighted_vote",
                                 "answer_weighted_gate",
@@ -1225,40 +1230,42 @@ class RayPPOTrainer:
                                     select_top_k_per_prompt,
                                 )
 
-                                batch = apply_sps_weighted_ttrl_gt(
-                                    batch=batch,
-                                    gen_batch_output=gen_batch_output,
-                                    n=K,
-                                    tokenizer=self.tokenizer,
-                                    ref_log_prob=base_lp.batch["ref_log_prob"],
-                                    rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
-                                    response_mask=response_mask,
-                                    alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
-                                    length_normalize=self.config.ttrl.get("sps_length_normalize", True),
-                                    weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
-                                    use_majority_fallback=sps_mode == "answer_weighted_gate",
-                                    gate_confidence_threshold=self.config.ttrl.get("sps_gate_confidence_threshold", 0.8),
-                                    gate_majority_ratio_threshold=self.config.ttrl.get("sps_gate_majority_ratio_threshold", 0.75),
-                                    confidence_filter=sps_mode == "answer_conf_filter",
-                                    confidence_weight=sps_mode in ("answer_conf_weight", "answer_rule_conf_weight"),
-                                    filter_confidence_threshold=self.config.ttrl.get("sps_filter_confidence_threshold", 0.8),
-                                    filter_majority_ratio_threshold=self.config.ttrl.get("sps_filter_majority_ratio_threshold", 0.75),
-                                    weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
-                                    clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
-                                    weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
-                                    answer_sharpen_beta=self.config.ttrl.get("sps_answer_sharpen_beta", 1.0),
-                                    answer_sharpen_capacity=self.config.ttrl.get("sps_answer_sharpen_capacity", False),
-                                )
-                                sps_reward_tensor, sps_info = compute_sps_reward(
-                                    ref_log_prob=base_lp.batch["ref_log_prob"],
-                                    rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
-                                    response_mask=response_mask,
-                                    n=K,
-                                    alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
-                                    weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
-                                    reward_mode="group_norm_base",
-                                    length_normalize=self.config.ttrl.get("sps_length_normalize", True),
-                                )
+                                with marked_timer("sps_apply_weighted_gt", timing_raw):
+                                    batch = apply_sps_weighted_ttrl_gt(
+                                        batch=batch,
+                                        gen_batch_output=gen_batch_output,
+                                        n=K,
+                                        tokenizer=self.tokenizer,
+                                        ref_log_prob=base_lp.batch["ref_log_prob"],
+                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                        response_mask=response_mask,
+                                        alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                        length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                        weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                        use_majority_fallback=sps_mode == "answer_weighted_gate",
+                                        gate_confidence_threshold=self.config.ttrl.get("sps_gate_confidence_threshold", 0.8),
+                                        gate_majority_ratio_threshold=self.config.ttrl.get("sps_gate_majority_ratio_threshold", 0.75),
+                                        confidence_filter=sps_mode == "answer_conf_filter",
+                                        confidence_weight=sps_mode in ("answer_conf_weight", "answer_rule_conf_weight"),
+                                        filter_confidence_threshold=self.config.ttrl.get("sps_filter_confidence_threshold", 0.8),
+                                        filter_majority_ratio_threshold=self.config.ttrl.get("sps_filter_majority_ratio_threshold", 0.75),
+                                        weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
+                                        clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
+                                        weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
+                                        answer_sharpen_beta=self.config.ttrl.get("sps_answer_sharpen_beta", 1.0),
+                                        answer_sharpen_capacity=self.config.ttrl.get("sps_answer_sharpen_capacity", False),
+                                    )
+                                with marked_timer("sps_compute_reward", timing_raw):
+                                    sps_reward_tensor, sps_info = compute_sps_reward(
+                                        ref_log_prob=base_lp.batch["ref_log_prob"],
+                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                        response_mask=response_mask,
+                                        n=K,
+                                        alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                        weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                        reward_mode="group_norm_base",
+                                        length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                    )
                                 mode_id = {
                                     "answer_weighted_vote": 2.0,
                                     "answer_weighted_gate": 3.0,
@@ -1308,103 +1315,107 @@ class RayPPOTrainer:
                                         DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
                                     )
                                 selection_mode = self.config.ttrl.get("sps_rollout_selection", "first")
-                                if selection_mode == "majority_first":
-                                    gen_batch_output, selected_majority_ratio = select_majority_first_per_prompt(
-                                        gen_batch_output,
-                                        K,
-                                        self.config.ttrl.n_samples_per_prompt,
-                                        self.tokenizer,
-                                        batch.non_tensor_batch["sps_raw_majority_gt_list"],
-                                    )
-                                    sps_info["sps/selected_majority_ratio"] = float(
-                                        selected_majority_ratio.mean()
-                                    )
-                                elif selection_mode == "sharpened_cluster":
-                                    gen_batch_output, selection_info = select_sharpened_cluster_per_prompt(
-                                        data=gen_batch_output,
-                                        n_votes_per_prompt=K,
-                                        n_samples_per_prompt=self.config.ttrl.n_samples_per_prompt,
-                                        tokenizer=self.tokenizer,
-                                        majority_gt_list=batch.non_tensor_batch["sps_raw_majority_gt_list"],
-                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
-                                        response_mask=response_mask,
-                                        ref_log_prob=base_lp.batch["ref_log_prob"],
-                                        selection_temperature=self.config.ttrl.get(
-                                            "sps_selection_temperature",
-                                            self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
-                                        ),
-                                        require_majority=self.config.ttrl.get(
-                                            "sps_selection_require_majority", True
-                                        ),
-                                        cluster_bonus_weight=self.config.ttrl.get(
-                                            "sps_selection_cluster_bonus", 4.0
-                                        ),
-                                        parseable_bonus_weight=self.config.ttrl.get(
-                                            "sps_selection_parseable_bonus", 2.0
-                                        ),
-                                        nonclip_bonus_weight=self.config.ttrl.get(
-                                            "sps_selection_nonclip_bonus", 1.0
-                                        ),
-                                        selection_priority=self.config.ttrl.get(
-                                            "sps_selection_priority", "score"
-                                        ),
-                                    )
-                                    sps_info["sps/selected_parseable_rate"] = float(
-                                        selection_info["parseable_rate"].mean()
-                                    )
-                                    sps_info["sps/selected_clip_rate"] = float(
-                                        selection_info["clip_rate"].mean()
-                                    )
-                                    sps_info["sps/selected_cluster_rate"] = float(
-                                        selection_info["cluster_rate"].mean()
-                                    )
-                                    sps_info["sps/selection_fallback_rate"] = float(
-                                        selection_info["fallback_rate"].mean()
-                                    )
-                                    if self.config.ttrl.get("sps_selection_capacity", False):
-                                        support_capacity = selection_info["parseable_rate"] * (
-                                            1.0 - selection_info["clip_rate"]
+                                with marked_timer("sps_selection", timing_raw):
+                                    if selection_mode == "majority_first":
+                                        gen_batch_output, selected_majority_ratio = select_majority_first_per_prompt(
+                                            gen_batch_output,
+                                            K,
+                                            self.config.ttrl.n_samples_per_prompt,
+                                            self.tokenizer,
+                                            batch.non_tensor_batch["sps_raw_majority_gt_list"],
                                         )
-                                        capacity_floor = float(
-                                            self.config.ttrl.get("sps_selection_capacity_floor", 0.5)
+                                        sps_info["sps/selected_majority_ratio"] = float(
+                                            selected_majority_ratio.mean()
                                         )
-                                        capacity_power = max(
-                                            float(self.config.ttrl.get("sps_selection_capacity_power", 1.0)),
-                                            1e-6,
+                                    elif selection_mode == "sharpened_cluster":
+                                        gen_batch_output, selection_info = select_sharpened_cluster_per_prompt(
+                                            data=gen_batch_output,
+                                            n_votes_per_prompt=K,
+                                            n_samples_per_prompt=self.config.ttrl.n_samples_per_prompt,
+                                            tokenizer=self.tokenizer,
+                                            majority_gt_list=batch.non_tensor_batch["sps_raw_majority_gt_list"],
+                                            rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                            response_mask=response_mask,
+                                            ref_log_prob=base_lp.batch["ref_log_prob"],
+                                            selection_temperature=self.config.ttrl.get(
+                                                "sps_selection_temperature",
+                                                self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                            ),
+                                            require_majority=self.config.ttrl.get(
+                                                "sps_selection_require_majority", True
+                                            ),
+                                            cluster_bonus_weight=self.config.ttrl.get(
+                                                "sps_selection_cluster_bonus", 4.0
+                                            ),
+                                            parseable_bonus_weight=self.config.ttrl.get(
+                                                "sps_selection_parseable_bonus", 2.0
+                                            ),
+                                            nonclip_bonus_weight=self.config.ttrl.get(
+                                                "sps_selection_nonclip_bonus", 1.0
+                                            ),
+                                            selection_priority=self.config.ttrl.get(
+                                                "sps_selection_priority", "score"
+                                            ),
                                         )
-                                        support_capacity = np.clip(
-                                            support_capacity, capacity_floor, 1.0
-                                        ) ** capacity_power
-                                        if "sps_train_weight_list" in batch.non_tensor_batch:
-                                            batch.non_tensor_batch["sps_train_weight_list"] = (
-                                                batch.non_tensor_batch["sps_train_weight_list"]
-                                                * support_capacity
+                                        sps_info["sps/selected_parseable_rate"] = float(
+                                            selection_info["parseable_rate"].mean()
+                                        )
+                                        sps_info["sps/selected_clip_rate"] = float(
+                                            selection_info["clip_rate"].mean()
+                                        )
+                                        sps_info["sps/selected_cluster_rate"] = float(
+                                            selection_info["cluster_rate"].mean()
+                                        )
+                                        sps_info["sps/selection_fallback_rate"] = float(
+                                            selection_info["fallback_rate"].mean()
+                                        )
+                                        if self.config.ttrl.get("sps_selection_capacity", False):
+                                            support_capacity = selection_info["parseable_rate"] * (
+                                                1.0 - selection_info["clip_rate"]
                                             )
-                                        sps_info["sps/selection_capacity"] = float(
-                                            support_capacity.mean()
+                                            capacity_floor = float(
+                                                self.config.ttrl.get("sps_selection_capacity_floor", 0.5)
+                                            )
+                                            capacity_power = max(
+                                                float(self.config.ttrl.get("sps_selection_capacity_power", 1.0)),
+                                                1e-6,
+                                            )
+                                            support_capacity = np.clip(
+                                                support_capacity, capacity_floor, 1.0
+                                            ) ** capacity_power
+                                            if "sps_train_weight_list" in batch.non_tensor_batch:
+                                                batch.non_tensor_batch["sps_train_weight_list"] = (
+                                                    batch.non_tensor_batch["sps_train_weight_list"]
+                                                    * support_capacity
+                                                )
+                                            sps_info["sps/selection_capacity"] = float(
+                                                support_capacity.mean()
+                                            )
+                                    else:
+                                        gen_batch_output = select_top_k_per_prompt(
+                                            gen_batch_output, K, self.config.ttrl.n_samples_per_prompt
                                         )
-                                else:
-                                    gen_batch_output = select_top_k_per_prompt(
-                                        gen_batch_output, K, self.config.ttrl.n_samples_per_prompt
-                                    )
                                 assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
                             else:
-                                sps_reward_tensor, sps_info = compute_sps_reward(
-                                    ref_log_prob=base_lp.batch["ref_log_prob"],
-                                    rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
-                                    response_mask=response_mask,
-                                    n=K,
-                                    alpha=1.0 / sps_temp,
-                                    weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
-                                    reward_mode=sps_mode,
-                                    length_normalize=self.config.ttrl.get("sps_length_normalize", True),
-                                )
+                                with marked_timer("sps_compute_reward", timing_raw):
+                                    sps_reward_tensor, sps_info = compute_sps_reward(
+                                        ref_log_prob=base_lp.batch["ref_log_prob"],
+                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                        response_mask=response_mask,
+                                        n=K,
+                                        alpha=1.0 / sps_temp,
+                                        weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                        reward_mode=sps_mode,
+                                        length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                    )
                                 # stash SPS reward via union of a fresh proto (locked-safe)
-                                gen_batch_output = gen_batch_output.union(
-                                    DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
-                                )
-                            for _k, _v in sps_info.items():
-                                metrics.update({f"train/{_k}": _v})
+                                with marked_timer("sps_reward_union", timing_raw):
+                                    gen_batch_output = gen_batch_output.union(
+                                        DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
+                                    )
+                            with marked_timer("sps_metrics_update", timing_raw):
+                                for _k, _v in sps_info.items():
+                                    metrics.update({f"train/{_k}": _v})
                         elif self.config.get("ttrl", {}).get("enable", False):
 
                             from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt

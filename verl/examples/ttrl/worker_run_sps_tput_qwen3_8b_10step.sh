@@ -14,6 +14,11 @@ LOCAL_MODEL=${LOCAL_MODEL:-/tmp/qwen3_8b_local_v21_answer_sharpen}
 
 echo "WORKER_QWEN3_8B_TPUT_START exp=${EXP_NAME} $(date '+%F %T')" | tee "$LOG"
 echo "HOST $(hostname)" | tee -a "$LOG"
+if [ ! -e /proc/self ] || [ ! -e /proc/meminfo ]; then
+  echo "WORKER_QWEN3_8B_TPUT_PROC_BAD $(date '+%F %T')" | tee -a "$LOG"
+  ls -ld /proc /proc/self /proc/meminfo 2>&1 | tee -a "$LOG" || true
+  exit 97
+fi
 ls -ld /proc /proc/self /proc/meminfo | tee -a "$LOG"
 df -h /opt/tiger /tmp | tee -a "$LOG"
 nvidia-smi -L | tee -a "$LOG"
@@ -106,7 +111,7 @@ if [ -n "$task_log" ] && [ -f "$task_log" ]; then
   cp "$task_log" "$RAY_LOG_SNAPSHOT" || true
   {
     echo "TASK_LOG $task_log"
-    grep -a -E "training/global_step|train/sps/selected_|train/sps/selection_fallback|train/sps/selection_capacity|train/sps/train_weight|train/ground_truth_reward|train/pass@32|train/majority_ratio|response_length/mean|response_length/clip_ratio|timing_s/step|timing_s/gen|timing_s/generate_sequences|timing_s/old_log_prob|timing_s/ref|timing_s/update_actor|perf/total_num_tokens|perf/throughput" "$task_log" || true
+    grep -a -E "training/global_step|train/sps/selected_|train/sps/selection_fallback|train/sps/selection_capacity|train/sps/train_weight|train/ground_truth_reward|train/pass@32|train/majority_ratio|response_length/mean|response_length/clip_ratio|timing_s/step|timing_s/gen|timing_s/generate_sequences|timing_s/sps_|timing_s/old_log_prob|timing_s/ref|timing_s/update_actor|perf/total_num_tokens|perf/throughput" "$task_log" || true
   } > "$METRICS_SNAPSHOT"
   /opt/tiger/TTRL/verl/examples/ttrl/parse_ttrl_throughput.py "$task_log" --gpu-csv "$GPU_CSV" --last 10 > "$SUMMARY" || true
   echo "WORKER_QWEN3_8B_TPUT_RAY_LOG_SNAPSHOT $RAY_LOG_SNAPSHOT" | tee -a "$LOG"

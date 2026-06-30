@@ -4918,3 +4918,573 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - 这是明确提升，应保存 local git commit。
     - 剩余缺口约 `5.524s/step`。当前瓶颈重新集中到 `gen ~=35.3s`，其中 `generate_sequences ~=23.8s` 和 SPS scoring/selection 固定开销约 `11.5s`；其次是 `update_actor ~=9.4s`。
     - 实验结束后 worker `976722` 再次出现 procfs 损坏：`/proc/self` 与 `/proc/meminfo` 缺失，需 kill 后重新申请唯一新 worker 才能继续 GPU 实验。
+- 2026-06-30 07:10 CST throughput exp 16：`tput_reuselogp_minib2_10step`
+  - worker 管理：
+    - stale worker 清空后，按单 worker 规则 launch 新 8×B200 worker `976729`。
+    - worker 内 `/proc/self` 与 `/proc/meminfo` 正常，实验前 8 张 B200 空闲；`/tmp` 约 `3.0T` 可用，模型本地副本写入 `/tmp/qwen3_8b_local_v21_answer_sharpen`。
+  - 目的：在当前最佳 `tput_reuselogp_10step` 基线基础上，仅将 actor global `ppo_mini_batch_size` 从 `1` 提到 `2`；规范化后 actor mini batch 变为 `8`，仍可被 `ppo_micro_batch_size_per_gpu=4` 整除，测试是否减少 PPO update 循环开销。
+  - 命令：
+    - `EXP_NAME=tput_reuselogp_minib2_10step RAY_DIR=/tmp/reuselogp_minib2 MASTER_PORT=29654 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.actor.ppo_mini_batch_size=2 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib2_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib2_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib2_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib2_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib2_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=45.310`
+    - `perf/total_num_tokens=700548.200`
+    - whole-machine throughput `=15461.364 token/s`
+    - `timing_s/gen=35.042`
+    - `timing_s/generate_sequences=23.627`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.411`
+    - `response_length/mean=2644.854`
+    - `response_length/clip_ratio=0.531`
+    - GPU summary: `gpu_util_mean_pct=63.333`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=84097.990`，`gpu_mem_used_max_mib=175960.000`，`gpu_power_mean_w=646.355`
+  - 对比当前最佳 `tput_reuselogp_10step`：
+    - step time 小幅改善：`45.524 -> 45.310`（`-0.214s`，约 `0.5%`）。
+    - 整机吞吐小幅提升：`15359.139 -> 15461.364 token/s`。
+    - `update_actor` 未改善：`9.384 -> 9.411`。
+    - 改善主要来自本次样本下 `gen` 和 `generate_sequences` 的自然波动：`35.288 -> 35.042`，`23.765 -> 23.627`。
+  - 结论：
+    - `actor_rollout_ref.actor.ppo_mini_batch_size=2` 不是有效主方向，没有压低 `update_actor`；虽然 summary 数值略优于 best，但幅度很小且收益不来自目标阶段，不作为 improvement commit。
+    - active goal 仍未完成：整机吞吐已超过 `10k token/s`，但 step time `45.310s` 仍高于 `<=40s`。
+    - worker `976729` 实验后 `/proc/self` 与 `/proc/meminfo` 正常，GPU 显存归零，可继续跑下一组 10-step 实验。
+- 2026-06-30 07:23 CST throughput exp 17：`tput_reuselogp_mnbt7168_10step`
+  - 目的：在当前 SPS selected logprob reuse 基线基础上，仅将 vLLM `actor_rollout_ref.rollout.max_num_batched_tokens` 从 `3584` 提到 `7168`，测试是否改善 `generate_sequences` batching，从而减少 `gen` 和 step time。该实验不同于之前的 `tput_dynbsz7168_10step`，不启用 actor dynamic batch，也不同于负向的 `max_num_batched_tokens=8192`。
+  - 命令：
+    - `EXP_NAME=tput_reuselogp_mnbt7168_10step RAY_DIR=/tmp/reuselogp_mnbt7168 MASTER_PORT=29655 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.max_num_batched_tokens=7168 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_mnbt7168_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_mnbt7168_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_mnbt7168_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_mnbt7168_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_mnbt7168_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=45.527`
+    - `perf/total_num_tokens=700312.300`
+    - whole-machine throughput `=15382.419 token/s`
+    - `timing_s/gen=35.055`
+    - `timing_s/generate_sequences=23.493`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.610`
+    - `response_length/mean=2643.932`
+    - `response_length/clip_ratio=0.547`
+    - GPU summary: `gpu_util_mean_pct=67.374`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=87160.934`，`gpu_mem_used_max_mib=175994.000`，`gpu_power_mean_w=652.500`
+  - 对比当前最佳 `tput_reuselogp_10step`：
+    - step time 基本持平/略慢：`45.524 -> 45.527`。
+    - 整机吞吐小幅提升但主要来自 token 数波动：`15359.139 -> 15382.419 token/s`。
+    - `generate_sequences` 小幅下降：`23.765 -> 23.493`，但 `update_actor` 变慢：`9.384 -> 9.610`，整体没有净收益。
+  - 结论：
+    - `max_num_batched_tokens=7168` 不是解决 40s step 的有效方向；不做 improvement commit。
+    - active goal 仍未完成：step time `45.527s` 高于 `<=40s`。
+    - worker `976729` 实验后 `/proc/self` 与 `/proc/meminfo` 正常，GPU 显存归零，可继续跑下一组 10-step 实验。
+- 2026-06-30 07:35 CST throughput exp 18：`tput_reuselogp_refno_10step`
+  - 目的：在当前 SPS selected logprob reuse 基线基础上，仅将 `actor_rollout_ref.ref.fsdp_config.param_offload=False`，测试 SPS all-K base/ref scoring 是否受 ref parameter offload 影响，并观察 `gen - generate_sequences` 固定开销是否下降。
+  - 命令：
+    - `EXP_NAME=tput_reuselogp_refno_10step RAY_DIR=/tmp/reuselogp_refno MASTER_PORT=29656 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.ref.fsdp_config.param_offload=False actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_refno_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_refno_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_refno_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_refno_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_refno_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=45.355`
+    - `perf/total_num_tokens=698237.000`
+    - whole-machine throughput `=15394.793 token/s`
+    - `timing_s/gen=35.062`
+    - `timing_s/generate_sequences=23.560`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.431`
+    - `response_length/mean=2635.826`
+    - `response_length/clip_ratio=0.537`
+    - GPU summary: `gpu_util_mean_pct=66.063`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=88503.450`，`gpu_mem_used_max_mib=175960.000`，`gpu_power_mean_w=668.566`
+  - 对比当前最佳 `tput_reuselogp_10step`：
+    - step time 小幅改善：`45.524 -> 45.355`（`-0.169s`，约 `0.4%`），但仍明显高于 40s。
+    - `gen` 基本持平：`35.288 -> 35.062`；`generate_sequences` 基本持平：`23.765 -> 23.560`。
+    - `update_actor` 基本持平/略慢：`9.384 -> 9.431`。
+    - 显存压力更高，部分 GPU 在 step 中接近 `176GB`。
+  - 结论：
+    - `ref.fsdp_config.param_offload=False` 没有显著降低 SPS base/ref scoring 固定开销，且显存压力更高；不作为 improvement commit。
+    - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `45.355s` 高于 `<=40s`。
+    - worker `976729` 实验后 `/proc/self` 与 `/proc/meminfo` 正常，GPU 显存归零，可继续实验；根盘仅约 `127M` 可用，后续需控制仓库日志大小。
+- 2026-06-30 07:47 CST throughput exp 19：`tput_reuselogp_minib4_10step`
+  - 目的：在当前 SPS selected logprob reuse 基线基础上，仅将 actor global `ppo_mini_batch_size` 从 `1` 提到 `4`；规范化后 actor mini batch 变为 `16`，仍可被 `ppo_micro_batch_size_per_gpu=4` 整除，测试是否减少 PPO update 循环开销。
+  - 命令：
+    - `EXP_NAME=tput_reuselogp_minib4_10step RAY_DIR=/tmp/reuselogp_minib4 MASTER_PORT=29657 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.actor.ppo_mini_batch_size=4 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib4_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib4_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib4_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib4_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_reuselogp_minib4_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=45.215`
+    - `perf/total_num_tokens=703401.300`
+    - whole-machine throughput `=15556.641 token/s`
+    - `timing_s/gen=35.025`
+    - `timing_s/generate_sequences=23.614`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.343`
+    - `response_length/mean=2655.999`
+    - `response_length/clip_ratio=0.553`
+    - GPU summary: `gpu_util_mean_pct=68.642`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=89648.402`，`gpu_mem_used_max_mib=175960.000`，`gpu_power_mean_w=663.469`
+  - 对比当前最佳 `tput_reuselogp_10step`：
+    - step time 小幅改善：`45.524 -> 45.215`（`-0.309s`，约 `0.7%`），但仍明显高于 40s。
+    - 整机吞吐提升：`15359.139 -> 15556.641 token/s`，主要受 token 数和阶段波动影响。
+    - `update_actor` 仅小幅改善：`9.384 -> 9.343`，不足以解释目标缺口。
+    - `gen` 基本持平：`35.288 -> 35.025`；`generate_sequences` 基本持平：`23.765 -> 23.614`。
+  - 结论：
+    - `actor_rollout_ref.actor.ppo_mini_batch_size=4` 没有有效压低 actor update，主要瓶颈仍是 `gen ~=35s`，不作为 improvement commit。
+    - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `45.215s` 高于 `<=40s`。
+    - 下一步需要拆分 `gen - generate_sequences ~=11.4s` 的内部耗时，尤其 SPS all-K base/ref scoring、reward/selection 的 Python 处理、以及 DataProto union/selection 开销；仅靠已试过的外层 micro batch / vLLM batching 参数无法稳定接近 40s。
+- 2026-06-30 08:02 CST diagnostic exp 20：`tput_sps_timers_10step`
+  - 目的：在当前 SPS selected logprob reuse 基线基础上，只添加 `gen` 内部诊断 timer，不改变训练语义，用于拆解 `gen - generate_sequences ~=11s` 的固定开销来源。
+  - 代码改动：
+    - `verl/verl/trainer/ppo/ray_trainer.py`：给 SPS 分支新增 `marked_timer`：
+      - `sps_generate_sequences_call`
+      - `sps_build_score_batch`
+      - `sps_base_logprob`
+      - `sps_response_mask`
+      - `sps_reuse_ref_union`
+      - `sps_apply_weighted_gt`
+      - `sps_compute_reward`
+      - `sps_selection`
+      - `sps_metrics_update`
+    - `verl/examples/ttrl/parse_ttrl_throughput.py`：新增上述 `timing_s/sps_*` keys。
+    - `verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh`：metrics snapshot grep 纳入 `timing_s/sps_`。
+  - 静态检查：
+    - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/examples/ttrl/parse_ttrl_throughput.py`
+    - `git -C /opt/tiger/TTRL diff --check -- TTRL_SPS_HANDOFF.md verl/verl/trainer/ppo/ray_trainer.py verl/examples/ttrl/parse_ttrl_throughput.py verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh`
+  - 命令：
+    - `EXP_NAME=tput_sps_timers_10step RAY_DIR=/tmp/sps_timers MASTER_PORT=29658 bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/opt/tiger/TTRL/verl/tput_sps_timers_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_sps_timers_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_sps_timers_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_sps_timers_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_sps_timers_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=45.341`
+    - `perf/total_num_tokens=697357.200`
+    - whole-machine throughput `=15380.177 token/s`
+    - `timing_s/gen=35.086`
+    - `timing_s/generate_sequences=23.604`
+    - `timing_s/sps_generate_sequences_call=28.180`
+    - `timing_s/sps_base_logprob=5.311`
+    - `timing_s/sps_apply_weighted_gt=0.822`
+    - `timing_s/sps_compute_reward=0.007`
+    - `timing_s/sps_selection=0.762`
+    - `timing_s/sps_build_score_batch=0.000`
+    - `timing_s/sps_response_mask=0.000`
+    - `timing_s/sps_reuse_ref_union=0.000`
+    - `timing_s/sps_metrics_update=0.000`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.388`
+    - `response_length/mean=2632.389`
+    - `response_length/clip_ratio=0.535`
+    - GPU summary: `gpu_util_mean_pct=69.479`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=89806.980`，`gpu_mem_used_max_mib=175960.000`，`gpu_power_mean_w=666.916`
+  - 结论：
+    - `gen - generate_sequences` 的主要可优化项已经定位：all-K SPS base/ref logprob forward 平均 `5.311s/step`，几乎正好对应当前距离 40s 的缺口。
+    - Python 侧 `apply_weighted_gt + selection` 平均约 `1.584s/step`，有优化空间但单独不足以达标。
+    - 外层 vLLM batching、actor mini batch、ref offload 参数已经多次证明只能带来 <1s 波动；下一步应优先优化或复用 `sps_base_logprob`，例如研究是否能在 rollout 侧同时产出 base/ref logprob、把 ref scoring 与 generation pipeline 更紧密复用，或把该 forward 与 CPU reward/selection 并行化。
+    - 该诊断埋点不是吞吐 improvement commit；若后续保留为长期 profiling 能力，可单独提交为 diagnostic commit，否则达成优化后再清理。
+- 2026-06-30 08:23 CST throughput exp 21：`tput_refdyn7168_10step`
+  - worker/命令注意：
+    - `mlx worker login 976729 -- <cmd>` 不会把写在 `mlx worker login` 前面的本地环境变量传入 worker；正确写法是 `mlx worker login 976729 -- env EXP_NAME=... RAY_DIR=... MASTER_PORT=... bash ...`。
+    - 本轮曾有两次因前置 `EXP_NAME=... mlx worker login ...` 写法落回默认 `tput_baseline_v28_alg_10step` 名称，并在 Ray 真正训练前中断；不计入吞吐结果。
+  - 目的：在当前 SPS selected logprob reuse + timer 基线基础上，仅打开 ref logprob dynamic batch，测试是否降低 SPS 内部 all-K `sps_base_logprob` forward。该改动保持 `ttrl.sps_base_logprob_source=ref`，不改变 SPS ref scoring 语义。
+  - 命令：
+    - `NO_COLOR=1 TERM=dumb mlx worker login 976729 -- env EXP_NAME=tput_refdyn7168_10step RAY_DIR=/tmp/refdyn7168 MASTER_PORT=29659 LOG=/tmp/tput_refdyn7168_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_refdyn7168_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_refdyn7168_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_refdyn7168_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_refdyn7168_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=7168 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+  - 产物：
+    - `/tmp/tput_refdyn7168_10step.log`
+    - `/opt/tiger/TTRL/verl/tput_refdyn7168_10step_ray_taskrunner.log`
+    - `/opt/tiger/TTRL/verl/tput_refdyn7168_10step_metrics.txt`
+    - `/opt/tiger/TTRL/verl/tput_refdyn7168_10step_gpu.csv`
+    - `/opt/tiger/TTRL/verl/tput_refdyn7168_10step_throughput_summary.txt`
+  - 结果（steps 1-10，no validation）：
+    - `timing_s/step=46.798`
+    - `perf/total_num_tokens=698252.100`
+    - whole-machine throughput `=14920.586 token/s`
+    - `timing_s/gen=36.525`
+    - `timing_s/generate_sequences=23.505`
+    - `timing_s/sps_generate_sequences_call=28.481`
+    - `timing_s/sps_base_logprob=6.547`
+    - `timing_s/sps_apply_weighted_gt=0.758`
+    - `timing_s/sps_selection=0.729`
+    - `timing_s/old_log_prob=0.006`
+    - `timing_s/ref=0.000`
+    - `timing_s/update_actor=9.419`
+    - `response_length/mean=2635.885`
+    - `response_length/clip_ratio=0.549`
+    - GPU summary: `gpu_util_mean_pct=67.359`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=87271.899`，`gpu_mem_used_max_mib=175844.000`，`gpu_power_mean_w=662.978`
+  - 对比 `tput_sps_timers_10step`：
+    - step time 变差：`45.341 -> 46.798`。
+    - `sps_base_logprob` 变差：`5.311 -> 6.547`。
+    - `generate_sequences` 基本持平：`23.604 -> 23.505`。
+    - `update_actor` 基本持平：`9.388 -> 9.419`。
+  - 结论：
+    - `actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True` + `ref.log_prob_max_token_len_per_gpu=7168` 对 SPS all-K ref scoring 是负向；动态重排开销超过收益，不作为 improvement commit。
+    - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `46.798s` 高于 `<=40s`。
+- 2026-06-30 08:40 CST worker 状态：
+  - `tput_refdyn7168_10step` 结束后，worker `976729` GPU 显存释放，但健康检查发现 `/proc/self` 缺失，按长期规则判定为坏 worker，已执行 `NO_COLOR=1 TERM=dumb mlx worker kill 976729`。
+  - `976729` 随后从 `mlx worker list` 消失后，尝试按用户指定命令申请唯一新 8xB200 worker。
+  - 第一次 launch 在自动 login 阶段失败，`mlx worker list` 为空。
+  - 第二次 launch 创建了 worker `976829`，但 `podIP` 长时间为空，未 ready；中断 launch 后平台尝试删除但被 `context canceled` 打断。
+  - 已多次执行 `NO_COLOR=1 TERM=dumb mlx worker kill 976829`，命令返回 `killing 1 workers: 976829`，但 `mlx worker list` 仍显示：
+    - `976829 248 3800 8 NVIDIA-B200 podIP=<empty> port=9000 createdAt=2026-06-30T00:28:55`
+  - 当前不能 launch 新 worker，否则会违反“同一时间只允许一个 worker”的约束；需要等 `976829` 从列表消失，或继续重试 kill/联系平台。
+  - 2026-06-30 08:50 CST 复查：
+    - `NO_COLOR=1 TERM=dumb mlx worker list` 仍显示 `976829`，`podIP` 为空。
+    - 再次执行 `NO_COLOR=1 TERM=dumb mlx worker kill 976829` 返回 `killing 1 workers: 976829`。
+    - 随后复查 `mlx worker list` 仍保留同一个 pending 记录；仍不能 launch 新 worker。
+    - `NO_COLOR=1 TERM=dumb mlx worker kill --all` 同样返回 `killing 1 workers: 976829`。
+    - `NO_COLOR=1 TERM=dumb mlx worker list --show-all` 显示 `976829 status=deleted deleteAt=2026-06-30 08:51:05`，但普通 `mlx worker list` 仍显示 `976829` 且 `podIP` 为空；判断为控制面 active list 同步/缓存未收敛，仍按“不能同时有两个 worker”的规则等待，不 launch 新 worker。
+    - 2026-06-30 08:53 CST：`timeout 25s env NO_COLOR=1 TERM=dumb mlx worker login 976829 -- true` 返回 `worker has not been ready yet.`，证明该记录不可复用；`mlx worker --help` 仅有 `launch/list/login/kill/quota`，没有额外 force-clean 子命令。
+    - 2026-06-30 08:56 CST：普通 `mlx worker list` 连续两次只剩表头，`976829` active list 收敛完成。
+    - 随后按用户指定 arnold queue 发起唯一新 8xB200 worker launch，创建 `976838`，但自动 login 阶段失败：`exec command: 0`，提示查看 Merlin worker Q&A；`mlx worker list` 随后为空，`mlx worker list --show-all --limit 5` 显示 `976838 status=deleted deleteAt=2026-06-30 08:58:50`。
+    - 2026-06-30 08:59 CST 磁盘状态：`/opt/tiger` 所在 `/dev/vdh` 仅剩约 `115M`，`/tmp` 还有约 `420G`。后续实验必须继续把 Ray 目录和大日志放到 `/tmp`，只把小 summary/metrics snapshot 放 `/opt/tiger/TTRL/verl`。
+    - 2026-06-30 09:01 CST：第二次按同一 arnold queue launch 创建 `976839`，自动 login 阶段同样失败 `exec command: 0`，随后 `--show-all` 显示 `976839 status=deleted deleteAt=2026-06-30 09:01:43`。
+    - 2026-06-30 09:06 CST：尝试把 worker 命令从 `-- bash` 改成 `-- sleep infinity`，避免无 TTY 自动 login 结束后 worker 被回收；创建 `976844`，但 ready 后自动 login 仍失败 `exec command: 0`，随后 `--show-all` 显示 `976844 status=deleted deleteAt=2026-06-30 09:06:07`。
+    - 只读定位系统盘占用：`/home/tiger/.cache` 约 `46G`，其中 `/home/tiger/.cache/vllm/torch_compile_cache` 约 `24G`、`/home/tiger/.cache/uv` 约 `20G`；这些是可再生缓存。由于系统盘满可能影响 worker login/本地控制面写临时文件，下一步先清理 vLLM torch compile cache，不删除 `/opt/tiger/qwen*` 模型权重。
+    - 已执行 `rm -rf /home/tiger/.cache/vllm/torch_compile_cache`，释放系统盘空间；`df -h /opt/tiger /tmp` 显示 `/dev/vdh` 从约 `115M` 可用恢复到约 `24G` 可用，`/tmp` 约 `420G` 可用。
+    - 清理系统盘后再次 launch 创建 `976845`，这次不再出现 system drive almost full warning，但 ready 后自动 login 仍失败 `exec command: 0`，`--show-all` 显示 `976845 status=deleted deleteAt=2026-06-30 09:12:44`。
+    - 结论：系统盘满是风险并已处理，但不是本轮自动 login 失败的唯一根因；所有失败 launch 日志均包含 `worker status TUI unavailable ... could not open /dev/tty`，下一步尝试用 PTY 方式运行 `mlx worker launch`，避免非 TTY 自动 login 链路异常。
+    - 2026-06-30 09:30 CST：用户明确要求不再反复 launch/kill worker，当前 worker `976847` 已 ready。执行 `mlx worker login 976847` 约 10s 后成功进入 worker shell；健康检查通过：
+      - `PROC_OK`
+      - 8 张 `NVIDIA B200` 可见，初始显存均 `0 MiB / 183359 MiB`
+      - `/opt/tiger/TTRL` 和 `/tmp` 可见。
+    - 2026-06-30 09:33 CST throughput exp 22：`tput_refmb16_10step`
+      - 目的：在 `tput_sps_timers_10step` / selected logprob reuse 基线基础上，仅把 `actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu` 从 `8` 增加到 `16`，测试是否降低 SPS all-K ref/base logprob forward 开销；保持 `sps_base_logprob_source=ref`，不改变 SPS 语义。
+      - 命令：
+        - `env EXP_NAME=tput_refmb16_10step RAY_DIR=/tmp/refmb16 MASTER_PORT=29660 LOG=/tmp/tput_refmb16_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_refmb16_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_refmb16_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_refmb16_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_refmb16_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+      - 结果：无有效 10-step 吞吐结果；训练在第一轮 `generate_sequences` 的 vLLM `wake_up(tags=["kv_cache"])` 阶段失败：
+        - `RuntimeError: CUDA Error: out of memory at /workspace/csrc/cumem_allocator.cpp:122`
+        - 失败时 GPU sampler 显示多个 GPU 显存接近满载，约 `173360-179988 MiB / 183359 MiB`。
+        - 只生成了 `/opt/tiger/TTRL/verl/tput_refmb16_10step_gpu.csv`；没有生成 metrics/summary/ray_taskrunner snapshot。
+      - 失败后 worker 健康：
+        - 当前登录 shell 内 `test -e /proc/self && test -e /proc/meminfo` 返回 `PROC_BAD`。
+        - `ps` 提示 `Error, do this: mount -t proc proc /proc`。
+        - 尝试 `mount -t proc proc /proc || sudo mount -t proc proc /proc` 失败：`must be superuser` / `permission denied`。
+        - 新开 `mlx worker login 976847 -- sh -lc ...` 也返回 `PROC_BAD`，并出现 `/proc/self/exe`、`/dev/fd/63` 缺失相关错误；说明不是单个 shell 的局部问题。
+        - GPU 显存已释放为 `0 MiB`，但 `/proc` 损坏意味着该 worker 不适合继续 Ray/verl 训练。
+      - 结论：
+        - `ref.log_prob_micro_batch_size_per_gpu=16` 在当前配置下不是有效吞吐实验，因 OOM 失败，不作为 improvement commit。
+        - 按用户最新限制，不再自行 kill 或 launch worker；需用户恢复/更换健康 worker 后继续。
+        - 下一个保守候选应回退 ref micro batch 到 `8`，优先尝试 fused kernels 或更低 `gpu_memory_utilization` 的单变量实验；但必须在 `/proc` 健康的 worker 上运行。
+  - 下一步保守 infra 候选已预选，但尚未运行：
+    - 不要继续跑 `ref.log_prob_micro_batch_size_per_gpu=16`：`tput_refmb16_10step` 已在 vLLM `wake_up(kv_cache)` 阶段 OOM，且导致 `/proc` 损坏。
+    - 健康 worker 恢复后的下一条单变量实验建议：`tput_fusedtorch_10step`。
+      - 保持 `rollout/ref log_prob_micro_batch_size_per_gpu=8`、`actor.ppo_micro_batch_size_per_gpu=4`、`rollout.gpu_memory_utilization=0.9`、selected logprob reuse 开启。
+      - 仅新增 `actor_rollout_ref.model.use_fused_kernels=True actor_rollout_ref.model.fused_kernel_options.impl_backend=torch`。
+      - 代码确认：`ppo_trainer.yaml` 默认有 `actor_rollout_ref.model.use_fused_kernels` 和 `fused_kernel_options.impl_backend`；`fsdp_workers.py` 会把它传入 `apply_monkey_patch(...)`；`monkey_patch.py` 支持 backend `torch` / `triton`。
+      - 待健康 worker 后命令模板：
+        - `NO_COLOR=1 TERM=dumb mlx worker login <worker_id> -- env EXP_NAME=tput_fusedtorch_10step RAY_DIR=/tmp/fusedtorch MASTER_PORT=29661 LOG=/tmp/tput_fusedtorch_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True actor_rollout_ref.model.use_fused_kernels=True actor_rollout_ref.model.fused_kernel_options.impl_backend=torch`
+    - 2026-06-30 09:49 CST：给 `verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh` 增加 `/proc` 前置健康检查，避免坏 worker 上继续复制模型和启动 Ray：
+      - 若 `/proc/self` 或 `/proc/meminfo` 缺失，输出 `WORKER_QWEN3_8B_TPUT_PROC_BAD`，打印 `/proc` 路径状态，并以 `exit 97` 退出。
+      - 静态检查通过：`bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh`。
+      - `git diff --check` 通过：`TTRL_SPS_HANDOFF.md`、`worker_run_sps_tput_qwen3_8b_10step.sh`、`parse_ttrl_throughput.py`、`ray_trainer.py`。
+      - 该改动是实验基础设施防护，不是吞吐 improvement；不单独作为 goal 达成证据。
+    - 2026-06-30 09:53 CST completion audit：
+      - 当前 active goal 未完成：最佳有效整机吞吐已超过 `10k token/s`，但最佳有效 step time 仍约 `45.215-45.524s`，高于 `<=40s` 门槛。
+      - 已提交的明确吞吐 improvement：`01bba47 Add SPS logprob reuse throughput path`，对应 `tput_reuselogp_10step`，step time `45.524s`，whole-machine throughput `15359.139 token/s`。
+      - 当前未提交改动性质：
+        - `ray_trainer.py`：SPS 内部诊断 timer，用于定位 `sps_base_logprob` 等耗时。
+        - `parse_ttrl_throughput.py` 与 `worker_run_sps_tput_qwen3_8b_10step.sh`：解析/抓取 `timing_s/sps_*` 指标，并新增 `/proc` 前置健康检查。
+        - `TTRL_SPS_HANDOFF.md`：记录 refdyn/refmb16 负结果、worker 状态和下一步命令。
+      - 这些未提交改动不是可证明吞吐 improvement；除非后续决定保留诊断/防护能力作为单独 infra commit，否则不要作为达成目标证据。
+      - 本地验证：
+        - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/examples/ttrl/parse_ttrl_throughput.py`
+        - `/opt/tiger/TTRL/verl/examples/ttrl/parse_ttrl_throughput.py /opt/tiger/TTRL/verl/tput_sps_timers_10step_ray_taskrunner.log --gpu-csv /opt/tiger/TTRL/verl/tput_sps_timers_10step_gpu.csv --last 10`
+        - `git -C /opt/tiger/TTRL diff --check -- TTRL_SPS_HANDOFF.md verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh verl/examples/ttrl/parse_ttrl_throughput.py verl/verl/trainer/ppo/ray_trainer.py`
+    - 2026-06-30 09:53 CST worker 复查：
+      - `NO_COLOR=1 TERM=dumb mlx worker list` 仍只显示 `976847` 一个 8xB200 worker。
+      - 短超时登录检查 `mlx worker login 976847 -- sh -lc 'test -e /proc/self && test -e /proc/meminfo ...'` 仍返回 `PROC_BAD`，并伴随 `/proc/self/exe`、`/dev/fd/63` 缺失报错。
+      - GPU 显存仍为空闲：8 张卡均 `0 MiB`、`0%`。
+      - 结论：worker 仍不可用于 Ray/verl 训练；未执行 `tput_fusedtorch_10step`，未 launch/kill worker。
+    - 2026-06-30 09:59 CST throughput exp 23：`tput_fusedtorch_10step`
+      - worker：用户重新申请新 worker `976864`；只登录复用，不 launch/kill。启动前健康检查通过：`PROC_OK`，8 张 B200 空闲，`/tmp` 约 `2.9T` 可用。
+      - 目的：在 selected logprob reuse + SPS timer 基线基础上，只开启已有 fused-kernel monkey patch，测试 actor/ref forward 是否加速；保持 SPS 算法参数与 micro batch 配置不变。
+      - 命令：
+        - `env EXP_NAME=tput_fusedtorch_10step RAY_DIR=/tmp/fusedtorch MASTER_PORT=29661 LOG=/tmp/tput_fusedtorch_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_fusedtorch_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.9 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True actor_rollout_ref.model.use_fused_kernels=True actor_rollout_ref.model.fused_kernel_options.impl_backend=torch`
+      - 产物：
+        - `/opt/tiger/TTRL/verl/tput_fusedtorch_10step_ray_taskrunner.log`
+        - `/opt/tiger/TTRL/verl/tput_fusedtorch_10step_metrics.txt`
+        - `/opt/tiger/TTRL/verl/tput_fusedtorch_10step_gpu.csv`
+        - `/opt/tiger/TTRL/verl/tput_fusedtorch_10step_throughput_summary.txt`
+        - worker-local `/tmp/tput_fusedtorch_10step.log`
+      - 结果（steps 1-10，no validation）：
+        - `timing_s/step=46.324`
+        - `perf/total_num_tokens=700423.900`
+        - whole-machine throughput `=15120.174 token/s`
+        - `timing_s/gen=35.359`
+        - `timing_s/generate_sequences=23.443`
+        - `timing_s/sps_generate_sequences_call=27.967`
+        - `timing_s/sps_base_logprob=5.844`
+        - `timing_s/sps_apply_weighted_gt=0.800`
+        - `timing_s/sps_compute_reward=0.008`
+        - `timing_s/sps_selection=0.737`
+        - `timing_s/old_log_prob=0.006`
+        - `timing_s/ref=0.000`
+        - `timing_s/update_actor=10.125`
+        - `response_length/mean=2644.368`
+        - `response_length/clip_ratio=0.544`
+        - GPU summary: `gpu_util_mean_pct=62.520`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=78671.475`，`gpu_mem_used_max_mib=174774.000`，`gpu_power_mean_w=607.156`
+      - 对比 `tput_sps_timers_10step`：
+        - step time 变慢：`45.341 -> 46.324`。
+        - `sps_base_logprob` 变慢：`5.311 -> 5.844`。
+        - `update_actor` 变慢：`9.388 -> 10.125`。
+        - `generate_sequences` 基本持平/略快：`23.604 -> 23.443`，不足以抵消其他开销。
+      - 对比当前最佳 `tput_reuselogp_10step`：
+        - step time 变慢：`45.524 -> 46.324`。
+        - 整机吞吐略低：`15359.139 -> 15120.174 token/s`。
+      - 结论：
+        - `actor_rollout_ref.model.use_fused_kernels=True` + `impl_backend=torch` 对当前 Qwen3-8B SPS-TTRL 训练链路是负向；不作为 improvement commit。
+        - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `46.324s` 高于 `<=40s`。
+        - 实验结束后通过 `mlx worker login 976864 -- sh -lc ...` 得到过 `PROC_BAD`，但该路径同时出现 `/dev/fd/63` 登录包装错误，不能作为可靠健康判断。
+        - 直接在已登录 worker shell 中检查：`ls -ld /proc /proc/self /proc/meminfo` 正常，`test -e /proc/self && test -e /proc/meminfo` 返回 `PROC_OK_DIRECT`；8 张 GPU 显存均 `0 MiB`。结论修正为：worker `976864` 仍可继续实验。
+    - 2026-06-30 10:17 CST throughput exp 24：`tput_gmu085_10step`
+      - worker：继续复用用户提供的唯一 worker `976864`，未 launch/kill 新 worker。
+      - 启动前/训练中直接在已登录 worker shell 检查 `/proc` 正常：
+        - `test -e /proc/self && test -e /proc/meminfo` 返回 `PROC_OK_DIRECT`。
+        - `ls -ld /proc /proc/self /proc/meminfo` 正常。
+        - 训练中 8 张 B200 均可见，GPU utilization 一度达到 `98%`。
+      - 目的：在 selected logprob reuse + SPS timer 基线基础上，只把 `actor_rollout_ref.rollout.gpu_memory_utilization` 从 `0.9` 降到 `0.85`，测试 vLLM KV/cache 预留更保守时是否降低调度/内存压力；保持 SPS 算法参数与 micro batch 配置不变。
+      - 命令：
+        - `env EXP_NAME=tput_gmu085_10step RAY_DIR=/tmp/gmu085 MASTER_PORT=29662 LOG=/tmp/tput_gmu085_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_gmu085_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_gmu085_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.85 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+      - 产物：
+        - `/opt/tiger/TTRL/verl/tput_gmu085_10step_ray_taskrunner.log`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_10step_metrics.txt`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_10step_gpu.csv`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_10step_throughput_summary.txt`
+        - worker-local `/tmp/tput_gmu085_10step.log`
+      - 结果（steps 1-10，no validation）：
+        - `timing_s/step=45.148`
+        - `perf/total_num_tokens=698207.500`
+        - whole-machine throughput `=15464.826 token/s`
+        - `timing_s/gen=34.909`
+        - `timing_s/generate_sequences=23.321`
+        - `timing_s/sps_generate_sequences_call=27.879`
+        - `timing_s/sps_base_logprob=5.477`
+        - `timing_s/sps_apply_weighted_gt=0.806`
+        - `timing_s/sps_compute_reward=0.007`
+        - `timing_s/sps_selection=0.736`
+        - `timing_s/old_log_prob=0.006`
+        - `timing_s/ref=0.000`
+        - `timing_s/update_actor=9.388`
+        - `response_length/mean=2635.711`
+        - `response_length/clip_ratio=0.529`
+        - GPU summary: `gpu_util_mean_pct=63.409`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=82913.998`，`gpu_mem_used_max_mib=166816.000`，`gpu_power_mean_w=616.408`
+      - 对比 `tput_sps_timers_10step`：
+        - step time 小幅变快：`45.341 -> 45.148`。
+        - `generate_sequences` 小幅变快：`23.604 -> 23.321`。
+        - `sps_base_logprob` 变慢：`5.311 -> 5.477`。
+        - `update_actor` 基本持平：`9.388 -> 9.388`。
+      - 对比当前已提交最佳 `tput_reuselogp_10step`：
+        - step time 小幅变快：`45.524 -> 45.148`。
+        - 整机吞吐小幅提升：`15359.139 -> 15464.826 token/s`。
+      - 对比未提交 raw best `tput_reuselogp_minib4_10step`：
+        - step time 小幅变快：`45.215 -> 45.148`，幅度约 `0.067s`，属于很小的单次 10-step 差异。
+      - 训练结束后的 worker 健康：
+        - 同一个已登录 worker shell 内再次执行 `test -e /proc/self && test -e /proc/meminfo` 返回 `PROC_BAD_DIRECT_AFTER`。
+        - `ls -ld /proc /proc/self /proc/meminfo` 显示 `/proc` 变成普通空目录，`/proc/self`、`/proc/meminfo` 缺失。
+        - `ps` 提示 `Error, do this: mount -t proc proc /proc`。
+        - 8 张 GPU 显存已释放为 `0 MiB`。
+      - 结论：
+        - `rollout.gpu_memory_utilization=0.85` 是当前 raw 最快 10-step 结果，但提升非常小，且仍远高于 `<=40s/step` 目标。
+        - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `45.148s` 高于 `<=40s`。
+        - worker `976864` 的 `/proc` 状态会在训练结束后损坏；后续不要在该坏 `/proc` 状态上继续 Ray/verl 实验。若用户修复或重新申请 worker，必须先用直接登录 shell 复查 `/proc/self` 和 `/proc/meminfo`。
+        - 因提升幅度很小且 worker 结束后健康状态异常，暂不作为明确 throughput improvement commit；保留文档和产物供下一轮判断。
+    - 2026-06-30 10:31 CST worker cleanup/relaunch：
+      - 按 active goal 规则直接复查 `976864`：
+        - `NO_COLOR=1 TERM=dumb mlx worker login 976864` 成功进入 shell，但登录阶段出现 `readlink /proc/self/exe: no such file or directory`、`/dev/fd/63` 缺失和 `Error, do this: mount -t proc proc /proc`。
+        - 直接 shell 内 `test -e /proc/self && test -e /proc/meminfo` 返回 `PROC_BAD`。
+        - `ls -ld /proc /proc/self /proc/meminfo` 显示 `/proc/self`、`/proc/meminfo` 缺失。
+        - 8 张 GPU 均 `0 MiB`、`0%`。
+      - 操作：
+        - 执行 `NO_COLOR=1 TERM=dumb mlx worker kill 976864`，返回 `killing 1 workers: 976864`。
+        - 等待 `NO_COLOR=1 TERM=dumb mlx worker list` active list 只剩表头后，按用户指定命令申请唯一新 worker：
+          - `NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`
+        - 新 worker `976895` ready 并自动 login。
+      - 新 worker 健康：
+        - 直接 shell 内 `PROC_OK_DIRECT`。
+        - 8 张 `NVIDIA B200` 空闲，`/tmp` 约 `3.0T` 可用，`/opt/tiger` 所在 rootfs 约 `23G` 可用。
+        - 只使用 `976895` 一个 active worker；未同时 launch 第二个 worker。
+    - 2026-06-30 10:36 CST throughput exp 25：`tput_gmu085_minib4_10step`
+      - worker：`976895`，健康 worker，实验前 `/proc` 正常、8 张 B200 空闲。使用第二个 login 只做只读监控，没有启动第二个 worker。
+      - 目的：验证两个单独小收益是否可叠加。以当前 raw best `tput_gmu085_10step` 为基线，只增加 actor `ppo_mini_batch_size=4`；保持 SPS 算法参数、selected logprob reuse、rollout/ref logprob micro batch 和 `gpu_memory_utilization=0.85` 不变。
+      - 命令：
+        - `env EXP_NAME=tput_gmu085_minib4_10step RAY_DIR=/tmp/gmu085_minib4 MASTER_PORT=29663 LOG=/tmp/tput_gmu085_minib4_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.actor.ppo_mini_batch_size=4 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.85 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+      - 产物：
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_ray_taskrunner.log`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_metrics.txt`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_gpu.csv`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_10step_throughput_summary.txt`
+        - worker-local `/tmp/tput_gmu085_minib4_10step.log`
+      - 结果（steps 1-10，no validation）：
+        - `timing_s/step=45.089`
+        - `perf/total_num_tokens=704341.300`
+        - whole-machine throughput `=15621.168 token/s`
+        - `timing_s/gen=34.858`
+        - `timing_s/generate_sequences=23.490`
+        - `timing_s/sps_generate_sequences_call=27.942`
+        - `timing_s/sps_base_logprob=5.436`
+        - `timing_s/sps_apply_weighted_gt=0.764`
+        - `timing_s/sps_compute_reward=0.007`
+        - `timing_s/sps_selection=0.705`
+        - `timing_s/old_log_prob=0.006`
+        - `timing_s/ref=0.000`
+        - `timing_s/update_actor=9.393`
+        - `response_length/mean=2659.671`
+        - `response_length/clip_ratio=0.555`
+        - GPU summary: `gpu_util_mean_pct=64.530`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=81957.672`，`gpu_mem_used_max_mib=166816.000`，`gpu_power_mean_w=613.870`
+      - 对比 `tput_gmu085_10step`：
+        - step time 小幅变快：`45.148 -> 45.089`。
+        - 整机吞吐小幅提升：`15464.826 -> 15621.168 token/s`。
+        - `gen` 小幅变快：`34.909 -> 34.858`。
+        - `generate_sequences` 变慢：`23.321 -> 23.490`。
+        - `sps_base_logprob` 小幅变快：`5.477 -> 5.436`。
+        - `update_actor` 基本持平：`9.388 -> 9.393`。
+      - 对比 `tput_reuselogp_minib4_10step`：
+        - step time 小幅变快：`45.215 -> 45.089`。
+        - 整机吞吐小幅提升：`15556.641 -> 15621.168 token/s`。
+      - worker 结束后健康：
+        - 同一个 worker 的监控 shell 内 `PROC_OK_AFTER`，`/proc/self` 和 `/proc/meminfo` 正常。
+        - 8 张 GPU 显存均释放为 `0 MiB`。
+      - 结论：
+        - `gpu_memory_utilization=0.85` + `actor.ppo_mini_batch_size=4` 是当前 raw 最快 10-step 结果，但相比上一 raw best 只快 `0.059s`，仍属于很小提升。
+        - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `45.089s` 高于 `<=40s`。
+        - 当前剩余瓶颈仍是 `gen ~=34.9s`，其中 `generate_sequences ~=23.5s`、`sps_base_logprob ~=5.4s`，以及 `update_actor ~=9.4s`；外层 micro batch / gmu 调参已经接近噪声区。
+    - 2026-06-30 10:51 CST throughput exp 26：`tput_gmu085_minib8_10step`
+      - worker：继续复用健康 worker `976895`，未 launch/kill 新 worker；模型本地副本 `/tmp/qwen3_8b_local_v21_answer_sharpen` 复用。
+      - 目的：在当前 raw best `tput_gmu085_minib4_10step` 基础上，只把 actor global `ppo_mini_batch_size` 从 `4` 提到 `8`，测试 actor update 循环是否还能继续压缩；保持 `gpu_memory_utilization=0.85`、rollout/ref logprob micro batch `8`、actor micro batch `4`、selected logprob reuse 和 SPS 算法参数不变。
+      - 命令：
+        - `env EXP_NAME=tput_gmu085_minib8_10step RAY_DIR=/tmp/gmu085_minib8 MASTER_PORT=29664 LOG=/tmp/tput_gmu085_minib8_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.actor.ppo_mini_batch_size=8 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.85 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+      - 产物：
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_ray_taskrunner.log`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_metrics.txt`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_gpu.csv`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib8_10step_throughput_summary.txt`
+        - worker-local `/tmp/tput_gmu085_minib8_10step.log`
+      - 结果（steps 1-10，no validation）：
+        - `timing_s/step=45.157`
+        - `perf/total_num_tokens=703577.900`
+        - whole-machine throughput `=15580.705 token/s`
+        - `timing_s/gen=34.874`
+        - `timing_s/generate_sequences=23.404`
+        - `timing_s/sps_generate_sequences_call=27.957`
+        - `timing_s/sps_base_logprob=5.418`
+        - `timing_s/sps_apply_weighted_gt=0.774`
+        - `timing_s/sps_compute_reward=0.007`
+        - `timing_s/sps_selection=0.714`
+        - `timing_s/old_log_prob=0.006`
+        - `timing_s/ref=0.000`
+        - `timing_s/update_actor=9.428`
+        - `response_length/mean=2656.689`
+        - `response_length/clip_ratio=0.567`
+        - GPU summary: `gpu_util_mean_pct=66.207`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=83991.130`，`gpu_mem_used_max_mib=166816.000`，`gpu_power_mean_w=625.865`
+      - 对比 `tput_gmu085_minib4_10step`：
+        - step time 变慢：`45.089 -> 45.157`。
+        - 整机吞吐下降：`15621.168 -> 15580.705 token/s`。
+        - `update_actor` 变慢：`9.393 -> 9.428`。
+        - `sps_base_logprob` 小幅变快：`5.436 -> 5.418`，不足以抵消整体波动。
+      - worker 结束后健康：
+        - 监控 shell 内 `PROC_OK_AFTER_MINIB8`，`/proc/self` 和 `/proc/meminfo` 正常。
+        - 8 张 GPU 显存均释放为 `0 MiB`。
+      - 结论：
+        - `actor.ppo_mini_batch_size=8` 不是提升；当前最优仍是 `tput_gmu085_minib4_10step` 的 `45.089s`。
+        - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time 仍高于 `<=40s`。
+        - 不做 improvement commit。
+    - 2026-06-30 11:05 CST throughput exp 27：`tput_gmu085_minib4_refmb12_10step`
+      - worker：继续复用健康 worker `976895`，未 launch/kill 新 worker；模型本地副本 `/tmp/qwen3_8b_local_v21_answer_sharpen` 复用。
+      - 目的：在当前 raw best `tput_gmu085_minib4_10step` 基础上，只把 `actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu` 从 `8` 提到 `12`，测试在 `gpu_memory_utilization=0.85` 的显存余量下，能否降低 SPS all-K `sps_base_logprob` forward 开销；保持 SPS 算法参数、selected logprob reuse、actor mini batch `4`、rollout logprob micro batch `8` 不变。
+      - 命令：
+        - `env EXP_NAME=tput_gmu085_minib4_refmb12_10step RAY_DIR=/tmp/gmu085_m4_ref12 MASTER_PORT=29665 LOG=/tmp/tput_gmu085_minib4_refmb12_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_tput_qwen3_8b_10step.sh actor_rollout_ref.actor.ppo_mini_batch_size=4 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=12 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.gpu_memory_utilization=0.85 ttrl.sps_reuse_rollout_log_probs_as_old=True ttrl.sps_reuse_base_log_probs_as_ref=True`
+      - 产物：
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_ray_taskrunner.log`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_metrics.txt`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_gpu.csv`
+        - `/opt/tiger/TTRL/verl/tput_gmu085_minib4_refmb12_10step_throughput_summary.txt`
+        - worker-local `/tmp/tput_gmu085_minib4_refmb12_10step.log`
+      - 结果（steps 1-10，no validation）：
+        - `timing_s/step=44.836`
+        - `perf/total_num_tokens=702958.700`
+        - whole-machine throughput `=15678.549 token/s`
+        - `timing_s/gen=34.621`
+        - `timing_s/generate_sequences=23.429`
+        - `timing_s/sps_generate_sequences_call=27.837`
+        - `timing_s/sps_base_logprob=5.269`
+        - `timing_s/sps_apply_weighted_gt=0.783`
+        - `timing_s/sps_compute_reward=0.007`
+        - `timing_s/sps_selection=0.722`
+        - `timing_s/old_log_prob=0.007`
+        - `timing_s/ref=0.000`
+        - `timing_s/update_actor=9.377`
+        - `response_length/mean=2654.270`
+        - `response_length/clip_ratio=0.546`
+        - GPU summary: `gpu_util_mean_pct=68.844`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=87499.471`，`gpu_mem_used_max_mib=172532.000`，`gpu_power_mean_w=627.538`
+      - 对比 `tput_gmu085_minib4_10step`：
+        - step time 变快：`45.089 -> 44.836`。
+        - 整机吞吐提升：`15621.168 -> 15678.549 token/s`。
+        - `sps_base_logprob` 降低：`5.436 -> 5.269`，符合本实验目标。
+        - `gen` 降低：`34.858 -> 34.621`。
+        - `update_actor` 小幅降低：`9.393 -> 9.377`。
+        - GPU mean util 提升：`64.530% -> 68.844%`，max memory 从 `166816 MiB` 增至 `172532 MiB`，未 OOM。
+      - worker 结束后健康：
+        - 监控 shell 内 `PROC_OK_AFTER_REFMB12`，`/proc/self` 和 `/proc/meminfo` 正常。
+        - 8 张 GPU 显存均释放为 `0 MiB`。
+      - 结论：
+        - `ref.log_prob_micro_batch_size_per_gpu=12` 是有效小幅提升，当前 best 更新为 `tput_gmu085_minib4_refmb12_10step`。
+        - active goal 仍未完成：整机吞吐超过 `10k token/s`，但 step time `44.836s` 仍高于 `<=40s`。
+        - 该改动保持 SPS 语义不变，只改变 ref/base logprob forward micro batch；若静态检查通过，应作为明确 throughput improvement 做本地 commit 记录。
+    - 2026-06-30 11:23 CST majority-vote 20s/step 记忆核查与对照：
+      - 背景：用户询问原版 TTRL majority-vote 是否曾做到约 `20s/step`，要求查历史日志并实际试跑。
+      - 旧日志核查：
+        - `/opt/tiger/TTRL/verl/majvote_ttrl_4gpu.log` 只保留了 4-GPU Qwen3-4B MajVote 启动命令，包含 `ttrl.sps_enable=False`、`rollout.n=32`、`n_votes_per_prompt=64`、`n_samples_per_prompt=32`，未保存 step timing。
+        - `/opt/tiger/TTRL/verl/run_paper.log` 同样没有可解析的 `timing_s/step` 训练 step 行。
+        - handoff 里能看到 Qwen2.5-Math-7B v14 184-step 曾在后段达到 `33-39s/step`，但那是 SPS v14 / Qwen2.5-Math-7B，不是 Qwen3-8B 原版 TTRL；没有找到“原版总 step 20s”的记录。
+        - 多处日志中 `timing_s/generate_sequences` 在 `20-24s` 附近，容易和总 `timing_s/step` 混淆。
+      - 新增对照脚本：
+        - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_majvote_tput_qwen3_8b_10step.sh`
+        - 目的：同 worker、同 Qwen3-8B 本地模型、同 MATH-TTT、8x B200、10 step、no validation，关闭 SPS，仅跑原版 majority-vote，用统一 parser 输出 throughput。
+        - 关键算法参数：`ttrl.enable=True`，`ttrl.sps_enable=False`，`actor_rollout_ref.rollout.n=32`，`ttrl.n_votes_per_prompt=64`，`ttrl.n_samples_per_prompt=32`。
+        - 关键 infra 参数：`actor.ppo_mini_batch_size=4`，`actor.ppo_micro_batch_size_per_gpu=4`，`rollout.log_prob_micro_batch_size_per_gpu=8`，`ref.log_prob_micro_batch_size_per_gpu=12`，`rollout.gpu_memory_utilization=0.85`。
+      - 命令：
+        - `env EXP_NAME=tput_majvote_qwen3_8b_10step RAY_DIR=/tmp/majvote_qwen3_8b_10step MASTER_PORT=29666 LOG=/tmp/tput_majvote_qwen3_8b_10step.log RAY_LOG_SNAPSHOT=/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_ray_taskrunner.log METRICS_SNAPSHOT=/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_metrics.txt GPU_CSV=/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_gpu.csv SUMMARY=/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_throughput_summary.txt bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_majvote_tput_qwen3_8b_10step.sh`
+      - 产物：
+        - `/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_ray_taskrunner.log`
+        - `/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_metrics.txt`
+        - `/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_gpu.csv`
+        - `/opt/tiger/TTRL/verl/tput_majvote_qwen3_8b_10step_throughput_summary.txt`
+        - worker-local `/tmp/tput_majvote_qwen3_8b_10step.log`
+      - 结果（steps 1-10，no validation）：
+        - `timing_s/step=43.927`
+        - `perf/total_num_tokens=719672.100`
+        - whole-machine throughput `=16383.403 token/s`
+        - `timing_s/gen=28.617`
+        - `timing_s/generate_sequences=23.361`
+        - `timing_s/old_log_prob=2.455`
+        - `timing_s/ref=2.580`
+        - `timing_s/update_actor=9.509`
+        - `response_length/mean=2719.557`
+        - `response_length/clip_ratio=0.646`
+        - GPU summary: `gpu_util_mean_pct=65.536`，`gpu_util_min_pct=0.000`，`gpu_mem_used_mean_mib=87989.803`，`gpu_mem_used_max_mib=170230.000`，`gpu_power_mean_w=630.443`
+      - 对比当前 SPS best `tput_gmu085_minib4_refmb12_10step`：
+        - MajVote step time 更快：`44.836 -> 43.927`，快 `0.909s`。
+        - MajVote 整机吞吐更高：`15678.549 -> 16383.403 token/s`。
+        - 两者 `generate_sequences` 基本相同：SPS `23.429s`，MajVote `23.361s`。
+        - MajVote 无 SPS all-K base logprob/selection 开销，但仍有原版 `old_log_prob ~=2.46s`、`ref ~=2.58s` 和 `update_actor ~=9.51s`，因此总 step 不会等于 `generate_sequences` 的 20 多秒。
+      - worker 结束后健康：
+        - 监控 shell 内 `PROC_OK_AFTER_MAJVOTE`，`/proc/self` 和 `/proc/meminfo` 正常。
+        - 8 张 GPU 显存均释放为 `0 MiB`。
+      - 结论：
+        - 当前可复现证据不支持“原版 majority-vote 总 step 约 20s”；更准确说法是 generation 子阶段 `timing_s/generate_sequences` 约 `23s`，总 step 在本次 Qwen3-8B 8卡对照中约 `43.9s`。
+        - 原版 MajVote 比当前 SPS best 略快，但差距小于 1s；当前 active goal 的 `<=40s/step` 仍未完成。
+        - 这次是控制实验，不是 SPS throughput improvement；记录文档和产物，不做 improvement commit。
