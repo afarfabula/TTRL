@@ -118,3 +118,12 @@ ttrl:
   # behavior.
   sps_reuse_rollout_log_probs_as_old: false
   sps_reuse_base_log_probs_as_ref: false
+
+trainer:
+  # Optional test-time self-consistency selection for validation. When enabled,
+  # validation first generates many candidates per prompt, selects one answer
+  # cluster using only extracted predictions, then repeats that selected sample
+  # so the existing reducer reports the selected result under mean@4. Raw
+  # uncollapsed validation metrics are kept under val-raw/*.
+  validation_answer_selection_enable: false
+  validation_answer_selection_repeats: 4

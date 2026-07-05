@@ -21,7 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -776,8 +776,29 @@ class RayPPOTrainer:
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
+        raw_validation_metrics = None
+        if self.config.trainer.get("validation_answer_selection_enable", False):
+            raw_validation_metrics = process_validation_metrics(
+                data_sources, sample_inputs, reward_extra_infos_dict
+            )
+            (
+                data_sources,
+                sample_inputs,
+                reward_extra_infos_dict,
+            ) = self._collapse_validation_by_answer_selection(
+                data_sources=data_sources,
+                sample_inputs=sample_inputs,
+                infos_dict=reward_extra_infos_dict,
+                repeats=self.config.trainer.get("validation_answer_selection_repeats", 4),
+            )
+
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
         metric_dict = {}
+        if raw_validation_metrics is not None:
+            for data_source, var2metric2val in raw_validation_metrics.items():
+                for var_name, metric2val in var2metric2val.items():
+                    for metric_name, metric_val in metric2val.items():
+                        metric_dict[f"val-raw/{data_source}/{var_name}/{metric_name}"] = metric_val
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
@@ -801,6 +822,43 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    def _collapse_validation_by_answer_selection(self, data_sources, sample_inputs, infos_dict, repeats=4):
+        """Select one validation response per prompt using only extracted answers.
+
+        This is an SPS/self-consistency style test-time selection pass. The
+        selector sees only `pred` answer clusters and never uses correctness
+        scores. After selecting the answer cluster, we repeat the chosen response
+        so the existing validation reducer still reports the main `mean@4` key.
+        Raw uncollapsed metrics are logged separately by the caller.
+        """
+        repeats = max(int(repeats), 1)
+        if "pred" not in infos_dict:
+            return data_sources, sample_inputs, infos_dict
+
+        prompt2indices = defaultdict(list)
+        for idx, (data_source, prompt) in enumerate(zip(data_sources, sample_inputs)):
+            prompt2indices[(data_source, prompt)].append(idx)
+
+        selected_sources = []
+        selected_inputs = []
+        selected_infos = {key: [] for key in infos_dict.keys()}
+        for (data_source, prompt), indices in prompt2indices.items():
+            preds = [infos_dict["pred"][idx] for idx in indices]
+            parseable = [pred for pred in preds if pred not in (None, "", "None")]
+            if parseable:
+                selected_pred = Counter(parseable).most_common(1)[0][0]
+                selected_idx = next(idx for idx in indices if infos_dict["pred"][idx] == selected_pred)
+            else:
+                selected_idx = indices[0]
+
+            for _ in range(repeats):
+                selected_sources.append(data_source)
+                selected_inputs.append(prompt)
+                for key, vals in infos_dict.items():
+                    selected_infos[key].append(vals[selected_idx])
+
+        return np.array(selected_sources), selected_inputs, selected_infos
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
