@@ -1,0 +1,9 @@
+round	status	elapsed_s	proc_ok	proc_count	gpu_used_mib_total	step_rows	last_step_s
+1	0	196	OK	77	0	1	77.186
+2	0	195	OK	81	0	1	76.257
+3	0	195	OK	81	0	1	76.879
+4	0	191	OK	86	128083	1	76.755
+5	0	192	OK	85	241805	1	76.941
+6	0	190	OK	86	114931	1	77.248
+7	0	192	OK	86	120269	1	77.175
+8	0	192	BAD	0	0	1	77.280

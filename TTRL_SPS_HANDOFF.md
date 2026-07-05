@@ -7030,3 +7030,45 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
   - `nvidia-smi --query-compute-apps` shows no active CUDA processes.
   - all 8 A100 GPUs are idle (`0 MiB`, `0%`).
 - Do not treat this as a v37 algorithm result: only step 1 completed and no final validation ran.
+
+### 2026-07-05 A100 10x teardown stress test: procfs still breaks
+
+- User asked for a pressure test that repeatedly starts and exits the whole training path 10 times to verify whether the Ray teardown fix prevents `/proc` corruption.
+- Added stress runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_stress_v37_teardown_10x.sh`
+  - It reuses the v37 strict-n4 training path and local Qwen2.5-Math-7B model copy, but sets `trainer.total_training_steps=1` and `trainer.test_freq=-1` for each round.
+  - Each round uses a fresh short `RAY_TMPDIR=/tmp/r37stress${round}` and `MASTER_PORT=29700+round`.
+  - It records before/after `/proc` health, GPU memory, active compute apps, round status, elapsed time, and logged `timing_s/step`.
+- Stress result file:
+  - `/opt/tiger/TTRL/verl/v37_teardown_stress_10x_summary.tsv`
+- Summary:
+  ```text
+  round	status	elapsed_s	proc_ok	proc_count	gpu_used_mib_total	step_rows	last_step_s
+  1	0	196	OK	77	0	1	77.186
+  2	0	195	OK	81	0	1	76.257
+  3	0	195	OK	81	0	1	76.879
+  4	0	191	OK	86	128083	1	76.755
+  5	0	192	OK	85	241805	1	76.941
+  6	0	190	OK	86	114931	1	77.248
+  7	0	192	OK	86	120269	1	77.175
+  8	0	192	BAD	0	0	1	77.280
+  ```
+- Interpretation:
+  - Rounds 1-7 completed one full train step and exited with `proc_ok=OK`.
+  - Round 8 completed one train step and returned `status=0`, but immediately after exit `/proc` was broken:
+    - `PROC_HEALTH {"label": "after_round_8", "proc_count": 0, "proc_meminfo": false, "proc_self": false, ...}`
+    - Monitor shell also confirmed `PROC_COUNT 0 HAS_SELF False HAS_MEMINFO False`.
+    - The shell printed the known platform symptom: `Error, do this: mount -t proc proc /proc`.
+  - The teardown fix improves normal Ray driver shutdown and ensures abnormal exits are recorded, but it does not prevent the MLX worker/container procfs corruption under repeated full verl/vLLM/Ray startup/shutdown.
+  - The test stopped at round 8 by design after detecting `proc_ok=BAD`; rounds 9-10 were not started.
+- Step timing across completed rounds:
+  - All 8 rounds logged exactly one step.
+  - `last_step_s` stayed around `76.3-77.3s`.
+  - Full cold start + one step + teardown elapsed time was about `190-196s` per round.
+- Note on `gpu_used_mib_total`:
+  - Some OK rounds recorded nonzero GPU memory at the exact post-run sampling point, but later monitor samples showed memory dropping or the next round already starting. Treat that column as an immediate sampling artifact, not the procfs failure signal.
+  - The decisive failure signal is round 8 `proc_ok=BAD` and `proc_count=0`.
+- Current worker `985168` status after the stress test:
+  - `/proc/self` and `/proc/meminfo` are missing.
+  - `PROC_COUNT=0`.
+  - Do not run more Ray/psutil/CUDA training on this worker. It should be replaced or restarted before further experiments.
