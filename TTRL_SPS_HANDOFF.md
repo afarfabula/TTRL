@@ -7126,3 +7126,64 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
 - Updated operational conclusion:
   - Application-level `ray.shutdown()`, no `runtime_env`, no dashboard, and loopback Ray init are not sufficient.
   - The only robust workaround currently is avoiding repeated full Ray/verl/vLLM startup/teardown on the same worker: run one long experiment per fresh worker, or restructure experiments to reuse one Ray lifetime instead of launching many independent jobs.
+
+### 2026-07-05 H100 v38 Ray/c10d loopback fix
+
+- A fresh H100 worker was available and healthy before v38:
+  - `/proc/self` and `/proc/meminfo` existed.
+  - `PROC_COUNT` was nonzero.
+  - CUDA compat preflight enabled cuda-12.9 compat for driver `535.129.03`.
+  - `cuInit: 0`.
+- v38 was intended as a single long strict-n4 retry of the v37 algorithm with lower vLLM memory pressure:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v38_lean_strict_n4.sh`.
+  - Local model source: `/opt/tiger/qwen2.5_math_7b`.
+  - Local worker copy: `/tmp/qwen2_5_math_7b_local_v38_lean_strict_n4_20step`.
+  - Strict validation: `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - Validation answer selection disabled: `trainer.validation_answer_selection_enable=False`.
+  - Lean Ray init: `+ray_init.no_runtime_env=True`, `+ray_init.include_dashboard=False`, `+ray_init.node_ip_address=127.0.0.1`.
+  - vLLM memory lowered: `actor_rollout_ref.rollout.gpu_memory_utilization=0.75`.
+- First v38 attempt did not reach training:
+  - Ray GCS connected to loopback: `successful connect gcs: 127.0.0.1:63196`.
+  - However, the wrapper did not override MLX-provided `MY_HOST_IP`, and the inner script logged `MY_HOST_IP=10.124.104.219`.
+  - In verl, `WorkerHelper._get_node_ip()` prefers `MY_HOST_IP` over `ray._private.services.get_node_ip_address()`, so WorkerDict rank0 can publish a non-loopback `MASTER_ADDR` even when Ray itself was initialized with loopback.
+  - Worker `.err` logs showed C++ stacks in `c10d::TCPStore::ping()` / `c10d::TCPStore::TCPStore(...)` during `WorkerDict.__init__`; GPUs stayed idle and no training metrics were produced.
+- Fix applied to the v38 runner:
+  - Force `MY_HOST_IP=127.0.0.1`.
+  - Unset `MY_HOST_IPV6`.
+  - Force `MASTER_ADDR=127.0.0.1`.
+  - Force `GLOO_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo`, and `TP_SOCKET_IFNAME=lo`.
+  - Set `TTRL_UNSET_NCCL_SOCKET_FAMILY=1` and unset `NCCL_SOCKET_FAMILY`.
+- Rationale:
+  - Ray GCS/node IP loopback is necessary but not sufficient.
+  - WorkerDict/c10d master address is derived separately through `MY_HOST_IP`; if MLX exports a `10.*` address, c10d can still bypass loopback and hang/fail before GPU training.
+  - This fix mirrors the older v12f wrapper, which explicitly used `MY_HOST_IP=127.0.0.1` plus `lo` socket interfaces.
+- Retest after the loopback fix on worker `985239`:
+  - Health before start: `/proc/self` and `/proc/meminfo` present, `PROC_COUNT 240`, 8x H100 idle.
+  - The rerun log confirmed the intended loopback settings:
+    - `MY_HOST_IP=127.0.0.1`
+    - `MASTER_ADDR=127.0.0.1`
+    - `GLOO_SOCKET_IFNAME=lo`
+    - `NCCL_SOCKET_IFNAME=lo`
+    - `TP_SOCKET_IFNAME=lo`
+    - `NCCL_SOCKET_FAMILY` unset through `TTRL_UNSET_NCCL_SOCKET_FAMILY=1`.
+  - Ray again started on loopback: `successful connect gcs: 127.0.0.1:49280`.
+  - The job progressed past config/dataset validation:
+    - `filter dataset len: 497`
+    - `Total training steps: 20`
+    - `colocated worker base class <class 'verl.single_controller.base.worker.Worker'>`
+  - It then failed during worker initialization before any training step:
+    - `trainer.init_workers()` -> `self.ref_policy_wg.init_model()`.
+    - `ActorDiedError` for `create_colocated_worker_cls.<locals>.WorkerDict`.
+    - Failed actor example: `name: B9tBccWorkerDict_0:6`, `ip: 127.0.0.1`, `pid: 37208`, `Worker exit type: SYSTEM_ERROR`, `connection error code 2. End of file`.
+  - At the same timestamp, procfs broke:
+    - brpc warnings: `Fail to open /proc/self/stat`, `/proc/self/fd`, `/proc/loadavg`.
+    - wrapper final state: `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER 0`.
+    - final trap also recorded `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL 0`.
+  - No training metrics were produced:
+    - metrics snapshot only contains the task log path and `NO_STEP_ROWS`.
+    - no strict-n4 validation was reached.
+- Interpretation:
+  - The loopback fix solved the earlier address mismatch: all reported Ray/WorkerDict IPs were `127.0.0.1`.
+  - The remaining failure is a lower-level WorkerDict/Ray worker process death coupled with immediate procfs disappearance on the MLX worker.
+  - Do not continue using worker `985239` for Ray/psutil/CUDA experiments.
+  - v38 remains an infra failure, not an algorithm result; it cannot be used to judge the strict-n4 v37/v38 algorithm.

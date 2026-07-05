@@ -58,3 +58,7 @@ v37 尚未启动：worker `984279` 登录后 `/proc/self` 和 `/proc/meminfo` �
 `mlx worker` 没有 `status/logs` 子命令，只能用 `list/login/kill/quota` 做诊断。`mlx worker quota` 的 public resource 表里没有显示当前指定的 `cloudnative-useast1b` B200 可用量，这和 `985081` 长时间 pending 一致。
 
 当前结论：SPS 信号更适合作为训练期置信度、容量、样本选择和分布锐化信号，而不是独立 dense reward；当前 goal 下不能再靠推理时多采样选择。下一步必须提升 4 条 rollout 自身的候选质量，因为 v36 的 strict `best@4=83.00%` 仍低于 85%。
+
+2026-07-05 晚间 H100 v38 首次启动没有进入训练。虽然 Ray GCS 已经连到 `127.0.0.1`，但 wrapper 没有覆盖 MLX 环境里的 `MY_HOST_IP=10.*`，verl 的 WorkerDict 会优先用 `MY_HOST_IP` 生成 c10d `MASTER_ADDR`，导致 `WorkerDict.__init__` 阶段卡在 `TCPStore`，GPU 一直空闲。已修正 v38 runner：强制 `MY_HOST_IP=127.0.0.1`、`MASTER_ADDR=127.0.0.1`，并把 `GLOO/NCCL/TP_SOCKET_IFNAME` 设为 `lo`，同时禁用 `NCCL_SOCKET_FAMILY`。这说明 Ray 自己走 loopback 不够，WorkerDict/c10d 的地址也必须走 loopback。
+
+修正后在 H100 worker `985239` 重跑 v38，loopback 设置已确认生效，Ray GCS 和 WorkerDict 报错里的 IP 都是 `127.0.0.1`。任务越过配置和数据集校验，随后在 `trainer.init_workers()` 的 `ref_policy_wg.init_model()` 阶段 WorkerDict actor 系统级死亡，同时 `/proc` 立即损坏为 `PROC_COUNT=0`，没有产生任何 training step 或 strict n=4 validation 结果。因此 v38 仍是 infra/procfs 失败，不是算法结果；`985239` 不能继续跑 Ray/psutil/CUDA 实验。
