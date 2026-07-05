@@ -51,23 +51,27 @@ def run_ppo(config) -> None:
             num_cpus=config.ray_init.num_cpus,
         )
 
-    # Create a remote instance of the TaskRunner class, and
-    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
-    if (
-        OmegaConf.select(config.trainer, "profile_steps") is not None
-        and len(OmegaConf.select(config.trainer, "profile_steps")) > 0
-    ):
-        nsight_options = OmegaConf.to_container(config.trainer.controller_nsight_options)
-        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
-    else:
-        runner = TaskRunner.remote()
-    ray.get(runner.run.remote(config))
+    try:
+        # Create a remote instance of the TaskRunner class, and
+        # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+        if (
+            OmegaConf.select(config.trainer, "profile_steps") is not None
+            and len(OmegaConf.select(config.trainer, "profile_steps")) > 0
+        ):
+            nsight_options = OmegaConf.to_container(config.trainer.controller_nsight_options)
+            runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
+        else:
+            runner = TaskRunner.remote()
+        ray.get(runner.run.remote(config))
 
-    # [Optional] get the path of the timeline trace file from the configuration, default to None
-    # This file is used for performance analysis
-    timeline_json_file = config.ray_init.get("timeline_json_file", None)
-    if timeline_json_file:
-        ray.timeline(filename=timeline_json_file)
+        # [Optional] get the path of the timeline trace file from the configuration, default to None
+        # This file is used for performance analysis
+        timeline_json_file = config.ray_init.get("timeline_json_file", None)
+        if timeline_json_file:
+            ray.timeline(filename=timeline_json_file)
+    finally:
+        if ray.is_initialized():
+            ray.shutdown()
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head

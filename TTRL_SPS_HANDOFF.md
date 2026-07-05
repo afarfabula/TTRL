@@ -6874,3 +6874,159 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - v36 is a real strict n=4 improvement over v35: `68.96% -> 70.37%` mean@4 and `82.20% -> 83.00%` best@4.
     - The improvement supports using sharpened answer-cluster confidence as a train-time capacity signal, but the gap to `>85%` remains large.
     - Since strict `best@4=83.00%` is still below target, the next algorithm must improve the four generated candidates themselves, not merely sharpen validation aggregation or select from more samples.
+
+- 2026-07-05 16:24 CST planned experiment 37：train-time support projection under strict n=4
+  - Reason:
+    - v36 made the update capacity follow sharpened answer-cluster confidence and improved strict `mean@4` from `68.96%` to `70.37%`, but the selected training rollouts still used `sps_rollout_selection=first`.
+    - v36 internal signals show the train-time answer distribution is often already sharply concentrated (`answer_sharp_confidence` around `0.82-0.93`, low `answer_effective_K`), so the next justified change is to project the actual training samples onto the internal support that should be learnable: parseable, non-clipped, and answer-cluster-consistent rollouts.
+    - This is not validation-time inference scaling. It uses the 32/64 train-time SPS rollouts only to choose which trajectories receive the 20-step update; final validation remains strict 4 rollouts per problem with no answer selection.
+  - Runner:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v37_bucket_select_strict_n4.sh`.
+  - Changes from v36:
+    - Keep `ttrl.sps_answer_sharpen_capacity=True`.
+    - Change training sample selection from `ttrl.sps_rollout_selection=first` to `ttrl.sps_rollout_selection=sharpened_cluster`.
+    - Use the v26-style support projection priority: `ttrl.sps_selection_priority=nonclip_parseable_bucket`.
+    - Selection scoring remains unsupervised/internal: `sps_selection_temperature=0.4`, `sps_selection_require_majority=False`, `sps_selection_cluster_bonus=1.0`, `sps_selection_parseable_bonus=3.0`, `sps_selection_nonclip_bonus=4.0`.
+  - Strict validation remains unchanged:
+    - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+    - `trainer.validation_answer_selection_enable=False`.
+  - Expected diagnostic:
+    - `train/sps/selected_parseable_rate` should be high and `train/sps/selected_clip_rate` should drop relative to the raw training batch.
+    - If this fixes candidate quality rather than aggregation, strict `best@4` and `mean@4` should improve together.
+    - If `selected_cluster_rate` is high but strict `best@4` does not move, the bottleneck is likely pseudo-label correctness or prompt coverage rather than support projection.
+  - Worker health before launch:
+    - Checked worker `984279` via `mlx worker login 984279` at 2026-07-05 15:43 CST.
+    - Host after login: `trial-301545194-trialrun-301545194-worker-0`.
+    - Login printed `Error, do this: mount -t proc proc /proc`.
+    - `/proc` is present as a directory but broken: `/proc/self` missing, `/proc/meminfo` missing, `PROC_COUNT 0`.
+    - CUDA check: `/opt/tiger/modelchef/.venv/bin/python3 -c "import ctypes; print('cuInit:', ctypes.CDLL('libcuda.so.1').cuInit(0))"` returned `cuInit: 304`.
+    - `nvidia-smi -L` still lists all 8 B200 GPUs, but this is not enough; Ray/psutil/CUDA training is unsafe with broken procfs.
+    - v37 was not launched on this worker. Per the active goal constraints, the next step is to replace or restart the worker before any GPU experiment.
+  - Worker replacement attempt:
+    - Broken worker `984279` was killed from the master terminal with `NO_COLOR=1 TERM=dumb mlx worker kill 984279`.
+    - Confirmed worker list became empty before launching a replacement.
+    - New worker launch command was issued from the master terminal, not from inside a worker:
+      `NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash | tee /opt/tiger/mlx_deploy/mlx_launch_output.log`
+    - Replacement worker id: `985081`.
+    - As of 2026-07-05 15:52 CST, `985081` is still pending/scheduling; `mlx worker list` shows no `podIP` yet, so there is no usable login target and v37 has not been started.
+    - As of 2026-07-05 15:56 CST, launch has been pending for more than 10 minutes; still no `podIP` in `mlx worker list`. Do not launch a second worker in parallel.
+    - As of 2026-07-05 16:02 CST, launch has been pending for more than 15 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. Keep waiting or cancel/retry only after explicit user direction; do not start v37 without a healthy login target.
+    - As of 2026-07-05 16:07 CST, launch has been pending for more than 20 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. v37 remains prepared but not launched.
+    - As of 2026-07-05 16:16 CST, launch has been pending for about 30 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. There is still no healthy login target for the required preflight checks.
+    - As of 2026-07-05 16:22 CST, launch has been pending for about 35 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. Continue to avoid a second parallel worker.
+    - As of 2026-07-05 16:27 CST, launch has been pending for about 40 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. v37 cannot start until this worker gets a usable login target or the user explicitly directs cancellation/retry.
+    - As of 2026-07-05 16:32 CST, launch has been pending for about 45 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. No v37 GPU commands have been run.
+    - As of 2026-07-05 16:36 CST, launch has been pending for about 50 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. v37 remains blocked on worker scheduling.
+    - `mlx worker` only supports `launch/list/login/kill/quota`; there is no `status` or `logs` subcommand for deeper worker diagnostics.
+    - `NO_COLOR=1 TERM=dumb mlx worker quota` did not show available `cloudnative-useast1b` B200 quota in its public resource table, which is consistent with the long pending state.
+    - As of 2026-07-05 16:45 CST, launch has been pending for about 59 minutes; `mlx worker list` still shows worker `985081` with empty `podIP` and port `9000`. The next actionable step is to cancel/retry this pending worker or change resource/queue, but do not do that without explicit user direction because only one worker may exist at a time.
+    - 2026-07-05 16:46 CST: `985081` still had empty `podIP`, so it was killed with `NO_COLOR=1 TERM=dumb mlx worker kill 985081`; `mlx worker list` was polled until empty before retrying.
+    - 2026-07-05 16:47 CST: replacement launch was issued from the master terminal using the same 8x B200 command. New worker id: `985114`.
+    - 2026-07-05 16:50 CST: `985114` is pending/scheduling for about 3 minutes; no `podIP` yet, so v37 still has not been launched.
+    - 2026-07-05 16:58 CST: `985114` has been pending/scheduling for about 10 minutes; `mlx worker list` still shows empty `podIP` and port `9000`. v37 remains blocked on worker scheduling.
+    - 2026-07-05 17:03 CST: `985114` has been pending/scheduling for about 15 minutes; `mlx worker list` still shows empty `podIP` and port `9000`. No worker login or GPU health check is possible yet.
+    - 2026-07-05 17:08 CST: `985114` has been pending/scheduling for about 20 minutes; `mlx worker list` still shows empty `podIP` and port `9000`. v37 remains blocked on worker scheduling.
+    - 2026-07-05 17:14 CST: `985114` has been pending/scheduling for about 26 minutes; `mlx worker list` still shows empty `podIP` and port `9000`. A short login probe (`timeout 12s NO_COLOR=1 TERM=dumb mlx worker login 985114`) returned `worker has not been ready yet.`, so no worker shell/preflight/training has started.
+    - 2026-07-05 17:18 CST: `985114` has been pending/scheduling for about 30 minutes; a bounded 6x30s poll and a fresh `mlx worker list` still showed empty `podIP` and port `9000`. v37 remains prepared but not launched.
+    - 2026-07-05 17:23 CST: `985114` has been pending/scheduling for about 35 minutes; a second bounded 6x30s poll still showed empty `podIP` and port `9000`. No login/preflight/training has run.
+    - 2026-07-05 17:30 CST: `985114` has been pending/scheduling for about 42 minutes; a bounded 10x30s poll plus fresh `mlx worker list` still showed empty `podIP` and port `9000`. Continue to avoid launching a second worker in parallel.
+    - 2026-07-05 17:36 CST: user provided a replacement 8x H100 worker. `mlx worker list` showed new worker `985145` (`H100-SXM-80GB`, `podIP=fdbd:dccd:cdc2:12c8:0:23e::`, port `9293`) while stale B200 `985114` was still pending.
+    - 2026-07-05 17:37 CST: logged into `985145` successfully. Host: `trial-301562365-trialrun-301562365-worker-0`. Preflight passed: `/proc/self` and `/proc/meminfo` exist, `PROC_COUNT 71`, `nvidia-smi -L` lists 8x H100 80GB HBM3, CUDA compat preflight enabled cuda-12.9 compat for driver `535.129.03`, and `cuInit: 0`.
+    - 2026-07-05 17:38 CST: stale B200 worker `985114` was killed, and `mlx worker list` confirmed only H100 worker `985145` remains. This restores the one-worker constraint before running v37.
+  - H100 original-code run attempts:
+    - 2026-07-05 18:09-18:18 CST: v37 was launched on H100 worker `985145` using the original restored Ray/verl code path and runner `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v37_bucket_select_strict_n4.sh`.
+    - The mistaken earlier Ray/verl infra patches were confirmed reverted before these attempts; `verl/verl/trainer/main_ppo.py`, `verl/verl/single_controller/ray/base.py`, and `verl/verl/single_controller/base/worker.py` had no active diff from that temporary bypass.
+    - Multiple original-code runs failed before model loading/training with:
+      `ray.exceptions.RuntimeEnvSetupError: Failed to set up runtime environment. ... HTTP request returns non-ok status code 403, body"[Compliance Gateway HTTP] Missing Destination-Service header"`.
+    - Clearing standard proxy variables (`http_proxy`, `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `all_proxy`) did not fix it.
+    - Extending `NO_PROXY` to include localhost, the Ray-selected private IP `172.18.0.16`, worker IP `10.124.106.2`, and private CIDRs did not fix it.
+    - Setting `NO_PROXY=*` and `no_proxy=*` did not fix it.
+    - Clearing every environment variable whose name contains `proxy` also did not fix it; the minimal repro still failed with the same runtime-env 403.
+  - H100 Ray runtime-env diagnosis:
+    - Minimal repro that fails:
+      ```python
+      import ray
+      ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true"}}, num_cpus=2)
+      @ray.remote(num_cpus=1)
+      class A:
+          def ping(self):
+              return "ok"
+      a = A.remote()
+      ray.get(a.ping.remote())
+      ```
+    - With Ray default node IP (`172.18.0.16`), Ray logs show:
+      - `runtime_env_agent` listens on `172.18.0.16:<port>`.
+      - `raylet` fails in `runtime_env_agent_client.cc` with the Compliance Gateway 403.
+      - GCS marks actor scheduling as `SCHEDULING_CANCELLED_RUNTIME_ENV_SETUP_FAILED`.
+    - Reading live `raylet` environment after clearing all proxy-like shell variables showed no `proxy` env inherited by raylet, so this is not caused by ordinary shell proxy variables.
+    - Minimal repro that passes:
+      ```python
+      import ray
+      ray.init(
+          runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true"}},
+          num_cpus=2,
+          _node_ip_address="127.0.0.1",
+      )
+      @ray.remote(num_cpus=1)
+      class A:
+          def ping(self):
+              import socket, os
+              return socket.gethostname(), os.environ.get("TOKENIZERS_PARALLELISM")
+      a = A.remote()
+      ray.get(a.ping.remote())
+      ```
+      This returned `('trial-301562365-trialrun-301562365-worker-0', 'true')`.
+    - Interpretation: on this H100 worker, Ray runtime-env agent HTTP works on loopback but fails when Ray uses the container private IP. The failure is environmental/worker-network related, not a TTRL algorithm result.
+  - H100 worker procfs failure after Ray prestart attempt:
+    - Attempted to pre-start Ray with `ray start --head --node-ip-address=127.0.0.1` as a no-code workaround, but Ray CLI still reported `Local node IP: 172.18.0.16` and then hit psutil/procfs failures.
+    - After this attempt, worker `985145` entered the known broken procfs state:
+      - `/proc/self` missing.
+      - `/proc/meminfo` missing.
+      - `PROC_COUNT 0`.
+      - `ps` reports `Error, do this: mount -t proc proc /proc`.
+      - `nvidia-smi` still lists all 8 H100s with only 7 MiB used per GPU, but this is not sufficient for Ray/verl.
+    - Do not continue Ray/verl GPU training on this worker. It needs replacement or restart before any further experiment.
+  - Current v37 status:
+    - v37 has not produced a strict n=4 training/validation result.
+    - No algorithm conclusion should be drawn from the H100 attempts.
+    - No improvement commit should be made for v37 yet.
+
+### 2026-07-05 A100 v37 step timing and Ray teardown fix
+
+- User provided an 8x A100 worker `985168` after the H100 worker became unusable.
+- A100 health before v37:
+  - host `trial-301562957-trialrun-301562957-worker-0`.
+  - `/proc/self` and `/proc/meminfo` present; `PROC_COUNT` in the 70s.
+  - 8x `NVIDIA A100-SXM4-80GB`.
+  - CUDA preflight `cuInit: 0`.
+- v37 original strict n=4 runner started and Ray selected loopback automatically:
+  - GCS address `127.0.0.1:56095`.
+  - raylet/runtime_env agent used `127.0.0.1`, so the H100 runtime-env 403 did not reproduce.
+- One complete training step was logged:
+  - `training/global_step:1`
+  - `timing_s/step:76.792`
+  - `timing_s/gen:59.812`
+  - `timing_s/update_actor:14.491`
+  - `perf/total_num_tokens:239358`
+  - `perf/throughput:389.621` per-GPU style metric from verl log, roughly `3.12k tokens/s` whole-machine if multiplied by 8.
+- The run then failed before step 2 with vLLM CUDA OOM during wakeup:
+  - `RuntimeError: CUDA Error: out of memory at /workspace/csrc/cumem_allocator.cpp:122`
+  - stack: `ActorRolloutRefWorker.generate_sequences` -> `fsdp_vllm.__enter__` -> `self.inference_engine.wake_up(tags=["kv_cache"])` -> vLLM `cumem_allocator`.
+- Important bug found in the v37 wrapper:
+  - The script had `set -e` around the training pipeline, so a non-zero training exit skipped the post-run task-log snapshot, throughput summary, and proc/GPU health recording.
+  - This made abnormal Ray/vLLM exits look less controlled and hid the final state.
+- Teardown fix applied:
+  - `verl/verl/trainer/main_ppo.py`: wrap the driver-side `ray.get(runner.run.remote(config))` path in `try/finally`; call `ray.shutdown()` in the `finally` block whenever Ray is initialized. This is intentionally minimal and does not alter trainer/algorithm logic.
+  - `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v37_bucket_select_strict_n4.sh`: switch the training command to `set +e`/capture status/`set -e`, add an `EXIT` trap, and always record final `/proc`, GPU memory, and compute-app status even on OOM or Ray task failure.
+- Validation of the teardown fix on the same A100 worker:
+  - `bash -n` passed for the v37 wrapper.
+  - `python3 -m py_compile verl/verl/trainer/main_ppo.py` passed.
+  - Minimal Ray teardown check:
+    - command: `RAY_TMPDIR=/tmp/ray_teardown_check_v37 /opt/tiger/modelchef/.venv/bin/python3 examples/ttrl/ray_procfs_teardown_repro.py --mode explicit --num-cpus 2`
+    - Ray started on `127.0.0.1:40654`, task and actor returned proc-health successfully, and explicit `ray.shutdown()` completed.
+    - after shutdown: `/proc/self` and `/proc/meminfo` still existed, `AFTER_REPRO_PROC_COUNT 84`, all 8 A100 GPUs showed `0 MiB` used.
+- Current A100 post-failure state:
+  - `/proc` remains healthy.
+  - `nvidia-smi --query-compute-apps` shows no active CUDA processes.
+  - all 8 A100 GPUs are idle (`0 MiB`, `0%`).
+- Do not treat this as a v37 algorithm result: only step 1 completed and no final validation ran.

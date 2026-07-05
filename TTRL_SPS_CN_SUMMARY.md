@@ -35,4 +35,22 @@ v35 重新建立 strict n=4 baseline：最终 validation 样本数 `1988=497*4`�
 
 v36 启用 `sps_answer_sharpen_capacity=True`，把 sharpened answer-cluster confidence 直接用于训练容量。它在 strict n=4 下小幅提升到 `mean@4=0.7037223340040242`，说明这个内部锐化信号方向有效，但仍远低于 85%。v36 跑完后 worker 出现 `/proc` 损坏和 `cuInit=304`，后续 GPU 实验必须先换健康 worker 或重启修复。
 
-当前结论：SPS 信号更适合作为训练期置信度、容量和分布锐化信号，而不是独立 dense reward；当前 goal 下不能再靠推理时多采样选择。下一步必须提升 4 条 rollout 自身的候选质量，因为 v36 的 strict `best@4=83.00%` 仍低于 85%。
+v37 计划在 v36 基础上只改训练期样本选择：启用 `sps_rollout_selection=sharpened_cluster` 和 `sps_selection_priority=nonclip_parseable_bucket`，把更新样本投影到可解析、非截断、答案簇一致的内部 support。最终 validation 仍保持 `n=4` 且禁用 answer selection。判断重点是 `selected_parseable_rate`、`selected_clip_rate`、`selected_cluster_rate` 这些内部指标，以及 strict `best@4` 和 `mean@4` 是否一起提升。
+
+v37 尚未启动：worker `984279` 登录后 `/proc/self` 和 `/proc/meminfo` 缺失，`PROC_COUNT=0`，`cuInit=304`。虽然 `nvidia-smi -L` 能看到 8 张 B200，但这个状态不能安全跑 Ray/CUDA 训练。已从 master 终端 kill `984279`，确认列表清空后申请新 worker `985081`；截至 2026-07-05 16:45 CST 已 pending 约 59 分钟，`mlx worker list` 仍显示 `podIP` 为空、端口 `9000`，不能登录也不能启动 v37；下一步需要取消重试或换资源/队列，但不能并行申请第二个 worker。
+
+2026-07-05 16:46 CST 已 kill 卡住的 `985081`，确认列表清空后用同一 8x B200 命令重新申请；新 worker id 为 `985114`。截至 17:30 CST，`985114` 已 pending 约 42 分钟，`mlx worker list` 仍显示 `podIP` 为空、端口 `9000`；短超时 `mlx worker login 985114` 返回 `worker has not been ready yet.`，后续两轮各 6 次 30 秒轮询和一轮 10 次 30 秒轮询仍未 ready，无法进入 worker 或做 GPU 健康检查。
+
+2026-07-05 17:36 CST 用户提供新的 8x H100 worker `985145`。已成功登录，host 为 `trial-301562365-trialrun-301562365-worker-0`；初始健康检查通过：`/proc/self` 和 `/proc/meminfo` 存在，`PROC_COUNT=71`，`nvidia-smi -L` 看到 8 张 H100 80GB，CUDA compat 按 driver `535.129.03` 启用 cuda-12.9 compat，`cuInit: 0`。17:38 CST 已 kill 旧的 pending B200 worker `985114`，确认列表只剩 `985145`，恢复单 worker 约束。
+
+18:09-18:18 CST 在 H100 上用原版恢复后的 Ray/verl 代码跑 v37，多次在训练前失败：Ray actor 创建时 `RuntimeEnvSetupError`，runtime-env agent HTTP 被 Compliance Gateway 403 拦截，错误为 `Missing Destination-Service header`。清标准代理变量、扩展 `NO_PROXY`、设置 `NO_PROXY=*`、清空所有变量名包含 `proxy` 的环境变量都不能解决。最小 Ray 复现确认：默认 node IP `172.18.0.16` 时带 `runtime_env.env_vars` 的 actor 会 403；强制 `ray.init(..., _node_ip_address="127.0.0.1")` 的最小 actor 能正常返回，说明问题是 H100 worker 上 Ray runtime-env agent 通过容器私网 IP 通信被平台网关拦截，不是 TTRL 算法问题。
+
+随后尝试用预启动 loopback Ray 作为无代码 workaround，但 Ray CLI 仍选择 `Local node IP: 172.18.0.16`，并触发已知 `/proc` 损坏状态：`/proc/self` 和 `/proc/meminfo` 缺失，`PROC_COUNT=0`，`ps` 提示 `mount -t proc proc /proc`。虽然 `nvidia-smi` 仍能看到 8 张 H100 空闲，但这个 worker 已不能可靠跑 Ray/verl。v37 尚未得到 strict n=4 训练/验证结果，不能做算法结论，也不应为 v37 做提升 commit。
+
+2026-07-05 18:40 后用户提供 8x A100 worker `985168`。A100 初始健康，`/proc/self` 和 `/proc/meminfo` 存在，CUDA `cuInit: 0`，Ray 自动使用 `127.0.0.1`，没有复现 H100 的 runtime-env 403。v37 strict n=4 原路径成功跑完第 1 个 step：`timing_s/step=76.792`，其中生成 `59.812s`，actor update `14.491s`，`perf/total_num_tokens=239358`，verl 日志吞吐 `389.621 tok/s/GPU`，折算整机约 `3.12k tok/s`。随后进入第 2 个 step 前在 vLLM `wake_up(kv_cache)` 处 CUDA OOM，未跑到 final validation，因此不能作为 v37 算法结果。
+
+本轮修复了 Ray/训练失败时的退出路径：`verl/verl/trainer/main_ppo.py` 在 driver 侧加 `finally: ray.shutdown()`；v37 wrapper 改为训练命令失败后仍继续抓 task log、写 throughput/proc/GPU 状态，并用 `EXIT` trap 兜底记录最终状态。验证：wrapper `bash -n` 通过，`main_ppo.py` 编译通过；最小 Ray teardown 脚本在同一 A100 上显式 `ray.shutdown()` 后 `/proc` 仍健康，8 张 A100 显存均为 `0 MiB`。当前 worker 没有残留 CUDA 进程。
+
+`mlx worker` 没有 `status/logs` 子命令，只能用 `list/login/kill/quota` 做诊断。`mlx worker quota` 的 public resource 表里没有显示当前指定的 `cloudnative-useast1b` B200 可用量，这和 `985081` 长时间 pending 一致。
+
+当前结论：SPS 信号更适合作为训练期置信度、容量、样本选择和分布锐化信号，而不是独立 dense reward；当前 goal 下不能再靠推理时多采样选择。下一步必须提升 4 条 rollout 自身的候选质量，因为 v36 的 strict `best@4=83.00%` 仍低于 85%。
