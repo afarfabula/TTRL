@@ -7072,3 +7072,57 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
   - `/proc/self` and `/proc/meminfo` are missing.
   - `PROC_COUNT=0`.
   - Do not run more Ray/psutil/CUDA training on this worker. It should be replaced or restarted before further experiments.
+
+### 2026-07-05 no-preflight lean Ray init stress test: failure delayed, not fixed
+
+- User provided a fresh 8x A100 worker `985218` and explicitly required: do not run CUDA compat preflight, do not edit driver/compat config.
+- Fresh worker health:
+  - host `trial-301564126-trialrun-301564126-worker-0`.
+  - `/proc/self` and `/proc/meminfo` present, `PROC_COUNT 72`.
+  - 8x `NVIDIA A100-SXM4-80GB`, all idle at start.
+- Code change under test:
+  - `verl/verl/trainer/main_ppo.py` now supports optional lean Ray init:
+    - `ray_init.no_runtime_env=True`: do not pass Ray `runtime_env`; set the same env vars directly in `os.environ`.
+    - `ray_init.include_dashboard=False`: disable Ray dashboard sidecar.
+    - `ray_init.node_ip_address=127.0.0.1`: force loopback Ray node IP.
+  - Defaults remain backward compatible unless these Hydra overrides are supplied.
+- Stress script update:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_stress_v37_teardown_10x.sh`
+  - Defaults for this test:
+    - `RUN_CUDA_COMPAT_PREFLIGHT=0`
+    - `EXP_NAME=v37_teardown_stress_noenv_10x`
+    - `RAY_NO_RUNTIME_ENV=1`
+    - `RAY_INCLUDE_DASHBOARD=False`
+    - `RAY_NODE_IP_ADDRESS=127.0.0.1`
+  - Log confirmed `CUDA_COMPAT_PREFLIGHT_SKIPPED`; no CUDA compat/driver repair was run.
+  - Ray startup log changed from dashboard URL output to `Started a local Ray instance.`, consistent with `include_dashboard=False`.
+- Stress result file:
+  - `/opt/tiger/TTRL/verl/v37_teardown_stress_noenv_10x_summary.tsv`
+- Summary:
+  ```text
+  round	status	elapsed_s	proc_ok	proc_count	gpu_used_mib_total	step_rows	last_step_s
+  1	0	201	OK	87	293857	0	NA
+  2	0	190	OK	84	241211	0	NA
+  3	0	197	OK	78	0	0	NA
+  4	0	192	OK	84	356644	0	NA
+  5	0	190	OK	83	297776	0	NA
+  6	0	194	OK	82	235934	0	NA
+  7	0	191	OK	85	359811	0	NA
+  8	0	193	OK	83	124145	0	NA
+  9	0	193	BAD	0	120690	0	NA
+  ```
+- Interpretation:
+  - Lean Ray init without preflight passed rounds 1-8 and therefore got past the previous failure point (`round=8` with legacy runtime_env/dashboard).
+  - It still failed on round 9: `proc_ok=BAD`, `proc_count=0`, `/proc/self` and `/proc/meminfo` missing.
+  - The run stopped after round 9 by design; round 10 was not started.
+  - Therefore removing Ray runtime_env, disabling dashboard, and forcing loopback may reduce sidecar surface and delay the failure, but it does not fix procfs corruption.
+  - Logs before the failure still showed zombie `ray::WorkerDict` entries and compute apps with process name `[Not Found]`, suggesting worker process teardown / platform namespace cleanup remains the likely failure class.
+- Note:
+  - `step_rows=0` in this noenv summary is a parser/log-selection issue in the stress script: it selected a worker log that did not contain the `training/global_step` console metrics under the no-runtime-env run. The process status and procfs health columns remain valid for the teardown/procfs test.
+- Current worker `985218` status after this stress test:
+  - `/proc/self` and `/proc/meminfo` are missing.
+  - `PROC_COUNT=0`.
+  - Do not run more Ray/psutil/CUDA training on this worker.
+- Updated operational conclusion:
+  - Application-level `ray.shutdown()`, no `runtime_env`, no dashboard, and loopback Ray init are not sufficient.
+  - The only robust workaround currently is avoiding repeated full Ray/verl/vLLM startup/teardown on the same worker: run one long experiment per fresh worker, or restructure experiments to reuse one Ray lifetime instead of launching many independent jobs.

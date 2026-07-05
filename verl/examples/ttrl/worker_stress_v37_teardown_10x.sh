@@ -2,11 +2,15 @@
 set -euo pipefail
 
 ROUNDS=${ROUNDS:-10}
-EXP_NAME=${EXP_NAME:-v37_teardown_stress_10x}
+EXP_NAME=${EXP_NAME:-v37_teardown_stress_noenv_10x}
 LOG=${LOG:-/opt/tiger/TTRL/verl/${EXP_NAME}.log}
 SUMMARY=${SUMMARY:-/opt/tiger/TTRL/verl/${EXP_NAME}_summary.tsv}
 SRC_MODEL=${SRC_MODEL:-/opt/tiger/qwen2.5_math_7b}
 LOCAL_MODEL=${LOCAL_MODEL:-/tmp/qwen2_5_math_7b_local_v37_bucket_select_strict_n4_20step}
+RUN_CUDA_COMPAT_PREFLIGHT=${RUN_CUDA_COMPAT_PREFLIGHT:-0}
+RAY_NO_RUNTIME_ENV=${RAY_NO_RUNTIME_ENV:-1}
+RAY_INCLUDE_DASHBOARD=${RAY_INCLUDE_DASHBOARD:-False}
+RAY_NODE_IP_ADDRESS=${RAY_NODE_IP_ADDRESS:-127.0.0.1}
 
 health_snapshot() {
   local label="$1"
@@ -44,7 +48,11 @@ PY
 echo "V37_TEARDOWN_STRESS_START rounds=${ROUNDS} $(date '+%F %T')" | tee "$LOG"
 echo -e "round\tstatus\telapsed_s\tproc_ok\tproc_count\tgpu_used_mib_total\tstep_rows\tlast_step_s" > "$SUMMARY"
 
-bash /opt/tiger/TTRL/verl/examples/ttrl/check_cuda_compat_preflight.sh 2>&1 | tee -a "$LOG"
+if [ "$RUN_CUDA_COMPAT_PREFLIGHT" = "1" ]; then
+  bash /opt/tiger/TTRL/verl/examples/ttrl/check_cuda_compat_preflight.sh 2>&1 | tee -a "$LOG"
+else
+  echo "CUDA_COMPAT_PREFLIGHT_SKIPPED $(date '+%F %T')" | tee -a "$LOG"
+fi
 health_snapshot "before_stress" 2>&1 | tee -a "$LOG"
 proc_ok
 
@@ -120,6 +128,9 @@ for round in $(seq 1 "$ROUNDS"); do
     trainer.total_training_steps=1 \
     trainer.test_freq=-1 \
     trainer.val_before_train=False \
+    +ray_init.no_runtime_env="$RAY_NO_RUNTIME_ENV" \
+    +ray_init.include_dashboard="$RAY_INCLUDE_DASHBOARD" \
+    +ray_init.node_ip_address="$RAY_NODE_IP_ADDRESS" \
     trainer.experiment_name="math-qwen25_math_7b-v37-teardown-stress-round${round}" \
     2>&1 | tee "$ROUND_LOG"
   status=${PIPESTATUS[0]}

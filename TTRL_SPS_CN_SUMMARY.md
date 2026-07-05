@@ -53,6 +53,8 @@ v37 尚未启动：worker `984279` 登录后 `/proc/self` 和 `/proc/meminfo` �
 
 随后做 10 轮完整链路启动/退出压力测试，脚本为 `verl/examples/ttrl/worker_stress_v37_teardown_10x.sh`，每轮用 v37 路径跑 1 个训练 step、关闭 validation、换新的短 `RAY_TMPDIR`。结果文件 `verl/v37_teardown_stress_10x_summary.tsv` 显示前 7 轮均 `status=0` 且 `proc_ok=OK`，每步约 `76.3-77.3s`，整轮冷启动+训练+退出约 `190-196s`。第 8 轮训练也 `status=0`，但退出后 `/proc` 损坏：`proc_ok=BAD`、`proc_count=0`、`/proc/self=False`、`/proc/meminfo=False`，shell 出现 `Error, do this: mount -t proc proc /proc`。因此 `ray.shutdown()` 修复只能改善退出记录和普通 Ray driver teardown，不能根治 MLX worker/container 的 procfs 损坏；当前 A100 worker `985168` 已不可继续跑 Ray/psutil/CUDA 训练，必须换 worker 或重启。
 
+用户随后提供新 A100 worker `985218`，明确要求不要做 CUDA compat preflight、不要做驱动/compat 修复。新 worker 初始健康：`PROC_COUNT=72`，8 张 A100 空闲。本轮按设想测试精简 Ray init：`ray_init.no_runtime_env=True`，不传 Ray `runtime_env`；`ray_init.include_dashboard=False`；`ray_init.node_ip_address=127.0.0.1`。stress 脚本默认 `RUN_CUDA_COMPAT_PREFLIGHT=0`，日志明确记录 `CUDA_COMPAT_PREFLIGHT_SKIPPED`。结果文件 `verl/v37_teardown_stress_noenv_10x_summary.tsv` 显示前 8 轮 `proc_ok=OK`，越过了上次第 8 轮失败点，但第 9 轮仍然 `status=0` 后 `/proc` 损坏：`proc_ok=BAD`、`proc_count=0`、`/proc/self=False`、`/proc/meminfo=False`。因此 no-runtime-env、关 dashboard、loopback 只能延后失败，不能根治；日志里仍能看到 `ray::WorkerDict <defunct>` 和 compute app `[Not Found]`，问题更像 worker 进程 teardown / 平台 namespace 清理。当前 worker `985218` 也不可继续跑 Ray/psutil/CUDA 训练。后续可靠策略是避免同一 worker 多次完整启停：一个新 worker 跑一个长实验，或改成单个 Ray 生命周期内串行多配置。
+
 `mlx worker` 没有 `status/logs` 子命令，只能用 `list/login/kill/quota` 做诊断。`mlx worker quota` 的 public resource 表里没有显示当前指定的 `cloudnative-useast1b` B200 可用量，这和 `985081` 长时间 pending 一致。
 
 当前结论：SPS 信号更适合作为训练期置信度、容量、样本选择和分布锐化信号，而不是独立 dense reward；当前 goal 下不能再靠推理时多采样选择。下一步必须提升 4 条 rollout 自身的候选质量，因为 v36 的 strict `best@4=83.00%` 仍低于 85%。

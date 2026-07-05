@@ -35,21 +35,31 @@ def main(config):
 def run_ppo(config) -> None:
     # Check if Ray is not initialized
     if not ray.is_initialized():
-        # Initialize Ray with a local cluster configuration
-        # Set environment variables in the runtime environment to control tokenizer parallelism,
-        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
-        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
-        ray.init(
-            runtime_env={
-                "env_vars": {
-                    "TOKENIZERS_PARALLELISM": "true",
-                    "NCCL_DEBUG": "WARN",
-                    "VLLM_LOGGING_LEVEL": "WARN",
-                    "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
-                }
-            },
-            num_cpus=config.ray_init.num_cpus,
-        )
+        # Initialize Ray with a local cluster configuration.
+        # Some MLX workers are sensitive to Ray runtime_env/dashboard sidecars, so keep
+        # the legacy defaults but allow experiments to run with a leaner Ray init.
+        ray_env_vars = {
+            "TOKENIZERS_PARALLELISM": "true",
+            "NCCL_DEBUG": "WARN",
+            "VLLM_LOGGING_LEVEL": "WARN",
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+        }
+        ray_init_kwargs = {"num_cpus": config.ray_init.num_cpus}
+        if OmegaConf.select(config.ray_init, "no_runtime_env", default=False):
+            for key, value in ray_env_vars.items():
+                os.environ.setdefault(key, value)
+        else:
+            ray_init_kwargs["runtime_env"] = {"env_vars": ray_env_vars}
+
+        include_dashboard = OmegaConf.select(config.ray_init, "include_dashboard", default=None)
+        if include_dashboard is not None:
+            ray_init_kwargs["include_dashboard"] = include_dashboard
+
+        node_ip_address = OmegaConf.select(config.ray_init, "node_ip_address", default=None)
+        if node_ip_address:
+            ray_init_kwargs["_node_ip_address"] = node_ip_address
+
+        ray.init(**ray_init_kwargs)
 
     try:
         # Create a remote instance of the TaskRunner class, and
