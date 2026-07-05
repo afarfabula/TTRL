@@ -6767,3 +6767,110 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - On Qwen2.5-Math-7B, the same 20-step Efficient TTRL + validation answer-cluster selection reaches `83.10%`, higher than the Qwen3-4B v33 single-run result of `79.07%`.
     - Raw `best@32=93.19%` and raw `maj@32=81.90%` show this model has much stronger candidate support under the same final sampling budget; answer-cluster selection converts part of that support into the selected `mean@4`.
     - Training still does not use Math500 ground truth; labels are only used for final validation and diagnostic metrics.
+
+- 2026-07-05 15:18 CST result 35：Qwen2.5-Math-7B strict low-budget n=4 baseline
+  - Reason:
+    - User clarified that the active goal must not count validation-time inference scaling.
+    - Prior Qwen2.5-Math v33/v34 `mean@4=83.10%/83.30%` used `val_kwargs.n=32` plus unsupervised validation answer selection/collapse; those runs remain diagnostic only.
+    - This run keeps the same v33/v14 training path but uses strict final validation with only 4 rollouts per problem and no answer selection.
+  - Runner and key config:
+    - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v35_strict_n4.sh`.
+    - Model source: `/opt/tiger/qwen2.5_math_7b`; worker-local copy: `/tmp/qwen2_5_math_7b_local_v35_strict_n4_20step`.
+    - `trainer.total_training_steps=20`, `trainer.test_freq=20`, `trainer.val_before_train=False`.
+    - Training still uses SPS internal rollouts/signals: `actor_rollout_ref.rollout.n=32`, `ttrl.n_votes_per_prompt=64`, `ttrl.n_samples_per_prompt=32`.
+    - Strict validation: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`.
+    - SPS training path: `sps_weight_floor=0.15`, `sps_clip_penalty=0.5`, `sps_weight_power=1.5`, `sps_base_logprob_source=ref`, `sps_answer_sharpen_beta=2.0`, `sps_answer_sharpen_capacity=False`, `sps_rollout_selection=first`.
+  - Worker/preflight evidence:
+    - Worker: `984279`, host `trial-301545194-trialrun-301545194-worker-0`, 8x B200.
+    - `/proc` healthy before run: `PROC_COUNT_BEFORE 122`.
+    - Driver `580.105.08`; compat preflight action `clear_compat`; `cuInit: 0`.
+    - Final validation sample count confirmed strict n=4: `len reward_extra_infos_dict['reward']: 1988 = 497 * 4`.
+    - Post-run health: `PROC_SELF_OK_AFTER`, `PROC_MEMINFO_OK_AFTER`, `PROC_COUNT_AFTER 127`; all GPUs returned to `0 MiB`.
+  - Final Math500/MATH-TTT validation:
+    - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.6896378269617707` (`68.96%`).
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8220402414486921`.
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.7137223340040241`.
+    - `val-aux/MATH-TTT/format_score/mean@4=0.9678068410462777`.
+    - `val-aux/MATH-TTT/response_clip/mean@4=0.04275653923541248`.
+  - Training/internal signal diagnostics:
+    - Final step 20: `train/pass@32=0.875`, `train/majority_ratio=0.549`, `train/ground_truth_reward=0.523` for diagnostics only.
+    - Final SPS internals: `train/sps/weighted_label_confidence=0.573`, `train/sps/answer_sharp_confidence=0.814`, `train/sps/answer_effective_K=3.159`, `train/sps/train_weight=0.468`.
+    - Late training did show distribution sharpening relative to early steps: examples include step 13 `answer_sharp_confidence=0.933`, `answer_effective_K=1.182`; step 18 `answer_sharp_confidence=0.935`, `answer_effective_K=1.211`.
+  - Timing:
+    - Final validation cost: `timing_s/testing=232.680`.
+    - Throughput including final validation over steps 11-20: `47.077s/step`, `5570.664 tokens/s`.
+    - Pure train-only steps 10-19: `23.635s/step`, `11129.620 tokens/s`.
+  - Artifacts:
+    - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v35_strict_n4.log`.
+    - Ray task snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v35_strict_n4_ray_taskrunner.log`.
+    - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v35_strict_n4_metrics.txt`.
+    - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v35_strict_n4_throughput_summary.txt`.
+    - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v35_strict_n4_proc_health.txt`.
+  - Conclusion:
+    - v35 is the new strict n=4 baseline for the active goal, but it is far below the target `mean@4 > 0.85`; goal remains incomplete.
+    - This proves the earlier Qwen2.5-Math `83.10%` was not a strict low-budget result. It came from unsupervised validation-time n=32 answer selection/collapse, not from the trained model's 4-sample distribution alone.
+    - Since `best@4=82.20%` is also below 85%, the next algorithm should improve the 4-rollout candidate quality itself. It should not add validation-time selection.
+    - Next justified change: use the already logged sharpened answer-cluster confidence as training capacity (`sps_answer_sharpen_capacity=True`). v35 shows sharpened confidence (`answer_sharp_confidence`) is materially higher than ordinary weighted confidence in late steps, but v35 did not let that sharpened signal control update capacity.
+
+- 2026-07-05 15:22 CST planned experiment 36：sharpened answer-cluster capacity under strict n=4
+  - Reason:
+    - v35 strict validation shows `best@4=82.20%`, so the 4-rollout candidate set itself is still below the 85% target.
+    - v35 late training internally showed strong sharpened answer-cluster confidence (`answer_sharp_confidence` up to `0.933-0.935`) and low sharpened effective answer count (`answer_effective_K` near `1.18-1.21`), but v35 used `sps_answer_sharpen_capacity=False`.
+    - v36 therefore uses the sharpened cluster distribution as training capacity, so updates are stronger when the sharpened answer support is concentrated and aligned with the majority pseudo label. This is a train-time distribution-sharpening change, not validation-time selection.
+  - Runner:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4.sh`.
+  - Single intended algorithm change from v35:
+    - `ttrl.sps_answer_sharpen_capacity=True`.
+  - Strict validation remains unchanged:
+    - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+    - `trainer.validation_answer_selection_enable=False`.
+  - Expected diagnostic:
+    - If the change works, train `sps/train_weight` should more closely track `sps/answer_sharp_confidence` than v35, and strict `mean@4` should move toward `best@4` without using any validation-time scaling.
+
+- 2026-07-05 16:08 CST result 36：sharpened answer-cluster capacity under strict n=4
+  - Run status:
+    - Completed successfully with exit code `0`.
+    - Final validation ran at `training/global_step=20`.
+    - This is a strict low-budget validation run, not an inference-time scaling result.
+  - Runner and key config:
+    - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4.sh`.
+    - Model source: `/opt/tiger/qwen2.5_math_7b`.
+    - Worker-local copy: `/tmp/qwen2_5_math_7b_local_v36_sharpen_capacity_strict_n4_20step`.
+    - `trainer.total_training_steps=20`, `trainer.test_freq=20`, `trainer.val_before_train=False`.
+    - Training rollouts/signals unchanged from v35: `actor_rollout_ref.rollout.n=32`, `ttrl.n_votes_per_prompt=64`, `ttrl.n_samples_per_prompt=32`.
+    - Strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`.
+    - Single algorithm change from v35: `ttrl.sps_answer_sharpen_capacity=True`.
+    - Other SPS settings: `sps_weight_floor=0.15`, `sps_clip_penalty=0.5`, `sps_weight_power=1.5`, `sps_base_logprob_source=ref`, `sps_answer_sharpen_beta=2.0`, `sps_rollout_selection=first`, logprob reuse enabled.
+  - Strict n=4 evidence:
+    - Validation sample count again matched low-budget evaluation: `1988 = 497 * 4`.
+    - No validation answer selection/collapse was enabled.
+    - Ground truth was used only for final accuracy and diagnostic metrics, not for training reward or validation selection.
+  - Final Math500/MATH-TTT validation:
+    - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7037223340040242` (`70.37%`).
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8299718309859154`.
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.7227142857142856`.
+    - `val-aux/MATH-TTT/acc/std@4=0.16551420992503618`.
+    - `val-aux/MATH-TTT/format_score/mean@4=0.9708249496981891`.
+    - `val-aux/MATH-TTT/response_clip/mean@4=0.03118712273641851`.
+  - Training/internal signal diagnostics:
+    - Final step 20: `train/pass@32=0.875`, `train/majority_ratio=0.596`, `train/ground_truth_reward=0.539` for diagnostics only.
+    - Final SPS internals: `train/sps/train_weight=0.732`, `train/sps/weighted_label_confidence=0.613`, `train/sps/answer_sharp_confidence=0.818`, `train/sps/answer_effective_K=1.855`.
+    - Late training shows sharpened capacity did affect update strength: examples include step 15 `answer_sharp_confidence=0.911`, step 17 `0.931`, step 18 `0.921`; final train weight was much closer to sharpened confidence than in v35.
+  - Timing:
+    - Final validation cost: `timing_s/testing=232.759`.
+    - Throughput including final validation over steps 11-20: `49.587s/step`, `5261.505 tokens/s`.
+    - Pure train-only steps 10-19: `26.192s/step`, `9902.211 tokens/s`.
+  - Worker health:
+    - Post-run worker proc namespace broke: `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER 0`.
+    - A later check showed `PROC_COUNT=192`, `/proc/meminfo` still bad, and `cuInit: 304`.
+    - This cannot be fixed by CUDA compat toggling; further GPU experiments should not run on this worker until the worker is restarted or replaced.
+  - Artifacts:
+    - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4.log`.
+    - Ray task snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4_ray_taskrunner.log`.
+    - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4_metrics.txt`.
+    - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4_throughput_summary.txt`.
+    - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v36_sharpen_capacity_strict_n4_proc_health.txt`.
+  - Conclusion:
+    - v36 is a real strict n=4 improvement over v35: `68.96% -> 70.37%` mean@4 and `82.20% -> 83.00%` best@4.
+    - The improvement supports using sharpened answer-cluster confidence as a train-time capacity signal, but the gap to `>85%` remains large.
+    - Since strict `best@4=83.00%` is still below target, the next algorithm must improve the four generated candidates themselves, not merely sharpen validation aggregation or select from more samples.

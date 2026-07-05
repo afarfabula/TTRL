@@ -1,0 +1,9 @@
+task_log=/tmp/r25v35n4/ray/session_latest/logs/worker-f42c902eee426bfc3b249cac19674e6691b4fe2e29042ff1108e31ab-01000000-460828.out
+steps_including_final_validation=11-20
+timing_s/step_including_final_validation=47.077
+perf/total_num_tokens_including_final_validation=262249.600
+whole_machine_tokens_per_s_including_final_validation=5570.664
+train_only_steps=10-19
+train_only_timing_s/step=23.635
+train_only_perf/total_num_tokens=263050.800
+train_only_whole_machine_tokens_per_s=11129.620
