@@ -1,0 +1,93 @@
+V33_SEED_SWEEP_START 2026-07-05 12:23:57 tag=v33_seed_sweep_10x_20260705_1230 seeds=1 2 3 4 5 6 7 8 9 10
+HOST trial-301545194-trialrun-301545194-worker-0
+dr-xr-xr-x 2930 root root 0 Jul  4 19:41 /proc
+-r--r--r--    1 root root 0 Jul  4 19:42 /proc/meminfo
+lrwxrwxrwx    1 root root 0 Jul  4 19:41 /proc/self -> 238350
+PROC_COUNT_BEFORE 104
+Filesystem                                         Size  Used Avail Use% Mounted on
+[fdbd:dccd:cde2:1002:ec80:370b:50e9:ad83]:/rootfs  125G  107G   19G  86% /
+/dev/nvme0n1p1                                     3.5T  353G  3.0T  11% /tmp
+CUDA_COMPAT_PREFLIGHT_START 2026-07-05 12:23:57
+CUDA_COMPAT_PREFLIGHT_DRIVER 580.105.08
+CUDA_COMPAT_PREFLIGHT_ACTION clear_compat
+ldconfig: File /lib/x86_64-linux-gnu/libcuda.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvoptix.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-ngx.so.1 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-ml.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libGLESv1_CM_nvidia.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libGLESv2_nvidia.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-allocator.so.1 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-pkcs11-openssl3.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libvdpau_nvidia.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-encode.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-nvvm.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-nscq.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-egl-wayland.so.1.1.18 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-pkcs11.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-egl-gbm.so.1.1.2 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libcudadebugger.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libGLESv2_nvidia.so.2 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-gpucomp.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-rtcore.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libcuda.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-fbc.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-glsi.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libEGL_nvidia.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-allocator.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-opticalflow.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-opticalflow.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-gpucomp.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvoptix.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-glcore.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-egl-gbm.so.1 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libGLX_nvidia.so.0 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-pkcs11-openssl3.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-opencl.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-egl-wayland.so.1 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvcuvid.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-opencl.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-ngx.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-eglcore.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-glvkspirv.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libcudadebugger.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-nvvm.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-encode.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-cfg.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libGLESv1_CM_nvidia.so.1 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libEGL_nvidia.so.0 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-nscq.so.580.126.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libGLX_nvidia.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libvdpau_nvidia.so.1 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-fbc.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-tls.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-cfg.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvidia-ml.so.570.133.20 is empty, not checked.
+ldconfig: File /lib/x86_64-linux-gnu/libnvcuvid.so.580.126.20 is empty, not checked.
+	libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
+cuInit: 0
+CUDA_COMPAT_PREFLIGHT_DONE 2026-07-05 12:24:03
+GPU 0: NVIDIA B200 (UUID: GPU-85c72874-975a-3986-0950-cae26d5e1aa4)
+GPU 1: NVIDIA B200 (UUID: GPU-2ddf45ca-45ed-a900-2604-13e24e1b16e1)
+GPU 2: NVIDIA B200 (UUID: GPU-4c05fc0c-de0d-cb3e-da3c-fd04e3c82cfa)
+GPU 3: NVIDIA B200 (UUID: GPU-f12939cb-15f4-50f7-81b5-f9f9cbd52623)
+GPU 4: NVIDIA B200 (UUID: GPU-627edc84-e894-6201-a97f-7f3c10a6e42e)
+GPU 5: NVIDIA B200 (UUID: GPU-eabe49c2-869b-d655-2559-24dd57cb29c9)
+GPU 6: NVIDIA B200 (UUID: GPU-30f2b85e-42e7-de57-2730-a525eb8dfca1)
+GPU 7: NVIDIA B200 (UUID: GPU-a48712f4-46fb-c0c1-2ef8-276665b121c0)
+0, NVIDIA B200, 0 MiB, 0 %
+1, NVIDIA B200, 0 MiB, 0 %
+2, NVIDIA B200, 0 MiB, 0 %
+3, NVIDIA B200, 0 MiB, 0 %
+4, NVIDIA B200, 0 MiB, 0 %
+5, NVIDIA B200, 0 MiB, 0 %
+6, NVIDIA B200, 0 MiB, 0 %
+7, NVIDIA B200, 0 MiB, 0 %
+MODEL_LOCAL_COPY_REUSE 2026-07-05 12:24:03 dst=/tmp/qwen3_4b_local_v33_seed_sweep
+Filesystem                                         Size  Used Avail Use% Mounted on
+[fdbd:dccd:cde2:1002:ec80:370b:50e9:ad83]:/rootfs  125G  107G   19G  86% /
+/dev/nvme0n1p1                                     3.5T  353G  3.0T  11% /tmp
+V33_SEED_START seed=1 2026-07-05 12:24:03
+V33_SEED_DONE seed=1 status=0 2026-07-05 12:55:39
+V33_SEED_START seed=2 2026-07-05 12:55:39

@@ -1,0 +1,2 @@
+seed,status,mean4,best4,maj4,raw_mean32,raw_best32,raw_maj32,task_log,log,metrics,proc_health
+1,0,0.801,0.801,0.801,0.615,0.792,0.618,/tmp/r3s1/ray/session_latest/logs/worker-aeee2fe8edb2f0960a3593011212d3f2342269f6ba412378ecd3c6d9-01000000-271099.out,/opt/tiger/TTRL/verl/v33_seed_sweep_10x_20260705_1230/sps_efficient_ttrl_qwen3_4b_20step_v33_seed1.log,/opt/tiger/TTRL/verl/v33_seed_sweep_10x_20260705_1230/sps_efficient_ttrl_qwen3_4b_20step_v33_seed1_metrics.txt,/opt/tiger/TTRL/verl/v33_seed_sweep_10x_20260705_1230/sps_efficient_ttrl_qwen3_4b_20step_v33_seed1_proc_health.txt

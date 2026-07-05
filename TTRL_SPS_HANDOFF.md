@@ -6686,3 +6686,84 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
   - Completion audit:
     - Requirement: 20 training steps, smallest available Qwen3 model, Math500/MATH-TTT `mean@4 >= 75%`, unsupervised internal-signal feedback/selection, documented artifacts.
     - Status: satisfied by v33.
+
+- 2026-07-05 13:04 CST partial robustness sweep：Qwen3-4B v33 seed sweep paused
+  - User requested 10 different seeds for v33. A serial sweep runner was prepared:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen3_4b_20step_v33_seed_sweep.sh`
+  - Initial attempt failed before training for seeds 1-4 because `RAY_TMPDIR` was too long and Ray hit the AF_UNIX socket limit:
+    - `validate_socket_filename failed: AF_UNIX path length cannot exceed 107 bytes`.
+    - Script was fixed to use short per-seed Ray dirs such as `/tmp/r3s1`.
+  - Valid restarted sweep directory:
+    - `/opt/tiger/TTRL/verl/v33_seed_sweep_10x_20260705_1230/`
+  - Valid completed seed before user redirected to Qwen2.5-Math:
+    - Seed 1 completed with status `0`.
+    - `val-core/MATH-TTT/acc/mean@4=0.8008048289738431`.
+    - `val-raw/MATH-TTT/acc/mean@32=0.6145623742454729`.
+    - `val-raw/MATH-TTT/acc/best@32/mean=0.7924607645875251`.
+    - `val-raw/MATH-TTT/acc/maj@32/mean=0.61843661971831`.
+  - The sweep was intentionally stopped during seed 2 after the user corrected the target model to Qwen2.5-Math-7B.
+  - Stop health:
+    - GPU memory returned to `0 MiB`, utilization `0%` on all 8 B200s.
+    - `/proc/self` and `/proc/meminfo` were healthy.
+    - No training/Ray processes remained after stopping.
+
+- 2026-07-05 13:32 CST final result 34：Qwen2.5-Math-7B Efficient TTRL 20-step + validation answer selection
+  - Reason:
+    - User redirected from the Qwen3 seed sweep to test the same v33-style 20-step algorithm on the local Qwen2.5-Math model.
+    - Local weights used: `/opt/tiger/qwen2.5_math_7b`.
+    - HDFS copy exists but was not used as the source for this run.
+  - Run status:
+    - Completed successfully with exit code `0`.
+    - Final validation ran at `training/global_step=20`.
+    - Worker post-run health: `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_AFTER 109`.
+    - GPUs returned to `0 MiB`, `0%` utilization after exit.
+  - Runner and key config:
+    - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v33.sh`.
+    - Model source: `/opt/tiger/qwen2.5_math_7b`.
+    - Worker-local copy: `/tmp/qwen2_5_math_7b_local_v33_efficient_ttrl_20step`.
+    - `trainer.total_training_steps=20`.
+    - `trainer.test_freq=20`.
+    - `trainer.val_before_train=False`.
+    - `actor_rollout_ref.rollout.val_kwargs.n=32`.
+    - `trainer.validation_answer_selection_enable=True`.
+    - `trainer.validation_answer_selection_repeats=4`.
+    - Same v33/v14 training path: `sps_weight_floor=0.15`, `sps_clip_penalty=0.5`, `sps_weight_power=1.5`, `sps_base_logprob_source=ref`, `sps_answer_sharpen_beta=2.0`, `sps_rollout_selection=first`, logprob reuse enabled.
+  - Final Math500/MATH-TTT validation:
+    - Main selected metric: `val-core/MATH-TTT/acc/mean@4=0.8309859154929577` (`83.10%`).
+    - Collapsed selected metrics also report:
+      - `val-core/MATH-TTT/acc/best@4/mean=0.8309859154929577`.
+      - `val-core/MATH-TTT/acc/maj@4/mean=0.8309859154929577`.
+    - Raw uncollapsed validation metrics:
+      - `val-raw/MATH-TTT/acc/mean@32=0.7057344064386318`.
+      - `val-raw/MATH-TTT/acc/best@4/mean=0.8622655935613682`.
+      - `val-raw/MATH-TTT/acc/best@8/mean=0.8969255533199195`.
+      - `val-raw/MATH-TTT/acc/best@16/mean=0.9182555331991953`.
+      - `val-raw/MATH-TTT/acc/best@32/mean=0.9318853118712274`.
+      - `val-raw/MATH-TTT/acc/maj@32/mean=0.8190382293762576`.
+  - Final train-step diagnostics:
+    - `train/label_accuracy=0.750`.
+    - `train/reward_accuracy=0.398`.
+    - `train/majority_voting_reward=0.337`.
+    - `train/ground_truth_reward=0.535` for diagnostics only.
+    - `train/pass@32=0.875`.
+    - `train/majority_ratio=0.570`.
+    - `response_length/clip_ratio=0.078`.
+  - Timing:
+    - Final validation cost: `timing_s/testing=595.307`.
+    - The throughput summary covers steps 11-20 and includes final validation overhead:
+      - `timing_s/step=83.597`.
+      - `perf/total_num_tokens=256685.300`.
+      - `whole_machine_tokens_per_s=3070.527`.
+    - Pure training steps were much faster than Qwen3-4B because Qwen2.5-Math generated shorter responses; example late steps:
+      - Step 17: `timing_s/step=23.550`, `train/pass@32=1.000`, `train/ground_truth_reward=0.496`.
+      - Step 19: `timing_s/step=22.851`, `train/pass@32=0.875`, `train/ground_truth_reward=0.574`.
+  - Artifacts:
+    - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v33.log`.
+    - Ray task snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v33_ray_taskrunner.log`.
+    - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v33_metrics.txt`.
+    - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v33_throughput_summary.txt`.
+    - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v33_proc_health.txt`.
+  - Conclusion:
+    - On Qwen2.5-Math-7B, the same 20-step Efficient TTRL + validation answer-cluster selection reaches `83.10%`, higher than the Qwen3-4B v33 single-run result of `79.07%`.
+    - Raw `best@32=93.19%` and raw `maj@32=81.90%` show this model has much stronger candidate support under the same final sampling budget; answer-cluster selection converts part of that support into the selected `mean@4`.
+    - Training still does not use Math500 ground truth; labels are only used for final validation and diagnostic metrics.
