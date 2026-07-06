@@ -132,3 +132,65 @@ v44 已完成 50 step strict n=4，结果为 `mean@4=73.84%`、`best@4=84.26%`�
 v44 的 step 50 内部指标显示容量信号确实很强：`cross_view_capacity=0.844`、`base_support_capacity=0.791`、`base_support_agreement=1.000`、`low_budget_majority_mass=0.906`、`low_budget_agreement=1.000`、`answer_sharp_confidence=0.979`、`weighted_label_confidence=0.793`、`pass@32=1.000`。问题是这些内部一致性仍没有足够转化成 4 条低预算样本的正确率，说明 base/ref 和 first4 多数时候只是确认同一个 majority 簇，独立纠错能力不够。
 
 v44 infra 正常：退出状态 0，最终 `/proc/self` 和 `/proc/meminfo` 正常，`PROC_COUNT_FINAL=104`，8 张 B200 显存均释放到 `0 MiB`。非 validation steps 2-49 平均约 `24.77s/step`、整机约 `10.23k tokens/s`；包含最终 validation 的 steps 41-50 汇总为 `47.596s/step`、`4923.941 tokens/s`。下一步不要再单纯提高锐化或容量，而应加入更能区分正确性的内部信号，例如 answer-cluster margin / ambiguity control：只有当 majority 答案在 sharpened distribution、first4、base/ref 三个视角里都相对第二簇有明确 margin 时才强更新，对高置信但低 margin 的题降权。
+
+## v45 计划：answer-cluster margin capacity
+
+v45 继续保持 strict validation：`n=4`，禁用 validation answer selection，不使用 best-of、major vote 或 n=32 选择。算法动机来自 v44：即使 `low_budget_agreement=1.000`、`base_support_agreement=1.000`、`answer_sharp_confidence=0.979`，`mean@4` 仍只有 `73.84%`，说明“高一致性”还不足以判断正确，可能只是把错误簇锐化。
+
+v45 新增默认关闭的 `sps_margin_capacity`。它计算 raw majority 答案相对第二答案簇的三个 margin：sharpened answer 分布 margin、base/ref support margin、first4 low-budget margin。三个 margin 截断到非负后取几何平均，再用 `floor=0.35` 转成训练容量，并乘 first4 可解析和非截断率。开启后这个容量继续作为 prompt train weight 的上限。这样做的目的不是调参碰运气，而是用“多数簇是否和第二簇拉开距离”来识别高置信但仍歧义的题。
+
+runner 是 `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v45_margin_capacity_strict_n4.sh`，沿用 v44 的 infra recipe 和所有 strict validation 约束。新增日志指标包括 `margin_capacity`、`sharp_majority_margin`、`base_support_majority_margin`、`low_budget_majority_margin`。
+
+v45 已完成 50 step strict n=4，结果退步：`mean@4=73.09%`、`best@4=83.13%`、`maj@4=74.61%`，低于 v44 的 `mean@4=73.84%`、`best@4=84.26%`、`maj@4=75.27%`。因此 v45 不是提升方案，不做 improvement commit。
+
+内部指标显示 margin gate 确实生效，但它只是更保守地控制容量，没有提高低预算候选正确率。step 50：`train_weight=0.648`、`margin_capacity=0.822`、`sharp_majority_margin=0.965`、`base_support_majority_margin=0.760`、`low_budget_majority_margin=0.750`、`cross_view_capacity=0.768`、`low_budget_majority_mass=0.844`、`answer_sharp_confidence=0.973`、`ground_truth_reward=0.793`。结论是：继续加纯 capacity cap 不够，下一版需要能改变候选质量的 train-time correctness signal，例如低成本 self-check / rephrase consistency / process consistency，而不是再只给同一个 pseudo-label 簇调权重。
+
+v45 性能：非 validation steps 2-49 平均 `24.494s/step`、整机 `10213 tokens/s`；steps 41-49 平均 `23.759s/step`、整机 `9993 tokens/s`；最终 validation step `testing=233.424s`、整步 `254.095s`。infra 方面，preflight 健康且训练 status 为 0，GPU 释放到 `0 MiB`，但退出后 `/proc` 再次损坏：`PROC_SELF_BAD_FINAL`、`PROC_MEMINFO_BAD_FINAL`、`PROC_COUNT_FINAL=0`。当前 worker `986493` 不能继续用于 Ray/CUDA 训练，必须换 worker 或重启后再做下一轮。
+
+## v46 计划：low-budget train rollout repair
+
+v46 不再继续加纯 capacity cap。它回到当前最好 v44 的配置，只把训练阶段的 downsampling 改成局部修复：先保留原来的 first 32 条训练 rollout，只检查前 4 条低预算位置。如果前 4 条里有不可解析、截断、或者不等于 raw majority pseudo label 的样本，就从同一题后面的 64 条训练 rollout 里找“可解析、非截断、等于 raw majority”的样本替换。最多替换 4 条，后面 28 条保持原始顺序。
+
+这个设计针对 v44/v45 的现象：strict `best@4` 仍不到 85%，说明前 4 条候选质量不够；v45 说明只降低 prompt weight 不够；v38/v39 又说明全局投影到 majority cluster 会放大错误簇。所以 v46 只修前 4 个训练位置，尽量让训练更关注低预算候选质量，同时避免把 32 条训练样本全部改成 majority cluster。
+
+v46 仍然不用 Math500 标注，不改 validation，不使用 best-of、major vote 或 n=32 选择。runner 是 `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4.sh`，开启 `ttrl.sps_rollout_selection=low_budget_repair` 和 `ttrl.sps_low_budget_repair_max_replacements=4`。新增日志指标包括 `low_budget_repair_rate`、`selected_low_budget_parseable_rate`、`selected_low_budget_clip_rate`、`selected_low_budget_cluster_rate`、`available_low_budget_repair_rate`。
+
+注意：v45 后 worker `986493` 的 `/proc` 已坏，不能继续跑 Ray/CUDA。v46 只能在新的或重启后的健康 worker 上跑。
+
+v46 已在健康 B200 worker `986717` 上完成 50 step strict n=4，结果退步：`mean@4=72.33%`、`best@4=83.28%`、`maj@4=73.61%`，低于当前最好 v44 的 `mean@4=73.84%`、`best@4=84.26%`。因此 v46 不是提升方案，不做 improvement commit。
+
+v46 的机制在内部指标上确实生效：step 50 `low_budget_repair_rate=0.250`、`available_low_budget_repair_rate=0.828`、`selected_low_budget_parseable_rate=1.000`、`selected_low_budget_clip_rate=0.000`、`selected_low_budget_cluster_rate=1.000`、`answer_sharp_confidence=0.983`、`answer_effective_K=1.036`、`ground_truth_reward=0.805`。但 validation 下降说明局部修复只是把前 4 个训练位置推向 raw majority 答案簇，并没有增加独立正确性证据，反而会强化自洽但错误的 majority cluster。
+
+v46 infra 正常：训练退出状态 0，preflight 健康，driver `580.105.08` 下清空 compat，`cuInit=0`，cuBLAS/cuDNN/NCCL/nvJitLink 来自 venv cu12.9；训练结束后 `/proc/self` 和 `/proc/meminfo` 仍正常，`PROC_COUNT_FINAL=76`，8 张 B200 GPU 释放到 `0 MiB`。包含 final validation 的 steps 41-50 汇总为 `47.759s/step`、`4687 tokens/s`，最终 validation step `testing=232.951s`、整步 `254.550s`。
+
+结论：当前最好 strict 50-step 仍是 v44 `mean@4=73.84%`。下一版不能再做单纯 majority/capacity-only 变体，应加入更独立的训练期正确性信号，例如 base/ref-supported rollout selection、self-check/rephrase/process consistency，或者能拒绝高置信错误簇的冲突惩罚，同时 validation 继续保持 `n=4` 且禁用 answer selection。
+
+## v47 计划：base-supported low-budget repair
+
+v47 保留 v46 “只修前 4 个低预算训练位置”的目标，但不再只看 raw majority。新的选择模式是 `sps_rollout_selection=base_supported_repair`：如果前 4 个训练 slot 里有不可解析、截断、或不等于 raw majority 的样本，才考虑从同题后续 rollout 里找可解析、非截断、等于 raw majority 的候选替换；候选按长度归一化 base/ref logprob 排序，并且只有当候选的 base/ref support 不低于被替换 slot 时才接受。v47 先用 `sps_base_supported_repair_min_gain=0.0`，理由是“不能降低 base/ref 支持”，不是后验调阈值。
+
+这个设计来自 v46 的失败：v46 把 first4 训练槽位干净地修到了 majority cluster，但 validation 降低，说明 raw majority 会强化自洽错误簇。v43/v44 说明 base/ref support 有一定独立信息，所以 v47 把它从 prompt-level capacity 移到 rollout-level repair guard。它仍然不用 Math500 标注，不改变 strict validation，不使用 best-of、major vote、n=32 selection 或 validation answer selection。runner 是 `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4.sh`。
+
+v47 已在 B200 worker `986717` 上完成 50 step strict n=4，结果为 `mean@4=73.29%`、`best@4=84.42%`、`maj@4=74.74%`。它比 v46 的 `mean@4=72.33%` 有恢复，但低于当前最好 v44 的 `mean@4=73.84%`，所以不是提升方案，不做 improvement commit。
+
+内部指标说明 base-supported guard 生效：step 50 `base_supported_repair_rate=0.250`、`base_supported_available_repair_rate=0.777`、`base_supported_low_budget_parseable_rate=1.000`、`base_supported_low_budget_clip_rate=0.000`、`base_supported_low_budget_cluster_rate=0.969`、`base_supported_replacement_base_gain=0.053`、`base_supported_skipped_base_guard_rate=0.031`。同时 `answer_sharp_confidence=0.966`、`base_support_capacity=0.772`、`cross_view_capacity=0.727`、`ground_truth_reward=0.777`。这说明 v47 确实比 v46 更保守，避免了完全无约束地修向 majority，但仍没有提供足够独立的正确性证据来提高 strict mean@4。
+
+v47 infra 正常：训练退出状态 0，preflight 中 `/proc` 正常、driver `580.105.08`、compat action `clear_compat`、`cuInit=0`、GEMM smoke 通过，cuBLAS/cuDNN/NCCL/nvJitLink 来自 venv cu12.9。runner 结束时 `/proc` 仍健康；结束瞬间 GPU2 有短暂 32GB 残留，但 `2026-07-07 03:16:25` 复查显示 8 张 B200 全部 `0 MiB`，无 Ray/vLLM/main_ppo/TaskRunner 残留。训练后段非 validation steps 40-49 约 `24.71s/step`、整机约 `9332 tokens/s`；包含 final validation 的 steps 41-50 汇总为 `47.357s/step`、`4857 tokens/s`。
+
+结论：当前最好 strict 50-step 仍是 v44 `mean@4=73.84%`。v47 的经验是 base/ref support 能缓解 v46 的 majority repair 伤害，但 answer-cluster repair 这一类方法已经接近上限。下一步应转向更独立的训练期信号，比如 self-check、rephrase consistency 或 process consistency，用作 correctness filter 或 contrastive penalty；validation 继续保持 `n=4` 且禁用 answer selection。
+
+## v48 计划：rollout 过程一致性容量
+
+v48 不再修复或重排 first4 到 majority 簇，而是在 v44 的 cross-view capacity 上新增一个默认关闭的 `sps_process_consistency_capacity`。它只看训练 rollout 自身文本，不额外生成、不调用外部 verifier：最终答案必须可解析、不能截断；同一条解里出现的多个 `\boxed{}` 答案必须一致；最后一个 boxed answer 应该在回答尾部，避免“先给答案后继续修改”；如果 final answer 后还有明显纠错/不确定表达则降权。
+
+这个信号的动机来自 v46/v47：把训练样本推向 majority cluster 会让内部一致性更干净，但 strict validation 反而下降，说明 majority/base/ref 多数时候只是在确认同一个可能错误的答案簇。v48 改为问“这个答案簇里的解题过程自己是否支持最终答案”，把 majority-cluster process support 聚合成 prompt-level 容量上限。它仍然不用 Math500 标注、不改变 validation、不使用 best-of/major vote/n=32/answer selection；成功仍只看 50 step strict `mean@4 >= 85%`。
+
+v48 已在 B200 worker `986717` 上完成 50 step strict n=4，训练退出状态 0。最终 strict `val-core/MATH-TTT/acc/mean@4=74.55%`，诊断项 `best@4=86.02%`、`maj@4=76.25%`。这里仍然只认 `mean@4`，`best@4` 不能作为达标指标；目标还没有完成。
+
+v48 是目前 50 step strict 最好结果：相比 v44 的 `mean@4=73.84%` 提升约 `+0.70pp`，`best@4` 从 `84.26%` 提升到 `86.02%`。说明过程一致性信号确实带来候选存在性的提升，但还没有把概率质量稳定压到前 4 条平均样本上。
+
+step 50 内部指标：`train_weight=0.684`、`answer_sharp_confidence=0.975`、`answer_effective_K=1.058`、`low_budget_capacity=0.750`、`low_budget_majority_mass=0.750`、`base_support_capacity=0.799`、`cross_view_capacity=0.752`、`process_consistency_capacity=0.988`、`process_majority_support=0.988`、`process_consistent_rate=0.953`、`process_majority_consistent_rate=0.777`、`process_box_conflict_rate=0.031`、`ground_truth_reward=0.797`。关键现象是 process capacity 到后期几乎饱和，所以它更像早期过滤器，不足以作为后期强 verifier。
+
+infra 正常：preflight 健康，driver `580.105.08` 下清空 compat，`cuInit=0`，cuBLAS/cuDNN/NCCL/nvJitLink 来自 venv cu12.9；runner final `/proc/self`、`/proc/meminfo` 正常，`PROC_COUNT_FINAL=84`。最终 GPU 快照有 teardown 窗口残留显存，后续 live check 显示 `/proc` 仍健康；下一轮实验启动前仍需重新检查 GPU 占用。
+
+结论：当前最好 strict 50-step 是 v48 `mean@4=74.55%`，但距离 85% 仍有明显差距。下一步重点不是继续验证“有没有正确候选”，因为 `best@4` 已超过 85%；而是训练期把候选存在性转成低预算平均正确率，避免 validation-time selection，同时避免 v46/v47 那种盲目修向 majority cluster 的错误簇放大。

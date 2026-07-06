@@ -1,0 +1,5 @@
+task_log=/tmp/r45margin/ray/session_latest/logs/worker-afa1447e7cb0079ad4b9192f075ef07c60e7bbb8a18c1c1f8eacfccb-ffffffff-259905.out
+steps=41-50
+timing_s/step=46.793
+perf/total_num_tokens=230429.700
+whole_machine_tokens_per_s=4924.480

@@ -7952,3 +7952,278 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
   - Base/ref support and first4 support are useful conservative capacity signals, but by late training they mostly agree with majority and are not an independent enough correctness verifier.
   - Next algorithm should target candidate correctness more directly while staying unsupervised. A promising direction is answer-cluster margin / ambiguity control: allow strong updates only when the supported majority answer has a clear margin over the second answer cluster across the sharpened distribution, first4 view, and base/ref support; penalize high-confidence but low-margin prompts because those are likely self-consistent wrong clusters.
   - Goal is not complete: strict `mean@4=0.7384 < 0.85`.
+
+### 2026-07-07 v45 plan: answer-cluster margin capacity
+
+- Motivation from v44:
+  - v44 improved only slightly even though step-50 `low_budget_majority_mass=0.906`, `low_budget_agreement=1.000`, `base_support_agreement=1.000`, and `answer_sharp_confidence=0.979`.
+  - This means agreement and sharpness are not enough: the model can become highly self-consistent around an answer cluster while the strict first four samples still do not contain enough correct candidates.
+  - The next internal signal should distinguish confident-but-ambiguous prompts from confident-and-separated prompts. This follows the literature theme from self-training and verifier-free RL: confidence is useful only when calibrated by uncertainty/capacity control.
+- Algorithm change:
+  - Add default-off `sps_margin_capacity` in `apply_sps_weighted_ttrl_gt()`.
+  - For each prompt, compute three majority-vs-runner-up margins:
+    - `sharp_majority_margin`: sharpened answer-cluster probability of raw majority minus the strongest non-majority answer cluster.
+    - `base_support_majority_margin`: base/ref support probability of raw majority minus the strongest non-majority answer cluster.
+    - `low_budget_majority_margin`: first4 majority mass on raw majority minus the strongest first4 non-majority answer mass.
+  - Convert the clipped margins to a conservative capacity:
+    - `margin_signal = geometric_mean(max(margin, 0) for the three views)`;
+    - `margin_capacity = floor + (1 - floor) * margin_signal`, with `floor=0.35`;
+    - multiply by first4 parseable and non-clipped rates.
+  - When enabled, cap prompt train weight by `margin_capacity` on top of v44's consistency, low-budget, base-support, and cross-view capacities.
+  - Log `train/sps/margin_capacity`, `train/sps/sharp_majority_margin`, `train/sps/base_support_majority_margin`, and `train/sps/low_budget_majority_margin`.
+- Why this is justified:
+  - It remains fully unsupervised and uses no Math500 labels.
+  - It does not add validation-time selection or inference-time scaling.
+  - It directly targets v44's observed failure: high confidence/agreement without enough separation from plausible alternative answer clusters.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v45_margin_capacity_strict_n4.sh`.
+  - Same CUDA/cuBLAS infra recipe and same strict validation as v44.
+  - Enabled configs: `ttrl.sps_margin_capacity=True`, `ttrl.sps_margin_capacity_floor=0.35`.
+
+### 2026-07-07 v45 result: margin capacity over-regularizes and is not an improvement
+
+- Run:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v45_margin_capacity_strict_n4.sh`.
+  - Strict validation stayed unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time best-of, majority vote, `n=32` selection, answer selection, or ground-truth selection was used as the success metric.
+- Final strict validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.7308853118712274`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8313299798792756`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7461006036217304`.
+  - Auxiliary: `response_clip/mean@4=0.015593561368209255`, `format_score/mean@4=0.966297786720322`, `response_avg_logprob/mean@4=-0.08391641441712032`.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.648`.
+  - `train/sps/margin_capacity=0.822`.
+  - `train/sps/sharp_majority_margin=0.965`.
+  - `train/sps/base_support_majority_margin=0.760`.
+  - `train/sps/low_budget_majority_margin=0.750`.
+  - `train/sps/cross_view_capacity=0.768`.
+  - `train/sps/base_support_capacity=0.800`, `train/sps/base_support_agreement=1.000`.
+  - `train/sps/low_budget_capacity=0.800`, `train/sps/low_budget_majority_mass=0.844`, `train/sps/low_budget_agreement=0.875`.
+  - `train/sps/answer_sharp_confidence=0.973`, `train/sps/weighted_label_confidence=0.801`.
+  - `train/pass@32=1.000`, `train/majority_ratio=0.781`, `train/ground_truth_reward=0.793`.
+- Timing:
+  - Non-validation steps 2-49 averaged `24.494s/step`, whole-machine throughput `10213.159 tokens/s`.
+  - Steps 11-49 averaged `23.901s/step`, whole-machine throughput `9988.704 tokens/s`.
+  - Steps 41-49 averaged `23.759s/step`, whole-machine throughput `9993.392 tokens/s`.
+  - Runner-generated steps 41-50 summary includes final validation: `46.793s/step`, `4924.480 tokens/s`.
+  - Final validation step included `timing_s/testing=233.424`, `timing_s/step=254.095`.
+- Infra health:
+  - Training command exit status `0`; GPUs released to `0 MiB`.
+  - Preflight was healthy: `/proc/self` and `/proc/meminfo` existed, `cuInit=0`, GEMM smoke passed, and loaded cuBLAS/cuDNN/NCCL/nvJitLink came from the venv cu12.9 stack.
+  - After training teardown, the worker's `/proc` became broken: `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`.
+  - Worker `986493` must not be used for further Ray/CUDA training without replacement or restart.
+- Interpretation:
+  - v45 is not an improvement: strict `mean@4` regressed from v44 `0.738430583501006` to `0.7308853118712274`, and strict `best@4` regressed from `0.8425714285714286` to `0.8313299798792756`.
+  - The margin signal behaved as designed internally: early low first4 margins reduced capacity, and late step-50 margins were high (`0.965/0.760/0.750`). However, this did not improve low-budget candidate correctness.
+  - The likely issue is that margin capacity is another conservative gate. It can delay or reduce updates, but it still only reweights the same pseudo-label clusters; it does not introduce new evidence that separates correct from self-consistent wrong answers.
+  - Do not commit v45 as an improvement. Keep it documented as a failed algorithm trial and an infra warning that procfs can still break after an otherwise successful run.
+  - Next algorithm should not add another pure capacity cap. It should add a train-time correctness-improving signal that changes candidate quality, for example a cheap self-check/rephrase view or process-consistency signal used only for training rewards/weights, while preserving strict `n=4` validation.
+  - Goal is not complete: strict `mean@4=0.7309 < 0.85`; current best remains v44 `mean@4=0.7384`.
+
+### 2026-07-07 v46 plan: low-budget train rollout repair
+
+- Motivation from v44/v45:
+  - v44 is the current best, but it only improves strict `mean@4` to `0.7384`; even `best@4=0.8426` is still below the 0.85 target, so the first four low-budget candidates still lack enough correct samples.
+  - v45 showed that adding another conservative capacity cap can change internal training weights but does not improve strict candidate correctness.
+  - v38/v39 showed that aggressive rollout-level projection onto a sharpened/majority cluster can amplify wrong clusters. Therefore v46 should not globally replace all train samples with majority-cluster samples.
+- Algorithm change:
+  - Add default-off train-only selection mode `sps_rollout_selection=low_budget_repair`.
+  - Start from the historical `first` downsampling: keep the first `n_samples_per_prompt=32` rollouts for PPO training.
+  - Only inspect the first `sps_low_budget_k=4` selected train slots, which mirror the strict validation budget.
+  - If one of those first four slots is unparseable, clipped, or does not match the raw majority pseudo label, replace it with a later rollout from the same 64-sample train pool only when that later rollout is parseable, non-clipped, and matches the raw majority pseudo label.
+  - Cap repairs with `sps_low_budget_repair_max_replacements=4`; the remaining 28 selected train samples keep their original order.
+  - Log `train/sps/low_budget_repair_rate`, `train/sps/selected_low_budget_parseable_rate`, `train/sps/selected_low_budget_clip_rate`, `train/sps/selected_low_budget_cluster_rate`, and `train/sps/available_low_budget_repair_rate`.
+- Why this is justified:
+  - It targets the active bottleneck directly: improving the training distribution seen by the first four low-budget candidates, rather than relying on validation-time scaling.
+  - It remains fully unsupervised: replacements use only parser/clip status and the train-time raw majority pseudo label, not Math500 labels.
+  - It is intentionally less aggressive than v38/v39 because only the first four selected training slots are repaired. This should reduce the risk of globally amplifying a wrong answer cluster.
+  - It is different from v45 because it changes which train trajectories receive PPO updates in the low-budget positions, instead of only reducing prompt-level capacity.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4.sh`.
+  - Based on v44, with `ttrl.sps_rollout_selection=low_budget_repair` and `ttrl.sps_low_budget_repair_max_replacements=4`.
+  - Keeps strict validation unchanged: `val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, no best-of/major vote/n=32 selection as success metric.
+- Execution note:
+  - Do not run on worker `986493`: v45 teardown left `/proc` broken (`PROC_COUNT_FINAL=0`).
+  - Need a fresh or restarted healthy worker before running this 50-step experiment.
+
+### 2026-07-07 v46 result: low-budget repair reinforces majority clusters and regresses
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4_proc_health.txt`.
+  - Ray TaskRunner log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v46_low_budget_repair_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling was used as the success metric.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7233400402414487`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.832784708249497`, `val-core/MATH-TTT/acc/maj@4/mean=0.7360643863179074`.
+  - Aux metrics: `format_score/mean@4=0.966297786720322`, `response_clip/mean@4=0.015090543259557344`, `response_avg_logprob/mean@4=-0.08256831133393365`.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.631`.
+  - `train/sps/low_budget_repair_rate=0.250`, `train/sps/available_low_budget_repair_rate=0.828`.
+  - `train/sps/selected_low_budget_parseable_rate=1.000`, `train/sps/selected_low_budget_clip_rate=0.000`, `train/sps/selected_low_budget_cluster_rate=1.000`.
+  - `train/sps/low_budget_capacity=0.730`, `train/sps/low_budget_majority_ratio=0.750`, `train/sps/low_budget_majority_mass=0.750`, `train/sps/low_budget_agreement=0.875`.
+  - `train/sps/base_support_capacity=0.813`, `train/sps/base_support_agreement=1.000`.
+  - `train/sps/cross_view_capacity=0.747`, `train/sps/margin_capacity=0.810`.
+  - `train/sps/answer_sharp_confidence=0.983`, `train/sps/answer_effective_K=1.036`, `train/sps/weighted_label_confidence=0.816`.
+  - `train/pass@32=1.000`, `train/majority_ratio=0.801`, `train/ground_truth_reward=0.805`.
+- Timing and throughput:
+  - Non-validation late steps were mostly around `22-29s/step`.
+  - Runner-generated steps 41-50 summary includes final validation: `timing_s/step=47.759`, `perf/total_num_tokens=223852.800`, `whole_machine_tokens_per_s=4687.182`.
+  - Final validation step included `timing_s/testing=232.951`, `timing_s/step=254.550`.
+- Infra health:
+  - Training command exit status `0`.
+  - Preflight on `986717` was healthy: `/proc/self` and `/proc/meminfo` OK, 8 B200 visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, and loaded cuBLAS/cuDNN/NCCL/nvJitLink came from the venv cu12.9 stack.
+  - Final health stayed OK after teardown: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=76`.
+  - All 8 B200 GPUs were released to `0 MiB`.
+- Interpretation:
+  - v46 is not an improvement: strict `mean@4` regressed from v44 `0.738430583501006` to `0.7233400402414487`; strict `best@4` also regressed from `0.8425714285714286` to `0.832784708249497`.
+  - The local repair mechanism worked internally: by step 50 the first four selected train slots were parseable, non-clipped, and fully in the raw majority cluster. However, strict validation got worse, so the mechanism mainly reinforced self-consistent majority clusters without adding independent correctness evidence.
+  - This is the same broader failure mode as v38/v39, but in a narrower form: pushing train samples toward majority support can make internal support cleaner while reducing real low-budget correctness.
+  - Do not commit v46 as an algorithm improvement. Keep it as a documented failed trial only.
+  - Next algorithm should avoid another majority/capacity-only variant. It should prefer train-time rollout evidence that is more independent than raw majority, for example base/ref-supported rollout selection, self-check/rephrase/process consistency, or a conflict penalty that can reject high-confidence wrong clusters while preserving strict `n=4` validation.
+  - Goal is not complete: strict `mean@4=0.7233 < 0.85`; current best remains v44 `mean@4=0.7384`.
+
+### 2026-07-07 v47 plan: base-supported low-budget repair
+
+- Motivation from v46:
+  - v46 successfully repaired first-four train slots toward parseable, non-clipped raw-majority samples, but strict validation regressed to `mean@4=0.7233`.
+  - The failure means raw majority is not independent enough as a correctness signal. Making the low-budget train slots cleaner in the majority cluster can still reinforce wrong self-consistent answers.
+  - v43/v44 showed that base/ref support is a useful conservative internal signal, though prompt-level capacity alone was not enough. v47 moves that signal to rollout selection: a first-four repair is only allowed when the replacement is not only parseable, non-clipped, and in the raw-majority answer cluster, but also has higher length-normalized base/ref logprob support than the slot being replaced.
+- Algorithm change:
+  - Add default-off train-only selection mode `sps_rollout_selection=base_supported_repair`.
+  - Start from the historical `first` downsampling and only inspect the first `sps_low_budget_k=4` selected train slots.
+  - A bad low-budget slot is still defined as unparseable, clipped, or outside the raw-majority answer cluster.
+  - Candidate replacements are later train rollouts from the same prompt that are parseable, non-clipped, and match raw majority, ranked by length-normalized base/ref logprob.
+  - A replacement is accepted only if `base_score(candidate) - base_score(slot) >= sps_base_supported_repair_min_gain`; v47 starts with `0.0` because the internal reason is directional support, not threshold tuning.
+  - Log `base_supported_repair_rate`, `base_supported_available_repair_rate`, `base_supported_low_budget_parseable_rate`, `base_supported_low_budget_clip_rate`, `base_supported_low_budget_cluster_rate`, `base_supported_replacement_base_gain`, `base_supported_skipped_base_guard_rate`, and `base_supported_selected_base_support`.
+- Why this is justified:
+  - It keeps v46's direct low-budget training target but adds the independent base/ref support constraint that v46 lacked.
+  - It remains unsupervised and uses no Math500 labels.
+  - It does not change validation and does not use validation-time answer selection, best-of, majority vote, `n=32`, ground-truth selection, or inference-time scaling.
+  - It is not a random threshold search: `min_gain=0.0` simply enforces that a repair cannot reduce base/ref support.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4.sh`.
+  - Based on v44/v46 stack with `ttrl.sps_rollout_selection=base_supported_repair`, `ttrl.sps_low_budget_repair_max_replacements=4`, and `ttrl.sps_base_supported_repair_min_gain=0.0`.
+  - Keeps strict validation unchanged: `val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+
+### 2026-07-07 v47 result: base-supported repair recovers v46 loss but is still below v44
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4_proc_health.txt`.
+  - Ray TaskRunner log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v47_base_supported_repair_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling was used as the success metric.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7328973843058351`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8441730382293763`, `val-core/MATH-TTT/acc/maj@4/mean=0.7474164989939638`.
+  - Aux metrics: `format_score/mean@4=0.9683098591549296`, `response_clip/mean@4=0.014084507042253521`, `response_avg_logprob/mean@4=-0.0817076097850611`.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.652`.
+  - `train/sps/weighted_label_confidence=0.773`.
+  - `train/sps/answer_sharp_confidence=0.966`, `train/sps/answer_effective_K=1.084`.
+  - `train/sps/low_budget_capacity=0.719`, `train/sps/low_budget_majority_mass=0.719`, `train/sps/low_budget_agreement=0.875`.
+  - `train/sps/base_support_capacity=0.772`, `train/sps/base_support_agreement=1.000`.
+  - `train/sps/cross_view_capacity=0.727`, `train/sps/margin_capacity=0.768`.
+  - `train/sps/base_supported_repair_rate=0.250`, `train/sps/base_supported_available_repair_rate=0.777`.
+  - `train/sps/base_supported_low_budget_parseable_rate=1.000`, `train/sps/base_supported_low_budget_clip_rate=0.000`, `train/sps/base_supported_low_budget_cluster_rate=0.969`.
+  - `train/sps/base_supported_replacement_base_gain=0.053`, `train/sps/base_supported_skipped_base_guard_rate=0.031`, `train/sps/base_supported_selected_base_support=-0.164`.
+  - `train/pass@32=1.000`, `train/majority_ratio=0.762`, `train/ground_truth_reward=0.777`.
+- Timing:
+  - Non-validation steps were healthy and fast: first 10 steps averaged about `28.0s/step`, later training mostly `22-29s/step`.
+  - Steps 40-49 averaged about `24.711s/step`, whole-machine throughput about `9332 tokens/s`.
+  - Runner-generated steps 41-50 summary includes final validation: `47.357s/step`, `230017.900 tokens/step`, `4857.084 tokens/s`.
+  - Final validation step included `timing_s/testing=228.219`, `timing_s/step=249.768`.
+- Infra health:
+  - Training command exit status `0`.
+  - Preflight was healthy: `/proc/self` and `/proc/meminfo` OK, `PROC_COUNT_BEFORE=77`, `PROC_COUNT_AFTER_PREFLIGHT=78`, 8 B200 visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke passed, and loaded cuBLAS/cuDNN/NCCL/nvJitLink came from the venv cu12.9 stack.
+  - Runner final snapshot had `/proc` healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=85`.
+  - The runner final GPU snapshot caught one short-lived process on GPU2, but a follow-up check at `2026-07-07 03:16:25` showed `/proc` still healthy (`PROC_COUNT_NOW=78`), all 8 B200 GPUs at `0 MiB`, and no Ray/vLLM/main_ppo/TaskRunner processes. Treat final infra as healthy.
+- Interpretation:
+  - v47 is not an improvement over the current best: strict `mean@4=0.7329` is below v44 `0.738430583501006`, although it recovers some of v46's drop (`0.7233 -> 0.7329`).
+  - The base-support guard did what it was designed to do: it reduced the unconstrained v46 repair behavior and kept accepted replacements base-supported (`replacement_base_gain` stayed positive). It also restored `best@4` to `0.84417`, close to v44's `0.84257`.
+  - However, strict `mean@4` still did not improve. This suggests that better-supported majority candidates help contain v46's damage, but they still do not provide enough independent correctness evidence to move average low-budget samples toward the 85% target.
+  - Do not commit v47 as an algorithm improvement. It should remain documented as a failed/neutral trial.
+  - Next algorithm should move beyond answer-cluster repair. The clearest remaining direction is to generate or score an independent self-check/rephrase/process-consistency view during training and use it as a correctness filter or contrastive penalty, while keeping strict validation `n=4` with no answer selection.
+  - Goal is not complete: strict `mean@4=0.7329 < 0.85`; current best remains v44 `mean@4=0.7384`.
+
+### 2026-07-07 v48 plan: rollout process-consistency capacity
+
+- Motivation from v44-v47:
+  - v44 remains the current best strict 50-step result (`mean@4=0.7384`), but its step-50 internal signals were already very sharp: `low_budget_agreement=1.000`, `base_support_agreement=1.000`, `answer_sharp_confidence=0.979`, and `pass@32=1.000`.
+  - v46/v47 then showed that repairing first-four train slots toward majority, even with base/ref support, does not improve strict `mean@4`. This confirms that answer-cluster agreement and base support mostly verify the same self-consistent cluster and do not add enough independent correctness evidence.
+  - The next signal therefore should not be another majority/capacity-only variant or a low-budget repair. It should inspect whether a rollout's own reasoning text consistently supports its final answer, then use that as a train-time capacity signal.
+- Algorithm change:
+  - Add default-off `ttrl.sps_process_consistency_capacity`.
+  - For each generated rollout, compute a cheap verifier-free process-consistency score from its own text:
+    - final answer must be parseable;
+    - the response must not be clipped;
+    - all explicit `\boxed{...}` answers in the solution must agree after simplification, so a solution that boxes two conflicting answers is treated as internally inconsistent;
+    - the last boxed answer should appear near the tail of the response, avoiding solutions that state a final answer early and then continue reasoning or revise themselves;
+    - obvious uncertainty/correction markers after the final boxed answer reduce confidence.
+  - Aggregate this at the prompt level as the fraction of all train-time rollouts that both match the raw majority pseudo label and pass the process-consistency check. If the raw majority cluster has low process support, cap the prompt train weight before PPO.
+  - Log `process_consistency_capacity`, `process_majority_support`, `process_consistent_rate`, `process_majority_consistent_rate`, `process_tail_rate`, and `process_box_conflict_rate`.
+- Why this is justified:
+  - It directly follows the failed trials: v46/v47 made majority-cluster train slots cleaner but still regressed, so v48 asks whether the majority cluster is supported by internally consistent reasoning rather than by answer frequency alone.
+  - It is independent of Math500 labels and does not use validation-time scaling.
+  - It has zero extra generation or model scoring, so step time should stay near v44/v47 rather than doubling for a second generation pass.
+  - It is not a random hyperparameter search: the first thresholds are semantic defaults (`tail_fraction=0.50`, `disagreement_penalty=0.35`) chosen to enforce "final answer is actually final" and to match the existing conservative disagreement penalty used in v42-v44.
+- Runner:
+  - Planned runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4.sh`.
+  - Based on v44 with `ttrl.sps_process_consistency_capacity=True`.
+  - Keeps strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling may count as success.
+
+### 2026-07-07 v48 result: process consistency is the current best but still below 85%
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling was used as the success metric.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7454728370221329`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8601911468812877`, `val-core/MATH-TTT/acc/maj@4/mean=0.7625472837022133`.
+  - Aux metrics: `format_score/mean@4=0.971327967806841`, `response_clip/mean@4=0.011066398390342052`, `response_avg_logprob/mean@4=-0.08388606803557298`.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.684`.
+  - `train/sps/weighted_label_confidence=0.802`.
+  - `train/sps/answer_sharp_confidence=0.975`, `train/sps/answer_effective_K=1.058`.
+  - `train/sps/low_budget_capacity=0.750`, `train/sps/low_budget_majority_mass=0.750`, `train/sps/low_budget_agreement=0.875`.
+  - `train/sps/base_support_capacity=0.799`, `train/sps/base_support_agreement=1.000`.
+  - `train/sps/cross_view_capacity=0.752`, `train/sps/margin_capacity=0.824`.
+  - `train/sps/process_consistency_capacity=0.988`, `train/sps/process_majority_support=0.988`.
+  - `train/sps/process_consistent_rate=0.953`, `train/sps/process_majority_consistent_rate=0.777`.
+  - `train/sps/process_tail_rate=0.986`, `train/sps/process_box_conflict_rate=0.031`, `train/sps/process_revision_after_final_rate=0.008`.
+  - `train/pass@32=1.000`, `train/majority_ratio=0.789`, `train/ground_truth_reward=0.797`.
+- Timing:
+  - Late non-validation steps remained in the same healthy range as v44-v47, mostly about `22-29s/step`.
+  - Runner-generated steps 41-50 summary includes final validation: `49.534s/step`, `230363.200 tokens/step`, `4650.608 tokens/s`.
+  - Final validation step included `timing_s/testing=225.715`, `timing_s/step=248.623`.
+- Infra health:
+  - Training command exit status `0`.
+  - Preflight was healthy: `/proc/self` and `/proc/meminfo` OK, 8 B200 visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke passed, and loaded cuBLAS/cuDNN/NCCL/nvJitLink came from the venv cu12.9 stack.
+  - Runner final snapshot had `/proc` healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=84`.
+  - The final GPU snapshot still showed residual memory on GPU4/GPU5 and one process line (`107210`) from the teardown window. A follow-up live check after the run showed `/proc` remained healthy (`PROC_SELF_OK`, `PROC_MEMINFO_OK`, `PROC_COUNT=120`). Re-check GPU occupancy before starting the next experiment.
+- Interpretation:
+  - v48 is a real improvement over the previous strict 50-step best v44: `mean@4` improved from `0.738430583501006` to `0.7454728370221329` (`+0.70pp`), and diagnostic `best@4` improved from `0.8425714285714286` to `0.8601911468812877` (`+1.76pp`).
+  - The process-consistency signal provides useful early filtering and improves candidate existence, but by step 50 it is nearly saturated (`process_consistency_capacity=0.988`). As implemented it is not a strong late-stage discriminator and cannot close the gap to 85% by itself.
+  - The most important new observation is that strict `best@4` is now above 85% while strict `mean@4` is only `74.55%`. The bottleneck has shifted from "a correct candidate exists in four samples" toward "probability mass is not reliably placed on all first-four low-budget samples."
+  - Next algorithm should focus on train-time conversion from candidate existence to low-budget average correctness without validation-time selection. A plausible direction is a contrastive or capacity-weighted objective that separates internally supported correct-looking candidates from the other first-four samples, while avoiding the v46/v47 failure of blindly repairing toward majority clusters.
+  - v48 should be committed locally as an improvement record after documentation. v45-v47 remain failed/neutral trials documented for context and should not be described as improvement commits.
+  - Goal is not complete: strict `mean@4=0.7455 < 0.85`; current best is v48.

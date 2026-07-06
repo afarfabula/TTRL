@@ -88,6 +88,11 @@ ttrl:
   sps_base_support_disagreement_penalty: 0.35
   sps_cross_view_capacity: false
   sps_cross_view_disagreement_penalty: 0.35
+  sps_margin_capacity: false
+  sps_margin_capacity_floor: 0.35
+  sps_process_consistency_capacity: false
+  sps_process_tail_fraction: 0.5
+  sps_process_disagreement_penalty: 0.35
 
   # Source for the base/internal logprob used by SPS confidence weighting.
   # "ref" keeps the historical behavior and uses the reference-policy worker.
@@ -101,6 +106,12 @@ ttrl:
   # "sharpened_cluster" additionally ranks candidates by parseability,
   # non-clipping, and reference-reweighted sequence score within the answer
   # cluster, sharpening the train distribution without true labels.
+  # "low_budget_repair" keeps the historical first samples, but repairs only
+  # the first low-budget slots with parseable/non-clipped majority-cluster
+  # candidates when such candidates exist later in the train rollout set.
+  # "base_supported_repair" keeps the same narrow low-budget repair scope, but
+  # only accepts a repair candidate when it has better base/ref support than the
+  # low-budget slot it replaces.
   sps_rollout_selection: first
   sps_selection_temperature: ${ttrl.sps_weight_temperature_base}
   sps_selection_require_majority: true
@@ -113,6 +124,8 @@ ttrl:
   sps_selection_capacity: false
   sps_selection_capacity_floor: 0.5
   sps_selection_capacity_power: 1.0
+  sps_low_budget_repair_max_replacements: 4
+  sps_base_supported_repair_min_gain: 0.0
 
   # Optional unsupervised self-consistency reward mixed into SPS modes. This is
   # the 0/1 reward against the rollout majority pseudo label, not true labels.

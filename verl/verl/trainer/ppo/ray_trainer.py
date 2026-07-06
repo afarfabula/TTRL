@@ -1357,6 +1357,8 @@ class RayPPOTrainer:
                             ):
                                 from verl.trainer.ppo.ttrl_utils import (
                                     apply_sps_weighted_ttrl_gt,
+                                    select_base_supported_repair_per_prompt,
+                                    select_low_budget_repair_per_prompt,
                                     select_majority_first_per_prompt,
                                     select_sharpened_cluster_per_prompt,
                                     select_top_k_per_prompt,
@@ -1413,6 +1415,21 @@ class RayPPOTrainer:
                                         ),
                                         cross_view_disagreement_penalty=self.config.ttrl.get(
                                             "sps_cross_view_disagreement_penalty", 0.35
+                                        ),
+                                        margin_capacity=self.config.ttrl.get(
+                                            "sps_margin_capacity", False
+                                        ),
+                                        margin_capacity_floor=self.config.ttrl.get(
+                                            "sps_margin_capacity_floor", 0.35
+                                        ),
+                                        process_consistency_capacity=self.config.ttrl.get(
+                                            "sps_process_consistency_capacity", False
+                                        ),
+                                        process_tail_fraction=self.config.ttrl.get(
+                                            "sps_process_tail_fraction", 0.5
+                                        ),
+                                        process_disagreement_penalty=self.config.ttrl.get(
+                                            "sps_process_disagreement_penalty", 0.35
                                         ),
                                     )
                                 with marked_timer("sps_compute_reward", timing_raw):
@@ -1512,6 +1529,49 @@ class RayPPOTrainer:
                                     sps_info["sps/cross_view_capacity"] = float(
                                         batch.non_tensor_batch["sps_cross_view_capacity_list"].mean()
                                     )
+                                if "sps_margin_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/margin_capacity"] = float(
+                                        batch.non_tensor_batch["sps_margin_capacity_list"].mean()
+                                    )
+                                    sps_info["sps/sharp_majority_margin"] = float(
+                                        batch.non_tensor_batch["sps_sharp_majority_margin_list"].mean()
+                                    )
+                                    sps_info["sps/base_support_majority_margin"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_base_support_majority_margin_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_majority_margin"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_majority_margin_list"].mean()
+                                    )
+                                if "sps_process_consistency_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/process_consistency_capacity"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_consistency_capacity_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_majority_support"] = float(
+                                        batch.non_tensor_batch["sps_process_majority_support_list"].mean()
+                                    )
+                                    sps_info["sps/process_consistent_rate"] = float(
+                                        batch.non_tensor_batch["sps_process_consistent_rate_list"].mean()
+                                    )
+                                    sps_info["sps/process_majority_consistent_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_majority_consistent_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_tail_rate"] = float(
+                                        batch.non_tensor_batch["sps_process_tail_rate_list"].mean()
+                                    )
+                                    sps_info["sps/process_box_conflict_rate"] = float(
+                                        batch.non_tensor_batch["sps_process_box_conflict_rate_list"].mean()
+                                    )
+                                    sps_info["sps/process_revision_after_final_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_revision_after_final_rate_list"
+                                        ].mean()
+                                    )
                                 if sps_mode != "answer_rule_conf_weight":
                                     gen_batch_output = gen_batch_output.union(
                                         DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
@@ -1528,6 +1588,75 @@ class RayPPOTrainer:
                                         )
                                         sps_info["sps/selected_majority_ratio"] = float(
                                             selected_majority_ratio.mean()
+                                        )
+                                    elif selection_mode == "low_budget_repair":
+                                        gen_batch_output, repair_info = select_low_budget_repair_per_prompt(
+                                            data=gen_batch_output,
+                                            n_votes_per_prompt=K,
+                                            n_samples_per_prompt=self.config.ttrl.n_samples_per_prompt,
+                                            tokenizer=self.tokenizer,
+                                            majority_gt_list=batch.non_tensor_batch["sps_raw_majority_gt_list"],
+                                            response_mask=response_mask,
+                                            low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
+                                            max_replacements=self.config.ttrl.get(
+                                                "sps_low_budget_repair_max_replacements", 4
+                                            ),
+                                        )
+                                        sps_info["sps/low_budget_repair_rate"] = float(
+                                            repair_info["repaired_rate"].mean()
+                                        )
+                                        sps_info["sps/selected_low_budget_parseable_rate"] = float(
+                                            repair_info["low_budget_parseable_rate"].mean()
+                                        )
+                                        sps_info["sps/selected_low_budget_clip_rate"] = float(
+                                            repair_info["low_budget_clip_rate"].mean()
+                                        )
+                                        sps_info["sps/selected_low_budget_cluster_rate"] = float(
+                                            repair_info["low_budget_cluster_rate"].mean()
+                                        )
+                                        sps_info["sps/available_low_budget_repair_rate"] = float(
+                                            repair_info["available_repair_rate"].mean()
+                                        )
+                                    elif selection_mode == "base_supported_repair":
+                                        gen_batch_output, repair_info = select_base_supported_repair_per_prompt(
+                                            data=gen_batch_output,
+                                            n_votes_per_prompt=K,
+                                            n_samples_per_prompt=self.config.ttrl.n_samples_per_prompt,
+                                            tokenizer=self.tokenizer,
+                                            majority_gt_list=batch.non_tensor_batch["sps_raw_majority_gt_list"],
+                                            response_mask=response_mask,
+                                            ref_log_prob=base_lp.batch["ref_log_prob"],
+                                            low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
+                                            max_replacements=self.config.ttrl.get(
+                                                "sps_low_budget_repair_max_replacements", 4
+                                            ),
+                                            min_base_gain=self.config.ttrl.get(
+                                                "sps_base_supported_repair_min_gain", 0.0
+                                            ),
+                                        )
+                                        sps_info["sps/base_supported_repair_rate"] = float(
+                                            repair_info["repaired_rate"].mean()
+                                        )
+                                        sps_info["sps/base_supported_available_repair_rate"] = float(
+                                            repair_info["available_repair_rate"].mean()
+                                        )
+                                        sps_info["sps/base_supported_low_budget_parseable_rate"] = float(
+                                            repair_info["low_budget_parseable_rate"].mean()
+                                        )
+                                        sps_info["sps/base_supported_low_budget_clip_rate"] = float(
+                                            repair_info["low_budget_clip_rate"].mean()
+                                        )
+                                        sps_info["sps/base_supported_low_budget_cluster_rate"] = float(
+                                            repair_info["low_budget_cluster_rate"].mean()
+                                        )
+                                        sps_info["sps/base_supported_replacement_base_gain"] = float(
+                                            repair_info["replacement_base_gain"].mean()
+                                        )
+                                        sps_info["sps/base_supported_skipped_base_guard_rate"] = float(
+                                            repair_info["skipped_base_guard_rate"].mean()
+                                        )
+                                        sps_info["sps/base_supported_selected_base_support"] = float(
+                                            repair_info["selected_base_support"].mean()
                                         )
                                     elif selection_mode == "sharpened_cluster":
                                         gen_batch_output, selection_info = select_sharpened_cluster_per_prompt(

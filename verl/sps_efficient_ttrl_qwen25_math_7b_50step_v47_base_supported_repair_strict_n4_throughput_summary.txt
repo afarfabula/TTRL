@@ -1,0 +1,5 @@
+task_log=/tmp/r47basesup/ray/session_latest/logs/worker-2b97cefb0e77479b6be76e2a10b00beb64361868cbb3750df5146e26-ffffffff-38272.out
+steps=41-50
+timing_s/step=47.357
+perf/total_num_tokens=230017.900
+whole_machine_tokens_per_s=4857.084
