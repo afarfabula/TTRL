@@ -90,6 +90,8 @@ def select_sharpened_cluster_per_prompt(
     parseable_bonus_weight=2.0,
     nonclip_bonus_weight=1.0,
     selection_priority="score",
+    contrast_count=4,
+    contrast_min_cluster_ratio=0.5,
 ):
     """
     Select train rollouts from a sharpened answer cluster.
@@ -123,6 +125,7 @@ def select_sharpened_cluster_per_prompt(
     selected_parseable_rates = []
     selected_clip_rates = []
     selected_cluster_rates = []
+    selected_contrast_rates = []
     fallback_rates = []
     for i in range(num_prompts):
         start = i * n_votes_per_prompt
@@ -161,6 +164,7 @@ def select_sharpened_cluster_per_prompt(
         else:
             candidate_ranked = ranked
             fallback = 1.0 if require_majority else 0.0
+        contrast_rate = 0.0
         if selection_priority == "nonclip_parseable_bucket":
             # Project onto the learnable support first; sharpen within each bucket.
             candidate_ranked = sorted(
@@ -173,9 +177,92 @@ def select_sharpened_cluster_per_prompt(
                 ),
                 reverse=True,
             )
+        elif selection_priority == "nonclip_parseable_contrast_bucket":
+            # v26 support projection plus a small high-quality negative tail.
+            # When the majority cluster is internally strong, keep most selected
+            # samples as non-clipped/parseable majority positives and reserve a
+            # few non-clipped/parseable non-majority samples as contrastive
+            # negatives under the same pseudo label. This sharpens the train
+            # distribution without using true answers.
+            majority_support = sorted(
+                [
+                    item
+                    for item in candidate_ranked
+                    if (not item[3]) and item[2] and item[4]
+                ],
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            contrast_support = sorted(
+                [
+                    item
+                    for item in candidate_ranked
+                    if (not item[3]) and item[2] and (not item[4])
+                ],
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            majority_cluster_ratio = float(sum(1 for item in ranked if item[4])) / float(
+                n_votes_per_prompt
+            )
+            max_contrast = min(
+                max(int(contrast_count), 0),
+                max(n_samples_per_prompt // 4, 0),
+                len(contrast_support),
+            )
+            if (
+                max_contrast > 0
+                and majority_cluster_ratio >= float(contrast_min_cluster_ratio)
+                and len(majority_support) >= n_samples_per_prompt - max_contrast
+            ):
+                chosen = (
+                    majority_support[: n_samples_per_prompt - max_contrast]
+                    + contrast_support[:max_contrast]
+                )
+                contrast_rate = float(max_contrast) / float(n_samples_per_prompt)
+            else:
+                candidate_ranked = sorted(
+                    candidate_ranked,
+                    key=lambda item: (
+                        1.0 - item[3],
+                        item[2],
+                        item[4],
+                        item[0],
+                    ),
+                    reverse=True,
+                )
+        elif selection_priority == "nonclip_parseable_cluster_short_bucket":
+            # Keep v26's support projection, then use response length as a
+            # sample-level capacity signal inside the selected support.
+            candidate_ranked = sorted(
+                candidate_ranked,
+                key=lambda item: (
+                    1.0 - item[3],             # non-clipped
+                    item[2],                   # parseable boxed answer
+                    item[4],                   # majority answer cluster
+                    -float(lengths_cpu[item[1]].item()),
+                    item[0],                   # reference-reweighted quality
+                ),
+                reverse=True,
+            )
+        elif selection_priority == "parseable_nonclip_cluster_bucket":
+            # Favor valid answer-bearing trajectories before length support.
+            # This targets mean@k: v26 already stabilizes majority voting, while
+            # individual samples still lose points from invalid final answers.
+            candidate_ranked = sorted(
+                candidate_ranked,
+                key=lambda item: (
+                    item[2],        # parseable boxed answer
+                    1.0 - item[3],  # non-clipped
+                    item[4],        # majority answer cluster
+                    item[0],        # reference-reweighted quality
+                ),
+                reverse=True,
+            )
         else:
             candidate_ranked = sorted(candidate_ranked, key=lambda item: item[0], reverse=True)
-        chosen = candidate_ranked[:n_samples_per_prompt]
+        if selection_priority != "nonclip_parseable_contrast_bucket" or contrast_rate == 0.0:
+            chosen = candidate_ranked[:n_samples_per_prompt]
         if len(chosen) < n_samples_per_prompt:
             chosen_set = {idx for _, idx, _, _, _ in chosen}
             fill_candidates = [item for item in ranked if item[1] not in chosen_set]
@@ -190,6 +277,40 @@ def select_sharpened_cluster_per_prompt(
                     ),
                     reverse=True,
                 )
+            elif selection_priority == "nonclip_parseable_contrast_bucket":
+                fill = sorted(
+                    fill_candidates,
+                    key=lambda item: (
+                        1.0 - item[3],
+                        item[2],
+                        item[4],
+                        item[0],
+                    ),
+                    reverse=True,
+                )
+            elif selection_priority == "nonclip_parseable_cluster_short_bucket":
+                fill = sorted(
+                    fill_candidates,
+                    key=lambda item: (
+                        1.0 - item[3],
+                        item[2],
+                        item[4],
+                        -float(lengths_cpu[item[1]].item()),
+                        item[0],
+                    ),
+                    reverse=True,
+                )
+            elif selection_priority == "parseable_nonclip_cluster_bucket":
+                fill = sorted(
+                    fill_candidates,
+                    key=lambda item: (
+                        item[2],
+                        1.0 - item[3],
+                        item[4],
+                        item[0],
+                    ),
+                    reverse=True,
+                )
             else:
                 fill = sorted(fill_candidates, key=lambda item: item[0], reverse=True)
             chosen.extend(fill[: n_samples_per_prompt - len(chosen)])
@@ -199,6 +320,7 @@ def select_sharpened_cluster_per_prompt(
         selected_parseable_rates.append(float(np.mean([parseable for _, _, parseable, _, _ in chosen])))
         selected_clip_rates.append(float(np.mean([clipped for _, _, _, clipped, _ in chosen])))
         selected_cluster_rates.append(float(np.mean([in_cluster for _, _, _, _, in_cluster in chosen])))
+        selected_contrast_rates.append(contrast_rate)
         fallback_rates.append(fallback)
 
     return (
@@ -207,6 +329,7 @@ def select_sharpened_cluster_per_prompt(
             "parseable_rate": np.array(selected_parseable_rates, dtype=float),
             "clip_rate": np.array(selected_clip_rates, dtype=float),
             "cluster_rate": np.array(selected_cluster_rates, dtype=float),
+            "contrast_rate": np.array(selected_contrast_rates, dtype=float),
             "fallback_rate": np.array(fallback_rates, dtype=float),
         },
     )
@@ -286,6 +409,14 @@ def apply_sps_weighted_ttrl_gt(
     weight_power=1.0,
     answer_sharpen_beta=1.0,
     answer_sharpen_capacity=False,
+    consistency_capacity=False,
+    consistency_disagreement_penalty=0.5,
+    low_budget_capacity=False,
+    low_budget_k=4,
+    low_budget_disagreement_penalty=0.35,
+    base_support_capacity=False,
+    base_support_temperature=1.0,
+    base_support_disagreement_penalty=0.35,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -325,12 +456,25 @@ def apply_sps_weighted_ttrl_gt(
     answer_effective_k_list = []
     answer_logz_list = []
     majority_sharp_confidence_list = []
+    consistency_capacity_list = []
+    low_budget_parseable_rate_list = []
+    low_budget_clip_rate_list = []
+    low_budget_majority_ratio_list = []
+    low_budget_majority_mass_list = []
+    low_budget_agreement_list = []
+    low_budget_capacity_list = []
+    base_support_majority_confidence_list = []
+    base_support_top_confidence_list = []
+    base_support_agreement_list = []
+    base_support_capacity_list = []
 
     temp = max(float(weight_temperature), 1e-6)
     sharpen_beta = max(float(answer_sharpen_beta), 1e-6)
+    base_support_temp = max(float(base_support_temperature), 1e-6)
     max_response_len = response_mask.shape[-1]
     for i in range(num_prompts):
         answer_to_scores = {}
+        answer_to_base_scores = {}
         answers = []
         start = i * n
         for j in range(n):
@@ -347,6 +491,10 @@ def apply_sps_weighted_ttrl_gt(
             answer = simplify_expression_string(answer)
             answers.append(answer)
             answer_to_scores.setdefault(answer, []).append(scores[start + j] / temp)
+            base_score = base_seq[start + j].detach().cpu()
+            if length_normalize:
+                base_score = base_score / lengths[start + j].detach().cpu()
+            answer_to_base_scores.setdefault(answer, []).append(base_score / base_support_temp)
 
         if not answer_to_scores:
             selected_gt_list.append("None")
@@ -363,11 +511,26 @@ def apply_sps_weighted_ttrl_gt(
             answer_effective_k_list.append(0.0)
             answer_logz_list.append(0.0)
             majority_sharp_confidence_list.append(0.0)
+            consistency_capacity_list.append(0.0)
+            low_budget_parseable_rate_list.append(0.0)
+            low_budget_clip_rate_list.append(0.0)
+            low_budget_majority_ratio_list.append(0.0)
+            low_budget_majority_mass_list.append(0.0)
+            low_budget_agreement_list.append(0.0)
+            low_budget_capacity_list.append(0.0)
+            base_support_majority_confidence_list.append(0.0)
+            base_support_top_confidence_list.append(0.0)
+            base_support_agreement_list.append(0.0)
+            base_support_capacity_list.append(0.0)
             continue
 
         answer_scores = {
             answer: torch.logsumexp(torch.stack(vals), dim=0)
             for answer, vals in answer_to_scores.items()
+        }
+        base_answer_scores = {
+            answer: torch.logsumexp(torch.stack(vals), dim=0)
+            for answer, vals in answer_to_base_scores.items()
         }
         weighted_gt = max(answer_scores.items(), key=lambda item: item[1].item())[0]
         answer_keys = list(answer_scores.keys())
@@ -388,10 +551,57 @@ def apply_sps_weighted_ttrl_gt(
             answer: float(sharp_probs[idx].item())
             for idx, answer in enumerate(answer_keys)
         }
+        base_keys = list(base_answer_scores.keys())
+        base_stacked = torch.stack([base_answer_scores[answer] for answer in base_keys])
+        base_probs = torch.softmax(base_stacked - base_stacked.max(), dim=0)
+        base_prob_by_answer = {
+            answer: float(base_probs[idx].item())
+            for idx, answer in enumerate(base_keys)
+        }
         majority_sharp_confidence = sharp_prob_by_answer.get(majority_gt, 0.0)
         weighted_sharp_confidence = sharp_prob_by_answer.get(weighted_gt, 0.0)
+        base_support_gt = max(base_answer_scores.items(), key=lambda item: item[1].item())[0]
+        base_support_top_confidence = max(base_prob_by_answer.values()) if base_prob_by_answer else 0.0
+        base_support_majority_confidence = base_prob_by_answer.get(majority_gt, 0.0)
+        base_support_agreement = float(base_support_gt == majority_gt)
+        base_support_capacity_value = base_support_majority_confidence
+        if base_support_gt != majority_gt:
+            base_support_capacity_value *= max(0.0, min(1.0, float(base_support_disagreement_penalty)))
         prompt_lengths = lengths[start : start + n]
         prompt_clip_ratio = float((prompt_lengths >= max_response_len).to(torch.float32).mean().item())
+        low_k = max(1, min(int(low_budget_k), n))
+        low_budget_answers = []
+        low_budget_parseable = 0
+        for j in range(low_k):
+            data_item = gen_batch_output[start + j]
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is None:
+                continue
+            low_budget_parseable += 1
+            low_budget_answers.append(simplify_expression_string(answer))
+        low_counter = Counter(low_budget_answers)
+        if low_counter:
+            low_budget_gt, low_budget_count = low_counter.most_common(1)[0]
+            low_budget_majority_ratio = float(low_budget_count) / float(low_k)
+        else:
+            low_budget_gt = "None"
+            low_budget_majority_ratio = 0.0
+        low_budget_majority_mass = float(low_counter.get(majority_gt, 0)) / float(low_k)
+        low_budget_parseable_rate = float(low_budget_parseable) / float(low_k)
+        low_budget_clip_rate = float(
+            (prompt_lengths[:low_k] >= max_response_len).to(torch.float32).mean().item()
+        )
+        low_budget_agreement = float(low_budget_gt == majority_gt)
+        low_budget_capacity_value = low_budget_majority_mass
+        if low_budget_gt != majority_gt:
+            low_budget_capacity_value *= max(0.0, min(1.0, float(low_budget_disagreement_penalty)))
+        low_budget_capacity_value *= low_budget_parseable_rate * max(0.0, 1.0 - low_budget_clip_rate)
 
         use_sps_label = True
         if confidence_filter or confidence_weight:
@@ -417,12 +627,22 @@ def apply_sps_weighted_ttrl_gt(
         answer_effective_k_list.append(sharp_effective_k)
         answer_logz_list.append(float(answer_logz.item()))
         majority_sharp_confidence_list.append(majority_sharp_confidence)
+        consistency_capacity_value = 1.0
         if confidence_weight:
             if answer_sharpen_capacity:
                 agreement_confidence = weighted_sharp_confidence if weighted_gt == majority_gt else 0.0
             else:
                 agreement_confidence = weighted_confidence if weighted_gt == majority_gt else 0.0
             prompt_weight = max(float(majority_ratio), float(agreement_confidence))
+            if consistency_capacity:
+                consistency_capacity_value = max(0.0, min(1.0, float(majority_sharp_confidence)))
+                if weighted_gt != majority_gt:
+                    consistency_capacity_value *= max(0.0, min(1.0, float(consistency_disagreement_penalty)))
+                prompt_weight = min(prompt_weight, consistency_capacity_value)
+            if low_budget_capacity:
+                prompt_weight = min(prompt_weight, low_budget_capacity_value)
+            if base_support_capacity:
+                prompt_weight = min(prompt_weight, base_support_capacity_value)
             if clip_penalty > 0:
                 prompt_weight *= max(0.0, 1.0 - float(clip_penalty) * prompt_clip_ratio)
             power = max(float(weight_power), 1e-6)
@@ -437,6 +657,17 @@ def apply_sps_weighted_ttrl_gt(
             sps_train_weight_list.append(float(keep_prompt))
         else:
             sps_train_weight_list.append(1.0)
+        consistency_capacity_list.append(consistency_capacity_value)
+        low_budget_parseable_rate_list.append(low_budget_parseable_rate)
+        low_budget_clip_rate_list.append(low_budget_clip_rate)
+        low_budget_majority_ratio_list.append(low_budget_majority_ratio)
+        low_budget_majority_mass_list.append(low_budget_majority_mass)
+        low_budget_agreement_list.append(low_budget_agreement)
+        low_budget_capacity_list.append(low_budget_capacity_value)
+        base_support_majority_confidence_list.append(base_support_majority_confidence)
+        base_support_top_confidence_list.append(base_support_top_confidence)
+        base_support_agreement_list.append(base_support_agreement)
+        base_support_capacity_list.append(base_support_capacity_value)
 
     for i in range(num_prompts):
         data_item = batch[i]
@@ -460,6 +691,21 @@ def apply_sps_weighted_ttrl_gt(
     batch.non_tensor_batch["sps_answer_effective_k_list"] = np.array(answer_effective_k_list, dtype=float)
     batch.non_tensor_batch["sps_answer_logz_list"] = np.array(answer_logz_list, dtype=float)
     batch.non_tensor_batch["sps_majority_sharp_confidence_list"] = np.array(majority_sharp_confidence_list, dtype=float)
+    batch.non_tensor_batch["sps_consistency_capacity_list"] = np.array(consistency_capacity_list, dtype=float)
+    batch.non_tensor_batch["sps_low_budget_parseable_rate_list"] = np.array(low_budget_parseable_rate_list, dtype=float)
+    batch.non_tensor_batch["sps_low_budget_clip_rate_list"] = np.array(low_budget_clip_rate_list, dtype=float)
+    batch.non_tensor_batch["sps_low_budget_majority_ratio_list"] = np.array(low_budget_majority_ratio_list, dtype=float)
+    batch.non_tensor_batch["sps_low_budget_majority_mass_list"] = np.array(low_budget_majority_mass_list, dtype=float)
+    batch.non_tensor_batch["sps_low_budget_agreement_list"] = np.array(low_budget_agreement_list, dtype=float)
+    batch.non_tensor_batch["sps_low_budget_capacity_list"] = np.array(low_budget_capacity_list, dtype=float)
+    batch.non_tensor_batch["sps_base_support_majority_confidence_list"] = np.array(
+        base_support_majority_confidence_list, dtype=float
+    )
+    batch.non_tensor_batch["sps_base_support_top_confidence_list"] = np.array(
+        base_support_top_confidence_list, dtype=float
+    )
+    batch.non_tensor_batch["sps_base_support_agreement_list"] = np.array(base_support_agreement_list, dtype=float)
+    batch.non_tensor_batch["sps_base_support_capacity_list"] = np.array(base_support_capacity_list, dtype=float)
     return batch
 
 

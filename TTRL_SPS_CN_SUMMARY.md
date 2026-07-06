@@ -30,6 +30,8 @@
 | Qwen2.5-Math-7B 20-step strict | v39 | 20 | v38 + majority-guarded sharpened selection | `mean@4=58.80%`, `best@4=77.15%`, `maj@4=61.43%` |
 | Qwen2.5-Math-7B 20-step strict | v40 | 20 | 回到 v36 样本路径 + prompt-level consistency capacity | `mean@4=69.67%`, `best@4=83.13%`, `maj@4=71.69%` |
 | Qwen2.5-Math-7B 20-step strict | v41 | 20 | v40 + 训练 rollout/proposal 温度降到 0.7 + CUDA/cuBLAS infra 固化 | `mean@4=69.57%`, `best@4=82.92%`, `maj@4=72.02%` |
+| Qwen2.5-Math-7B 50-step strict | v42 | 50 | v36/v40 + low-budget first4 capacity | `mean@4=71.93%`, `best@4=82.22%`, `maj@4=73.37%` |
+| Qwen2.5-Math-7B 50-step strict | v43 | 50 | v42 + base/ref answer-cluster support capacity | `mean@4=73.59%`, `best@4=83.81%`, `maj@4=75.06%` |
 
 v33 达成 Efficient Test-Time RL 目标：20 个训练 step 后，Qwen3-4B 在 Math500/MATH-TTT 上 `val-core/MATH-TTT/acc/mean@4=0.7907444668008048`，超过 75% 目标。Qwen3-4B seed sweep 的第一个有效 seed 达到 `0.8008048289738431`，随后因目标模型切换暂停。
 
@@ -92,3 +94,29 @@ v41 已在 B200 worker `986493` 上完成。infra 侧结论是正向的：训练
 v41 算法侧不是提升。它把训练 rollout 温度和 `sps_proposal_temperature` 从 `1.0` 降到 `0.7`，同时由于低温语义不允许复用温度 1.0 下的 logprob，实际配置关闭了 `sps_reuse_rollout_log_probs_as_old` 和 `sps_reuse_base_log_probs_as_ref`。最终 strict validation 仍保持 `n=4` 且禁用 answer selection，结果为 `mean@4=69.57%`、`best@4=82.92%`、`maj@4=72.02%`，低于当前最好 v36 的 `mean@4=70.37%`。低温训练提高了速度和内部分布锐化，但没有提升最终 4 条低预算样本的正确率。
 
 v41 性能记录：1-step smoke 为 `34.271s/step`、约 `7913.8 tokens/s`；20-step 完整训练中非 validation 步骤 2-19 平均 `26.518s/step`、约 `9456.1 tokens/s`，步骤 11-19 平均 `24.706s/step`、约 `9524.3 tokens/s`。根盘只有约 `14G` 空余，但当前约束是不作为训练 gate，只记录；缓存和临时目录均落到 `/tmp`。
+
+## v42 计划：低预算容量信号
+
+本轮先读了 10 篇相关 arXiv/最新论文，覆盖 TTRL、自训练、verifier-free RL、entropy/confidence reward、confidence-weighted self-consistency 和 latent self-consistency。共同启发是：内部 confidence/entropy/majority 信号可以作为无监督训练信号，但容易把错误答案簇锐化；需要把它用作保守 capacity，而不是单独 reward 或 validation-time selection。
+
+v42 的设计只针对当前 strict `mean@4` 的失败模式：v40/v41 说明 32/64 条 rollout 的 wide support 里有较强候选，但最终 4 条低预算样本仍不够好。因此 v42 不再做 rollout-level 强选，也不降低训练温度，而是在训练期加入 `sps_low_budget_capacity`：每个 prompt 只看训练生成组里前 `4` 条 rollout，计算它们的可解析率、截断率、局部 majority、以及它们落在全局 raw-majority answer 上的比例。如果前 4 条和全局 majority 不一致，就降低这个 prompt 的训练权重；如果前 4 条可解析、非截断、且已经有质量落在全局 majority 上，才允许更强更新。
+
+这个信号不使用 Math500 标注，不改变 validation，不使用 `n=32` selection，不算 best-of 或 major vote。最终仍以 strict `val_kwargs.n=4`、禁用 `validation_answer_selection_enable` 的 `mean@4` 为唯一达标口径。v42 runner 是 `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4.sh`，沿用 v41 的 CUDA/cuBLAS infra recipe，并跑 `50` step。
+
+v42 已完成 50 step，但没有达标：strict `val-core/MATH-TTT/acc/mean@4=71.93%`，`best@4=82.22%`，`maj@4=73.37%`。这里仍然只认 `mean@4`，`best@4/maj@4` 只是诊断，不能算成功。相比 v36 的 20-step strict `70.37%` 有提升，但预算不同，不能当成明确算法胜利；距离 85% 还很远。
+
+内部信号显示 v42 的 low-budget gate 确实把前 4 条 rollout 的一致性拉高了：step 50 的 `low_budget_majority_mass=0.750`、`low_budget_agreement=0.875`、`low_budget_capacity=0.727`，`answer_sharp_confidence=0.965`，`majority_ratio=0.760`。问题是这种一致性没有足够转化成正确率，说明模型更自洽了，但错误簇仍会被锐化。下一步不能继续单纯强化 majority/sharpening，需要加入能拒绝高置信错误答案的内部 verifier/self-check 或多视角一致性 gate。
+
+infra 正常：runner 退出状态 0，最终 `/proc/self` 和 `/proc/meminfo` 都正常，`PROC_COUNT_FINAL=96`。非 validation 训练步 2-49 平均 `24.254s/step`，整机约 `10.50k token/s`；runner 自带 steps 41-50 汇总包含 final validation step，所以显示 `47.258s/step`、`5.01k token/s`，不能拿它代表纯训练吞吐。
+
+## v43 计划：base-support 内部 verifier capacity
+
+v42 的内部一致性已经很高，但 strict `best@4` 仍只有 `82.22%`，所以继续提高 majority/sharpening 没有充分理由。v43 改用 base/ref support 做一个内部 verifier：对每个 prompt，把 64 条 rollout 按最终答案分簇，然后用 ref/base logprob 对每个答案簇做 logsumexp 支持度。如果采样 majority 也是 base/ref 支持的答案，就允许较强更新；如果采样 majority 很强但 base/ref 支持的 top answer 不同，就降低这个 prompt 的训练容量。
+
+这仍然是无监督信号，不用 Math500 标注，也不改 validation。v43 新增 `sps_base_support_capacity=True`，默认配置里开关保持 off；runner 是 `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4.sh`。判断重点不是 answer 更锐，而是 `base_support_agreement/base_support_capacity` 能否识别高风险 prompt，并让 strict `mean@4`、尤其 `best@4` 上升。
+
+v43 已完成 50 step，strict `val_kwargs.n=4` 且禁用 validation answer selection。结果是 `mean@4=73.59%`、`best@4=83.81%`、`maj@4=75.06%`。相比 v42 的 `mean@4=71.93%` 提升 `+1.66pp`，是当前 Qwen2.5-Math-7B strict 50-step 最好结果，但仍没有达到 85%。这里的 `best@4` 也还低于 85%，所以瓶颈仍然是 4 条低预算样本里的正确候选不够，而不是验证阶段选择方法。
+
+v43 的 step 50 内部指标：`answer_sharp_confidence=0.969`、`low_budget_majority_mass=0.719`、`base_support_capacity=0.781`、`base_support_agreement=1.000`、`train_weight=0.577`、`ground_truth_reward=0.781`。这说明 base/ref support 作为保守 capacity 有帮助，但晚期大多和 majority 同向，独立纠错能力不够强。下一版应保留 v42/v43 的保守容量栈，但加入更有区分度的内部 correctness 信号，例如低温自检/改写一致性、base support 和 first4 冲突惩罚、answer-cluster margin，而不是继续单纯提高锐化强度。
+
+infra 正常：runner 退出状态 0，最终 `/proc/self` 和 `/proc/meminfo` 正常，`PROC_COUNT_FINAL=102`。非 validation 训练步 2-49 平均 `24.802s/step`，整机约 `10.22k token/s`；step 50 包含 final validation，`testing=225.862s`、整步 `247.066s`。

@@ -736,6 +736,19 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            response_mask = compute_response_mask(test_output_gen_batch)
+            response_lens = response_mask.sum(dim=-1).detach().cpu().to(torch.float32)
+            reward_extra_infos_dict["response_len"].extend(response_lens.tolist())
+            max_response_len = float(output_ids.shape[-1])
+            reward_extra_infos_dict["response_clip"].extend((response_lens >= max_response_len).to(torch.float32).tolist())
+            if "rollout_log_probs" in test_output_gen_batch.batch:
+                rollout_log_probs = test_output_gen_batch.batch["rollout_log_probs"].detach()
+                seq_logprob = (rollout_log_probs * response_mask.to(rollout_log_probs.dtype)).sum(dim=-1).cpu().to(
+                    torch.float32
+                )
+                avg_logprob = seq_logprob / response_lens.clamp(min=1.0)
+                reward_extra_infos_dict["response_avg_logprob"].extend(avg_logprob.tolist())
+
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
@@ -790,6 +803,9 @@ class RayPPOTrainer:
                 sample_inputs=sample_inputs,
                 infos_dict=reward_extra_infos_dict,
                 repeats=self.config.trainer.get("validation_answer_selection_repeats", 4),
+                strategy=self.config.trainer.get("validation_answer_selection_strategy", "majority"),
+                logprob_beta=self.config.trainer.get("validation_answer_selection_logprob_beta", 1.0),
+                clip_penalty=self.config.trainer.get("validation_answer_selection_clip_penalty", 0.25),
             )
 
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
@@ -823,18 +839,31 @@ class RayPPOTrainer:
 
         return metric_dict
 
-    def _collapse_validation_by_answer_selection(self, data_sources, sample_inputs, infos_dict, repeats=4):
+    def _collapse_validation_by_answer_selection(
+        self,
+        data_sources,
+        sample_inputs,
+        infos_dict,
+        repeats=4,
+        strategy="majority",
+        logprob_beta=1.0,
+        clip_penalty=0.25,
+    ):
         """Select one validation response per prompt using only extracted answers.
 
         This is an SPS/self-consistency style test-time selection pass. The
-        selector sees only `pred` answer clusters and never uses correctness
-        scores. After selecting the answer cluster, we repeat the chosen response
-        so the existing validation reducer still reports the main `mean@4` key.
-        Raw uncollapsed metrics are logged separately by the caller.
+        selector sees only answer clusters and unsupervised rollout quality
+        signals, never correctness scores. After selecting the answer cluster,
+        we repeat the chosen response so the existing validation reducer still
+        reports the main `mean@4` key. Raw uncollapsed metrics are logged
+        separately by the caller.
         """
         repeats = max(int(repeats), 1)
         if "pred" not in infos_dict:
             return data_sources, sample_inputs, infos_dict
+        strategy = str(strategy or "majority")
+        logprob_beta = float(logprob_beta)
+        clip_penalty = float(clip_penalty)
 
         prompt2indices = defaultdict(list)
         for idx, (data_source, prompt) in enumerate(zip(data_sources, sample_inputs)):
@@ -845,10 +874,19 @@ class RayPPOTrainer:
         selected_infos = {key: [] for key in infos_dict.keys()}
         for (data_source, prompt), indices in prompt2indices.items():
             preds = [infos_dict["pred"][idx] for idx in indices]
-            parseable = [pred for pred in preds if pred not in (None, "", "None")]
+            parseable_indices = [idx for idx in indices if infos_dict["pred"][idx] not in (None, "", "None")]
+            parseable = [infos_dict["pred"][idx] for idx in parseable_indices]
             if parseable:
-                selected_pred = Counter(parseable).most_common(1)[0][0]
-                selected_idx = next(idx for idx in indices if infos_dict["pred"][idx] == selected_pred)
+                if strategy == "quality_weighted":
+                    selected_idx = self._select_validation_quality_weighted(
+                        indices=parseable_indices,
+                        infos_dict=infos_dict,
+                        logprob_beta=logprob_beta,
+                        clip_penalty=clip_penalty,
+                    )
+                else:
+                    selected_pred = Counter(parseable).most_common(1)[0][0]
+                    selected_idx = next(idx for idx in indices if infos_dict["pred"][idx] == selected_pred)
             else:
                 selected_idx = indices[0]
 
@@ -859,6 +897,42 @@ class RayPPOTrainer:
                     selected_infos[key].append(vals[selected_idx])
 
         return np.array(selected_sources), selected_inputs, selected_infos
+
+    def _select_validation_quality_weighted(self, indices, infos_dict, logprob_beta=1.0, clip_penalty=0.25):
+        """Choose a validation sample using only prediction clusters and rollout confidence."""
+        use_avg_logprob = "response_avg_logprob" in infos_dict
+        use_format = "format_score" in infos_dict
+        use_clip = "response_clip" in infos_dict
+
+        avg_logprobs = []
+        if use_avg_logprob:
+            avg_logprobs = [float(infos_dict["response_avg_logprob"][idx]) for idx in indices]
+            mean_logprob = float(np.mean(avg_logprobs))
+        else:
+            mean_logprob = 0.0
+
+        pred2score = defaultdict(float)
+        pred2best = {}
+        pred2count = Counter()
+        for local_pos, idx in enumerate(indices):
+            pred = infos_dict["pred"][idx]
+            pred2count[pred] += 1
+            quality = 1.0
+            if use_format:
+                quality *= max(float(infos_dict["format_score"][idx]), 0.0)
+            if use_avg_logprob:
+                quality *= float(np.exp(logprob_beta * (avg_logprobs[local_pos] - mean_logprob)))
+            if use_clip:
+                quality *= max(0.0, 1.0 - clip_penalty * float(infos_dict["response_clip"][idx]))
+
+            pred2score[pred] += quality
+            best = pred2best.get(pred)
+            best_quality = best[0] if best is not None else -1.0
+            if quality > best_quality:
+                pred2best[pred] = (quality, idx)
+
+        selected_pred = max(pred2score, key=lambda pred: (pred2score[pred], pred2count[pred], str(pred)))
+        return pred2best[selected_pred][1]
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1312,6 +1386,28 @@ class RayPPOTrainer:
                                         weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
                                         answer_sharpen_beta=self.config.ttrl.get("sps_answer_sharpen_beta", 1.0),
                                         answer_sharpen_capacity=self.config.ttrl.get("sps_answer_sharpen_capacity", False),
+                                        consistency_capacity=self.config.ttrl.get(
+                                            "sps_consistency_capacity", False
+                                        ),
+                                        consistency_disagreement_penalty=self.config.ttrl.get(
+                                            "sps_consistency_disagreement_penalty", 0.5
+                                        ),
+                                        low_budget_capacity=self.config.ttrl.get(
+                                            "sps_low_budget_capacity", False
+                                        ),
+                                        low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
+                                        low_budget_disagreement_penalty=self.config.ttrl.get(
+                                            "sps_low_budget_disagreement_penalty", 0.35
+                                        ),
+                                        base_support_capacity=self.config.ttrl.get(
+                                            "sps_base_support_capacity", False
+                                        ),
+                                        base_support_temperature=self.config.ttrl.get(
+                                            "sps_base_support_temperature", 1.0
+                                        ),
+                                        base_support_disagreement_penalty=self.config.ttrl.get(
+                                            "sps_base_support_disagreement_penalty", 0.35
+                                        ),
                                     )
                                 with marked_timer("sps_compute_reward", timing_raw):
                                     sps_reward_tensor, sps_info = compute_sps_reward(
@@ -1368,6 +1464,44 @@ class RayPPOTrainer:
                                 sps_info["sps/majority_sharp_confidence"] = float(
                                     batch.non_tensor_batch["sps_majority_sharp_confidence_list"].mean()
                                 )
+                                if "sps_consistency_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/consistency_capacity"] = float(
+                                        batch.non_tensor_batch["sps_consistency_capacity_list"].mean()
+                                    )
+                                if "sps_low_budget_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/low_budget_capacity"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_capacity_list"].mean()
+                                    )
+                                    sps_info["sps/low_budget_parseable_rate"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_parseable_rate_list"].mean()
+                                    )
+                                    sps_info["sps/low_budget_clip_rate"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_clip_rate_list"].mean()
+                                    )
+                                    sps_info["sps/low_budget_majority_ratio"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_majority_ratio_list"].mean()
+                                    )
+                                    sps_info["sps/low_budget_majority_mass"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_majority_mass_list"].mean()
+                                    )
+                                    sps_info["sps/low_budget_agreement"] = float(
+                                        batch.non_tensor_batch["sps_low_budget_agreement_list"].mean()
+                                    )
+                                if "sps_base_support_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/base_support_capacity"] = float(
+                                        batch.non_tensor_batch["sps_base_support_capacity_list"].mean()
+                                    )
+                                    sps_info["sps/base_support_majority_confidence"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_base_support_majority_confidence_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/base_support_top_confidence"] = float(
+                                        batch.non_tensor_batch["sps_base_support_top_confidence_list"].mean()
+                                    )
+                                    sps_info["sps/base_support_agreement"] = float(
+                                        batch.non_tensor_batch["sps_base_support_agreement_list"].mean()
+                                    )
                                 if sps_mode != "answer_rule_conf_weight":
                                     gen_batch_output = gen_batch_output.union(
                                         DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
@@ -1414,6 +1548,12 @@ class RayPPOTrainer:
                                             selection_priority=self.config.ttrl.get(
                                                 "sps_selection_priority", "score"
                                             ),
+                                            contrast_count=self.config.ttrl.get(
+                                                "sps_selection_contrast_count", 4
+                                            ),
+                                            contrast_min_cluster_ratio=self.config.ttrl.get(
+                                                "sps_selection_contrast_min_cluster_ratio", 0.5
+                                            ),
                                         )
                                         sps_info["sps/selected_parseable_rate"] = float(
                                             selection_info["parseable_rate"].mean()
@@ -1423,6 +1563,9 @@ class RayPPOTrainer:
                                         )
                                         sps_info["sps/selected_cluster_rate"] = float(
                                             selection_info["cluster_rate"].mean()
+                                        )
+                                        sps_info["sps/selected_contrast_rate"] = float(
+                                            selection_info["contrast_rate"].mean()
                                         )
                                         sps_info["sps/selection_fallback_rate"] = float(
                                             selection_info["fallback_rate"].mean()

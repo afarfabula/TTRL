@@ -7631,3 +7631,247 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - v41: `mean@4=0.6956740442655935`.
   - Lowering the training rollout/proposal temperature to `0.7` improved training speed and drove late training support to high internal sharpness (`answer_sharp_confidence` often `0.90+`, `majority_ratio` often `0.65-0.80`), but it did not improve final strict `best@4` or `mean@4`.
   - This suggests the remaining bottleneck is not just making the training distribution colder. The method needs a training-side signal that improves low-budget candidate correctness, not only majority concentration. A reasonable next algorithm step is to combine low-budget candidates with a correctness-oriented internal consistency test, e.g. require agreement between majority answer, weighted label confidence, and low-temperature/base support before increasing update weight.
+
+### 2026-07-06 v42 literature pass and plan: low-budget capacity for strict mean@4
+
+- Goal for this phase:
+  - Qwen2.5-Math-7B, 50 training steps.
+  - Strict final validation only: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`.
+  - Target `val-core/MATH-TTT/acc/mean@4 >= 0.85`.
+  - No validation-time answer selection, best-of, major vote, n=32 selection, or ground-truth selection can count as success.
+- Literature pass used for design, not as direct recipe copying:
+  - `arXiv:2504.16084` TTRL: Test-Time Reinforcement Learning. Baseline framing: majority pseudo labels can support unlabeled test-time RL, but the reward is only as good as the sampled terminal answer distribution.
+  - `arXiv:2505.21444` Can Large Reasoning Models Self-Train? Key caution: self-reward/self-training can improve reasoning, but prolonged self-reward can reward-hack or collapse; use conservative capacity rather than unbounded sharpening.
+  - `arXiv:2505.21493` Reinforcing General Reasoning without Verifiers. Relevant lens: verifier-free RL is distribution sharpening from internal signals; stability depends on not amplifying spurious consensus.
+  - `arXiv:2505.22660` Maximizing Confidence Alone Improves Reasoning. Entropy/confidence can be a dense unsupervised signal, but our v38/v41 failures show confidence alone is unsafe when it sharpens wrong clusters.
+  - `arXiv:2505.15134` The Unreasonable Effectiveness of Entropy Minimization in LLM Reasoning. Supports confidence/entropy as a useful training signal; v42 uses it only as a capacity component, not as the sole objective.
+  - `arXiv:2506.06395` Confidence Is All You Need: Few-Shot RL Fine-Tuning of Language Models. Supports self-confidence rewards, but v42 keeps majority pseudo labels and uses confidence to gate update strength.
+  - `arXiv:2506.01369` Incentivizing LLMs to Self-Verify Their Answers. Relevant principle: internal verification/confidence should be trained jointly with answer generation; v42 operationalizes this as agreement between low-budget samples and the global internal consensus.
+  - `arXiv:2502.06233` Confidence Improves Self-Consistency in LLMs. Supports weighting self-consistency by internal confidence to reduce sample budget. v42 translates this into train-time low-budget support metrics.
+  - `arXiv:2505.17454` Self-Training Large Language Models with Confident Reasoning. Supports confident reasoning selection, but v42 avoids validation-time selection and applies confidence only to prompt update capacity.
+  - `arXiv:2508.18395` Latent Self-Consistency for Reliable Majority-Set Selection. Supports the idea that answer-cluster consistency is more reliable than raw single samples, while also highlighting the gap between majority-set quality and individual sample quality.
+- Empirical motivation from our prior runs:
+  - v36 is the current best strict 20-step result: `mean@4=0.7037223340040242`, using sharpened answer-cluster capacity.
+  - v38/v39 showed that selecting/sharpening a cluster at rollout level can amplify self-consistent wrong answers; v38 collapsed to `mean@4=0.4507`, v39 only recovered to `0.5880`.
+  - v40/v41 showed that conservative capacity and lower sampling temperature improved internal sharpness and speed, but not strict candidate correctness. v41 ended at `mean@4=0.6957`, `best@4=0.8292`.
+  - Therefore the next signal should explicitly target the strict low-budget failure mode: whether the first `k=4` sampled answers already align with the global train-time majority/weighted support.
+- v42 algorithm:
+  - Keep v36/v40's conservative prompt-level path:
+    - majority pseudo label remains the training label;
+    - `ttrl.sps_answer_sharpen_capacity=True`;
+    - `ttrl.sps_consistency_capacity=True`;
+    - no rollout-level sharpened-cluster selection (`ttrl.sps_rollout_selection=first`);
+    - no validation-time selection.
+  - Add `sps_low_budget_capacity`:
+    - For each prompt, inspect only the first `sps_low_budget_k=4` train rollouts from the same generated group.
+    - Compute parseable rate, clip rate, low-budget majority ratio, low-budget majority mass on the global raw-majority answer, and whether the low-budget local majority agrees with the global raw majority.
+    - Capacity value:
+      - starts from `low_budget_majority_mass = count(first4 answer == global_majority) / 4`;
+      - if first4 local majority disagrees with global majority, multiply by `sps_low_budget_disagreement_penalty=0.35`;
+      - multiply by `low_budget_parseable_rate * (1 - low_budget_clip_rate)`.
+    - Final prompt train weight is capped by this value in addition to v40's consistency capacity.
+  - Rationale:
+    - This does not use Math500 labels.
+    - It does not select validation samples.
+    - It does not choose best-of or majority at validation time.
+    - It directly asks training to prioritize prompts where the low-budget distribution is already aligned enough to sharpen safely, avoiding v38-style wrong-cluster amplification.
+- Code changes prepared:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`:
+    - Adds `low_budget_capacity`, `low_budget_k`, and `low_budget_disagreement_penalty` to `apply_sps_weighted_ttrl_gt()`.
+    - Adds metrics:
+      - `sps_low_budget_parseable_rate_list`
+      - `sps_low_budget_clip_rate_list`
+      - `sps_low_budget_majority_ratio_list`
+      - `sps_low_budget_majority_mass_list`
+      - `sps_low_budget_agreement_list`
+      - `sps_low_budget_capacity_list`
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`:
+    - Wires the config keys into `apply_sps_weighted_ttrl_gt()`.
+    - Logs `train/sps/low_budget_*` metrics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`:
+    - Adds defaults with behavior off:
+      - `sps_low_budget_capacity: false`
+      - `sps_low_budget_k: 4`
+      - `sps_low_budget_disagreement_penalty: 0.35`
+  - Runner:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4.sh`.
+    - Uses the v41 CUDA/cuBLAS infra recipe:
+      - `setup_ttrl_cuda_env.sh`
+      - `check_cuda_compat_preflight.sh`
+      - GEMM smoke and loaded-library capture before training
+      - caches under `/tmp/ttrl_cache/qwen25_v42_lowbudget_capacity_strict_n4_50step`
+      - loopback Ray/c10d.
+    - Uses temperature `1.0` for both rollout and SPS proposal so logprob reuse is semantically valid:
+      - `ttrl.sps_reuse_rollout_log_probs_as_old=True`
+      - `ttrl.sps_reuse_base_log_probs_as_ref=True`
+    - Runs `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+- Static checks completed before GPU launch:
+  - `bash -n` passed for the v42 runner.
+  - `py_compile` passed for `ttrl_utils.py` and `ray_trainer.py`.
+- Expected diagnostic:
+  - If v42 is correct, `train/sps/low_budget_majority_mass`, `train/sps/low_budget_agreement`, and strict validation `mean@4` should rise together.
+  - If `train/sps/train_weight` collapses too low, the low-budget gate is too strict and the next variant should use this signal as a soft blend rather than a hard cap.
+  - If low-budget metrics improve but strict `mean@4` does not, the first-four train rollout order may not match validation distribution enough; next step should compute an auxiliary low-temp first4 group rather than reusing the first 4 of the 64 rollout support.
+
+### 2026-07-06 v42 result: low-budget capacity did not reach strict 85%
+
+- Run:
+  - Worker: `986493`, host `trial-301587284-trialrun-301587284-worker-0`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4.sh`.
+  - Model: `/opt/tiger/qwen2.5_math_7b` copied to `/tmp/qwen2_5_math_7b_local_v42_lowbudget_capacity_strict_n4_50step`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4_metrics.txt`.
+  - Ray TaskRunner log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4_ray_taskrunner.log`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4_proc_health.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v42_lowbudget_capacity_strict_n4_throughput_summary.txt`.
+- Strict validation result:
+  - `val-core/MATH-TTT/acc/mean@4=0.7193158953722334`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8222334004024144`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7336881287726358`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.02012072434607646`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9622736418511066`.
+  - This does not meet the strict `mean@4 >= 0.85` goal. `best@4` and `maj@4` are diagnostic only and do not count as success.
+- Step-50 internal metrics:
+  - `train/sps/weighted_label_confidence=0.780`.
+  - `train/sps/train_weight=0.685`.
+  - `train/sps/answer_sharp_confidence=0.965`.
+  - `train/sps/answer_effective_K=1.086`.
+  - `train/sps/majority_sharp_confidence=0.965`.
+  - `train/sps/consistency_capacity=0.965`.
+  - `train/sps/low_budget_capacity=0.727`.
+  - `train/sps/low_budget_parseable_rate=0.969`.
+  - `train/sps/low_budget_clip_rate=0.000`.
+  - `train/sps/low_budget_majority_ratio=0.781`.
+  - `train/sps/low_budget_majority_mass=0.750`.
+  - `train/sps/low_budget_agreement=0.875`.
+  - `train/pass@32=1.000`.
+  - `train/majority_ratio=0.760`.
+  - `train/ground_truth_reward=0.762`.
+- Timing:
+  - Non-validation training steps 2-49: average `timing_s/step=24.254`, average `perf/total_num_tokens=254641.604`, whole-machine throughput `10499.142 tokens/s`.
+  - Runner-generated steps 41-50 summary includes final validation step 50, so it is lower: average `timing_s/step=47.258`, `whole_machine_tokens_per_s=5013.149`.
+  - Step 50 includes validation: `timing_s/testing=234.559`, `timing_s/step=255.333`.
+- Infra health:
+  - Exit status `0`.
+  - Final `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_FINAL=96`.
+  - Final GPU snapshot mostly released memory, but one stale GPU process entry was recorded on GPU 6 (`pid=181171`, about `30266 MiB`). A later `ps -p 181171` did not find the process, so this looks like a transient/stale NVIDIA accounting entry rather than an active training process.
+  - This run again supports the current infra recipe: venv cu12.9 CUDA user-space libraries first, driver-aware compat preflight, loopback Ray/c10d, and caches under `/tmp/ttrl_cache/<exp>`.
+- Interpretation:
+  - v42 improved strict `mean@4` relative to the previous best 20-step strict run v36 (`0.7037 -> 0.7193`), but the comparison is confounded by the larger 50-step budget. It still falls far short of `0.85`, so it is not an algorithmic success and should not be committed as an improvement.
+  - The new low-budget gate behaved as intended internally: by step 50, first-4 support aligned strongly with the global majority (`low_budget_majority_mass=0.750`, `low_budget_agreement=0.875`) and updates were not collapsed (`train_weight=0.685`).
+  - The final strict metric only reached `0.7193`, while `best@4=0.8222` remains below `0.85`. This means the remaining bottleneck is not merely choosing the right one among 4 samples; even the best of 4 is still short. The training signal is making the model's sampled distribution sharper and more self-consistent, but it is not adding enough correctness information.
+  - Next algorithm direction should not simply further sharpen majority clusters. Better candidates:
+    - Use an internal verifier/self-check signal that can reject high-confidence wrong majority answers before capacity is increased.
+    - Use agreement between independent generation views, e.g. normal-temp first4 vs low-temp first4 or base-vs-updated support, as a do-no-harm gate.
+    - Treat low-budget capacity as a soft factor blended with correctness-oriented signals rather than the final cap by itself.
+    - Track whether `best@4` rises; if `best@4` remains around `82-83%`, strict `mean@4=85%` is impossible without improving candidate correctness, not just sample selection.
+
+### 2026-07-06 v43 plan: base-support capacity as an internal verifier
+
+- Motivation from v42:
+  - v42 reached high internal self-consistency by step 50:
+    - `train/sps/answer_sharp_confidence=0.965`.
+    - `train/sps/low_budget_majority_mass=0.750`.
+    - `train/sps/low_budget_agreement=0.875`.
+    - `train/majority_ratio=0.760`.
+  - Strict final metrics were still weak:
+    - `mean@4=0.7193158953722334`.
+    - `best@4=0.8222334004024144`.
+  - Therefore the next justified change is not more sharpening. The problem is high-confidence wrong or under-verified majority clusters.
+- Algorithm hypothesis:
+  - The base/ref model's relative log-probability support over answer clusters is a separate internal signal from sampled majority.
+  - If the sampled majority answer is also strongly supported by the base/ref answer-cluster distribution, it is safer to sharpen/update.
+  - If the sampled majority is high but the base/ref-supported top answer disagrees, the update should be capacity-limited because this is a high-risk self-consistent cluster.
+  - This is still fully unsupervised: it uses only sampled answers, rollout logprobs, ref/base logprobs, parseability, and clipping.
+- Code changes prepared:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`:
+    - Adds `base_support_capacity`, `base_support_temperature`, and `base_support_disagreement_penalty` to `apply_sps_weighted_ttrl_gt()`.
+    - For each prompt, clusters rollouts by extracted answer and computes `base_answer_scores = logsumexp(base_seq / base_support_temperature)` over each answer cluster.
+    - Computes `base_support_majority_confidence`, `base_support_top_confidence`, `base_support_agreement`, and `base_support_capacity`.
+    - When enabled, caps prompt train weight by `base_support_capacity`; if the base-supported top answer differs from raw majority, the majority confidence is multiplied by `sps_base_support_disagreement_penalty=0.35`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`:
+    - Wires the new config keys into `apply_sps_weighted_ttrl_gt()`.
+    - Logs `train/sps/base_support_*`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`:
+    - Adds defaults with behavior off:
+      - `sps_base_support_capacity: false`
+      - `sps_base_support_temperature: 1.0`
+      - `sps_base_support_disagreement_penalty: 0.35`
+  - Runner:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4.sh`.
+    - Same strict validation and infra recipe as v42.
+    - Adds:
+      - `ttrl.sps_base_support_capacity=True`
+      - `ttrl.sps_base_support_temperature=1.0`
+      - `ttrl.sps_base_support_disagreement_penalty=0.35`
+- Static checks completed:
+  - `bash -n` passed for the v43 runner.
+  - `py_compile` passed for `ttrl_utils.py` and `ray_trainer.py`.
+- Expected diagnostic:
+  - If the new signal is useful, `base_support_agreement` should be meaningfully below `1.0` on risky prompts and `train/sps/train_weight` should drop specifically where base/ref support rejects majority.
+  - A real improvement must show strict `mean@4` and preferably `best@4` rising, not only higher majority or sharper answer entropy.
+  - If `base_support_capacity` collapses train weight too far while `mean@4` does not improve, then base/ref support is too conservative as a hard cap and should be used as a soft blend instead.
+
+### 2026-07-06 v43 result: base-support capacity improves strict 50-step result but remains far below 85%
+
+- Run:
+  - Worker: `986493`, host `trial-301587284-trialrun-301587284-worker-0`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4.sh`.
+  - Model: `/opt/tiger/qwen2.5_math_7b` copied to `/tmp/qwen2_5_math_7b_local_v43_base_support_capacity_strict_n4_50step`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4_metrics.txt`.
+  - Ray TaskRunner log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4_ray_taskrunner.log`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4_proc_health.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v43_base_support_capacity_strict_n4_throughput_summary.txt`.
+- Strict validation contract verified in the TaskRunner config:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - No validation-time answer selection, best-of, majority-vote selection, n=32 selection, or ground-truth selection is counted as success.
+- Strict validation result:
+  - `val-core/MATH-TTT/acc/mean@4=0.7359154929577465`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8380925553319919`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7505513078470825`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.014587525150905433`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9668008048289738`.
+  - `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.08287958649148269`.
+  - This is the best current strict 50-step Qwen2.5-Math-7B result in this series, improving v42 `mean@4` by `+1.66pp` (`0.7193 -> 0.7359`) and `best@4` by `+1.59pp` (`0.8222 -> 0.8381`), but it is still far below the required `mean@4 >= 0.85`.
+- Step-50 internal metrics:
+  - `train/sps/weighted_label_confidence=0.782`.
+  - `train/sps/train_weight=0.577`.
+  - `train/sps/answer_sharp_confidence=0.969`.
+  - `train/sps/answer_effective_K=1.072`.
+  - `train/sps/majority_sharp_confidence=0.969`.
+  - `train/sps/consistency_capacity=0.969`.
+  - `train/sps/low_budget_capacity=0.695`.
+  - `train/sps/low_budget_parseable_rate=0.969`.
+  - `train/sps/low_budget_clip_rate=0.000`.
+  - `train/sps/low_budget_majority_ratio=0.750`.
+  - `train/sps/low_budget_majority_mass=0.719`.
+  - `train/sps/low_budget_agreement=0.875`.
+  - `train/sps/base_support_capacity=0.781`.
+  - `train/sps/base_support_majority_confidence=0.781`.
+  - `train/sps/base_support_top_confidence=0.781`.
+  - `train/sps/base_support_agreement=1.000`.
+  - `train/pass@32=1.000`.
+  - `train/majority_ratio=0.764`.
+  - `train/ground_truth_reward=0.781`.
+- Timing:
+  - Non-validation training steps 2-49: average `timing_s/step=24.802`, average `perf/total_num_tokens=253586.896`, whole-machine throughput `10224.522 tokens/s`.
+  - Non-validation steps 11-49: average `timing_s/step=24.153`, whole-machine throughput `10119.960 tokens/s`.
+  - Late non-validation steps 41-49: average `timing_s/step=24.128`, whole-machine throughput `9957.366 tokens/s`.
+  - Runner-generated steps 41-50 throughput summary includes final validation, so it is lower: average `timing_s/step=46.422`, `whole_machine_tokens_per_s=5048.546`.
+  - Step 50 includes validation: `timing_s/testing=225.862`, `timing_s/step=247.066`.
+- Infra health:
+  - Exit status `0`.
+  - Final `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_FINAL=102`.
+  - Final GPU snapshot mostly released memory; one stale/remaining GPU process entry was recorded on GPU 0 (`pid=217955`, about `28332 MiB`) and GPU 1/7 had small residual accounting. Check and clear before launching the next GPU experiment if those processes persist.
+  - The established infra recipe again worked: venv cu12.9 CUDA user-space libraries first, driver-aware compat preflight, loopback Ray/c10d, and caches under `/tmp/ttrl_cache/<exp>`.
+- Interpretation:
+  - v43 is a real improvement over v42 under the same 50-step strict-n4 budget and therefore should be committed as an improvement record.
+  - The improvement is modest and does not close the goal gap. Even `best@4=0.8381` is still below `0.85`, so the four low-budget validation samples still do not contain enough correct candidates.
+  - The base-support gate appears useful as a safety/capacity signal, but by late training it mostly agrees with the sampled majority (`base_support_agreement=1.000` at step 50, often `0.875-1.000` late). It is not a strong enough independent verifier to reject high-confidence wrong clusters by itself.
+  - The next algorithm should keep the v42/v43 conservative capacity stack but add a more discriminative internal correctness signal. Reasonable v44 directions:
+    - soft-blend base/ref support instead of a hard cap, and separately penalize prompts where base top support and low-budget first4 disagree;
+    - add an independent self-check/rephrase consistency view generated at low temperature for only a small subset of rollouts, using it as train-time capacity rather than validation-time selection;
+    - use answer-cluster margin rather than only top confidence, because v43 shows high confidence and high agreement can still be wrong.
+  - Goal is not complete: strict `mean@4=0.7359 < 0.85`.
