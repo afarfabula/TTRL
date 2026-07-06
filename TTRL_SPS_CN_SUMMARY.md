@@ -26,6 +26,10 @@
 | Qwen2.5-Math-7B 20-step | v33 | 20 | 同一套 v33 训练 + validation-time answer-cluster selection | `mean@4=83.10%` |
 | Qwen2.5-Math-7B 20-step strict | v35 | 20 | v33/v14 训练路径 + validation `n=4` + 禁用 answer selection | `mean@4=68.96%`, `best@4=82.20%`, `maj@4=71.37%` |
 | Qwen2.5-Math-7B 20-step strict | v36 | 20 | v35 + sharpened answer-cluster capacity | `mean@4=70.37%`, `best@4=83.00%`, `maj@4=72.27%` |
+| Qwen2.5-Math-7B 20-step strict | v38 | 20 | v36 + sharpened-cluster 训练期样本选择 | `mean@4=45.07%`, `best@4=66.33%`, `maj@4=46.85%` |
+| Qwen2.5-Math-7B 20-step strict | v39 | 20 | v38 + majority-guarded sharpened selection | `mean@4=58.80%`, `best@4=77.15%`, `maj@4=61.43%` |
+| Qwen2.5-Math-7B 20-step strict | v40 | 20 | 回到 v36 样本路径 + prompt-level consistency capacity | `mean@4=69.67%`, `best@4=83.13%`, `maj@4=71.69%` |
+| Qwen2.5-Math-7B 20-step strict | v41 | 20 | v40 + 训练 rollout/proposal 温度降到 0.7 + CUDA/cuBLAS infra 固化 | `mean@4=69.57%`, `best@4=82.92%`, `maj@4=72.02%` |
 
 v33 达成 Efficient Test-Time RL 目标：20 个训练 step 后，Qwen3-4B 在 Math500/MATH-TTT 上 `val-core/MATH-TTT/acc/mean@4=0.7907444668008048`，超过 75% 目标。Qwen3-4B seed sweep 的第一个有效 seed 达到 `0.8008048289738431`，随后因目标模型切换暂停。
 
@@ -62,3 +66,29 @@ v37 尚未启动：worker `984279` 登录后 `/proc/self` 和 `/proc/meminfo` �
 2026-07-05 晚间 H100 v38 首次启动没有进入训练。虽然 Ray GCS 已经连到 `127.0.0.1`，但 wrapper 没有覆盖 MLX 环境里的 `MY_HOST_IP=10.*`，verl 的 WorkerDict 会优先用 `MY_HOST_IP` 生成 c10d `MASTER_ADDR`，导致 `WorkerDict.__init__` 阶段卡在 `TCPStore`，GPU 一直空闲。已修正 v38 runner：强制 `MY_HOST_IP=127.0.0.1`、`MASTER_ADDR=127.0.0.1`，并把 `GLOO/NCCL/TP_SOCKET_IFNAME` 设为 `lo`，同时禁用 `NCCL_SOCKET_FAMILY`。这说明 Ray 自己走 loopback 不够，WorkerDict/c10d 的地址也必须走 loopback。
 
 修正后在 H100 worker `985239` 重跑 v38，loopback 设置已确认生效，Ray GCS 和 WorkerDict 报错里的 IP 都是 `127.0.0.1`。任务越过配置和数据集校验，随后在 `trainer.init_workers()` 的 `ref_policy_wg.init_model()` 阶段 WorkerDict actor 系统级死亡，同时 `/proc` 立即损坏为 `PROC_COUNT=0`，没有产生任何 training step 或 strict n=4 validation 结果。因此 v38 仍是 infra/procfs 失败，不是算法结果；`985239` 不能继续跑 Ray/psutil/CUDA 实验。
+
+2026-07-05 晚间新的 B200 worker `985258` 可用，健康检查通过：`/proc/self`、`/proc/meminfo` 正常，8 张 B200 空闲，driver `580.105.08`，compat conf 为空，`cuInit: 0`。用 v38 strict n=4 runner 完整跑完 20 step，训练和最终 validation 均成功，退出状态 0，跑完后 `/proc` 仍健康。
+
+v38 B200 strict n=4 最终结果很差：`mean@4=0.4507042253521127`，`best@4=0.6632555331991953`，`maj@4=0.46845472837022134`。内部指标显示训练期选择看起来很干净：`selected_parseable_rate=1.0`、`selected_clip_rate=0.0`、`answer_sharp_confidence=0.757`、`answer_effective_K=1.921`，但 strict validation 的候选质量反而塌了。这说明单纯强化 sharpened cluster 会把模型推向“自洽但错误”的答案簇，v38 不是提升方案，不能 commit 作为算法改进。
+
+下一步算法方向：不要继续加强 raw sharpened-cluster selection，而是在训练期加入保守 gating，要求 majority pseudo label、weighted-label confidence、answer entropy/effective_K、base support 等内部信号互相一致后才放大更新；对高置信但与 majority/weighted label 冲突的答案簇降权，避免错误簇被 20 step 快速锐化。
+
+v39 在同一 B200 worker `985258` 上完整跑完 20 step strict n=4，唯一算法改动是把 v38 的 `sps_selection_require_majority=False` 改成 `True`，即训练期 sharpened selection 必须优先落在 raw majority pseudo label 的答案簇内。结果从 v38 的 `mean@4=45.07%` 恢复到 `58.80%`，`best@4` 从 `66.33%` 恢复到 `77.15%`，说明 v38 的确有错误簇放大问题。但 v39 仍低于 v35/v36 的 strict baseline，不能作为提升方案。
+
+v39 的内部指标：`selected_parseable_rate=1.0`，`selected_clip_rate=0.008`，`selected_cluster_rate=0.699`，`selection_fallback_rate=0.0`，`answer_sharp_confidence=0.777`。这说明 majority guard 生效且没有退化成 fallback，但 rollout-level support projection 仍然太激进。下一步应回到接近 v36 的样本选择，只在 prompt-level 做更保守的 capacity / do-no-harm gate：当 `majority_ratio`、`weighted_label_confidence`、`majority_sharp_confidence` 互相冲突时降低整题更新强度，而不是强行挑 32 条 rollout 锐化。
+
+v39 退出状态为 0，但训练结束后 worker `985258` 的 `/proc` 再次损坏：`PROC_SELF_BAD_AFTER`、`PROC_MEMINFO_BAD_AFTER`、`PROC_COUNT_AFTER=0`。这个 worker 不能再继续跑 Ray/psutil/CUDA 训练，后续实验必须换健康 worker 或重启。
+
+v40 在新 B200 worker `985302` 上完成 20 step strict n=4。设计是回到 v36 的 `sps_rollout_selection=first`，不再做 v38/v39 的 rollout-level projection，只新增 prompt-level consistency capacity：当 majority answer 在 sharpened answer distribution 里的置信度低时，降低整题训练权重；如果 SPS weighted answer 和 raw majority answer 不一致，再乘 `sps_consistency_disagreement_penalty=0.35`。这样把“分布锐化”用于保守控制更新容量，而不是强行挑 rollout。
+
+v40 结果：`mean@4=0.6966800804828974`，`best@4=0.8312957746478873`，`maj@4=0.7168913480885312`。它略高于 v35 strict baseline 的 `68.96%`，但低于当前最好 v36 的 `70.37%`，因此不是算法提升，也不能作为达标方案。内部指标说明 consistency capacity 生效：step20 `answer_sharp_confidence=0.849`，`majority_sharp_confidence=0.849`，`consistency_capacity=0.849`，`majority_ratio=0.574`，`pass@32=0.875`，clip ratio 降到 `0.074`；但 strict `best@4` 仍只有 `83.13%`，说明 4 条 validation rollout 的候选质量仍不足。
+
+v40 跑完后 worker `985302` 的 `/proc` 再次损坏：`PROC_SELF_BAD_AFTER`、`PROC_MEMINFO_BAD_AFTER`、`PROC_COUNT_AFTER=0`。这个 worker 不能继续跑 Ray/psutil/CUDA 训练。
+
+当前最好 strict n=4 20-step 结果仍是 v36：`mean@4=70.37%`，相比 v35 strict baseline `68.96%` 提升 `+1.41pp`。下一步算法不能再靠 validation-time selection；应利用 v40 暴露的现象，把高 `pass@32` 但低 `best@4/mean@4` 的差距转化为训练侧低预算候选质量目标，例如提高前几条样本对 majority/parseable answer 的概率质量，同时保留保守 capacity gate。
+
+v41 已在 B200 worker `986493` 上完成。infra 侧结论是正向的：训练前后 `/proc/self` 和 `/proc/meminfo` 都正常，`cuInit=0`，8 张 GPU 退出后显存回到 `0 MiB`，没有 Ray/TTRL 残留进程。新 helper `verl/examples/ttrl/setup_ttrl_cuda_env.sh` 会把 venv 内 cu12.9 的 cuBLAS、cuDNN、NCCL、cuDART、NVRTC、cuSolver、cuSparse、nvJitLink 等库放到 `LD_LIBRARY_PATH` 最前面，并把 Ray/HF/torch/vLLM/Triton/TorchInductor 缓存放到 `/tmp/ttrl_cache/<exp>`。配合 `check_cuda_compat_preflight.sh` 的 driver-version compat 规则后，GEMM smoke、1-step TTRL smoke、20-step TTRL+validation 都正常完成。这是目前支持“混合 CUDA/cuBLAS 依赖会污染启动环境”假设的最强缓解证据，但还不能证明全局根因。
+
+v41 算法侧不是提升。它把训练 rollout 温度和 `sps_proposal_temperature` 从 `1.0` 降到 `0.7`，同时由于低温语义不允许复用温度 1.0 下的 logprob，实际配置关闭了 `sps_reuse_rollout_log_probs_as_old` 和 `sps_reuse_base_log_probs_as_ref`。最终 strict validation 仍保持 `n=4` 且禁用 answer selection，结果为 `mean@4=69.57%`、`best@4=82.92%`、`maj@4=72.02%`，低于当前最好 v36 的 `mean@4=70.37%`。低温训练提高了速度和内部分布锐化，但没有提升最终 4 条低预算样本的正确率。
+
+v41 性能记录：1-step smoke 为 `34.271s/step`、约 `7913.8 tokens/s`；20-step 完整训练中非 validation 步骤 2-19 平均 `26.518s/step`、约 `9456.1 tokens/s`，步骤 11-19 平均 `24.706s/step`、约 `9524.3 tokens/s`。根盘只有约 `14G` 空余，但当前约束是不作为训练 gate，只记录；缓存和临时目录均落到 `/tmp`。

@@ -7187,3 +7187,447 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
   - The remaining failure is a lower-level WorkerDict/Ray worker process death coupled with immediate procfs disappearance on the MLX worker.
   - Do not continue using worker `985239` for Ray/psutil/CUDA experiments.
   - v38 remains an infra failure, not an algorithm result; it cannot be used to judge the strict-n4 v37/v38 algorithm.
+
+### 2026-07-05 B200 v38 completed strict-n4 result: clean infra, algorithm regressed
+
+- User provided a fresh 8x B200 worker, and it was checked before use:
+  - Worker id `985258`.
+  - Host `trial-301565356-trialrun-301565356-worker-0`.
+  - `/proc/self` and `/proc/meminfo` present, `PROC_COUNT=82` at the latest check.
+  - 8x `NVIDIA B200`, all visible and idle.
+  - Driver `580.105.08`.
+  - Because driver is >=580, CUDA 12.9 compat config files must stay empty. They were empty.
+  - `cuInit: 0`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v38_lean_strict_n4.sh`.
+  - Local model source `/opt/tiger/qwen2.5_math_7b`.
+  - Worker-local model copy `/tmp/qwen2_5_math_7b_local_v38_lean_strict_n4_20step`.
+- Important config:
+  - `trainer.total_training_steps=20`.
+  - `trainer.test_freq=20`.
+  - `trainer.val_before_train=False`.
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - `actor_rollout_ref.rollout.gpu_memory_utilization=0.75`.
+  - Lean Ray/c10d loopback:
+    - `+ray_init.no_runtime_env=True`.
+    - `+ray_init.include_dashboard=False`.
+    - `+ray_init.node_ip_address=127.0.0.1`.
+    - `MY_HOST_IP=127.0.0.1`, `MASTER_ADDR=127.0.0.1`.
+    - `GLOO_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo`, `TP_SOCKET_IFNAME=lo`.
+    - `NCCL_SOCKET_FAMILY` unset.
+  - Algorithm switches:
+    - `ttrl.sps_answer_sharpen_capacity=True`.
+    - `ttrl.sps_rollout_selection=sharpened_cluster`.
+    - `ttrl.sps_selection_priority=nonclip_parseable_bucket`.
+    - `ttrl.sps_selection_temperature=0.4`.
+    - `ttrl.sps_selection_require_majority=False`.
+    - `ttrl.sps_selection_cluster_bonus=1.0`.
+    - `ttrl.sps_selection_parseable_bonus=3.0`.
+    - `ttrl.sps_selection_nonclip_bonus=4.0`.
+    - `ttrl.sps_reuse_rollout_log_probs_as_old=True`.
+    - `ttrl.sps_reuse_base_log_probs_as_ref=True`.
+- Result artifacts:
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v38_lean_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v38_lean_strict_n4_metrics.txt`.
+  - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v38_lean_strict_n4_proc_health.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v38_lean_strict_n4_throughput_summary.txt`.
+- Run completed:
+  - Status `0`.
+  - Reached `training/global_step=20`.
+  - Post-run `/proc` stayed healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=90`.
+- Strict validation result:
+  - `val-core/MATH-TTT/acc/mean@4=0.4507042253521127`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.6632555331991953`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.46845472837022134`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9622736418511066`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.056841046277665994`.
+  - `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.11793854818899574`.
+- Step-20 internal metrics:
+  - `train/sps/weighted_label_confidence=0.373`.
+  - `train/sps/answer_sharp_confidence=0.757`.
+  - `train/sps/answer_effective_K=1.921`.
+  - `train/sps/majority_sharp_confidence=0.697`.
+  - `train/sps/selected_parseable_rate=1.000`.
+  - `train/sps/selected_clip_rate=0.000`.
+  - `train/sps/selected_cluster_rate=0.613`.
+  - `train/sps/train_weight=0.604`.
+  - `train/label_accuracy=0.625`.
+  - `train/reward_accuracy=0.359`.
+  - `train/majority_voting_reward=0.432`.
+  - `train/ground_truth_reward=0.508`.
+  - `train/pass@32=0.875`.
+  - `train/majority_ratio=0.311`.
+- Timing:
+  - Step 1 `timing_s/step=33.194`, `perf/total_num_tokens=251861`, `perf/throughput=948.434`.
+  - Step 10 `timing_s/step=24.621`, `perf/total_num_tokens=269086`, `perf/throughput=1366.130`.
+  - Step 19 `timing_s/step=22.549`, `perf/total_num_tokens=238656`, `perf/throughput=1322.976`.
+  - Step 20 includes final validation: `timing_s/testing=231.374`, `timing_s/step=256.812`.
+  - Throughput summary over steps 11-20 includes validation step 20: average `timing_s/step=48.341`, `whole_machine_tokens_per_s=4920.120`; pure training steps were closer to the mid-20 second range.
+- Interpretation:
+  - This is the first clean B200 end-to-end strict `n=4` v38 run, so the loopback/no-runtime-env infra path is usable on B200.
+  - Algorithmically, v38 is a regression versus strict v35/v36 (`mean@4=68.96%/70.37%`).
+  - The unsupervised training-side cluster signals looked confident (`answer_sharp_confidence=0.757`, `selected_parseable_rate=1.0`, `selected_clip_rate=0.0`), but strict validation candidate quality collapsed (`best@4=66.33%`).
+  - The next algorithmic change should not further strengthen raw sharpened-cluster selection. It should add a conservative guard against self-consistent wrong clusters, using only internal signals such as agreement between majority pseudo-label and sharpened cluster, weighted-label confidence, entropy/effective-K, and possibly base-model support. Ground truth remains diagnostic only.
+
+### 2026-07-05 v39 plan: majority-guarded sharpened support projection
+
+- Reason from v38 internal metrics:
+  - v38 proved that parseable/non-clipped sharpened-cluster selection can be internally confident while still collapsing strict `best@4`.
+  - The likely failure is high-confidence but wrong answer clusters being amplified during the 20-step update window.
+  - A conservative next test should keep the support projection benefits, but require agreement with the raw majority pseudo label before the selected cluster can dominate training.
+- Implementation:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4.sh`.
+  - It is based on v38 and keeps the same strict validation constraints:
+    - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+    - `trainer.validation_answer_selection_enable=False`.
+    - `trainer.total_training_steps=20`.
+    - `trainer.test_freq=20`.
+    - local model `/opt/tiger/qwen2.5_math_7b`, copied to `/tmp/qwen2_5_math_7b_local_v39_majority_guard_strict_n4_20step`.
+  - The only algorithmic change versus v38 is:
+    - v38: `ttrl.sps_selection_require_majority=False`.
+    - v39: `ttrl.sps_selection_require_majority=True`.
+  - Existing `select_sharpened_cluster_per_prompt()` already implements this guard: when the majority cluster exists, selection is restricted to that answer cluster before applying nonclip/parseable/quality ranking; if no majority-cluster candidate is available, it falls back rather than dropping the prompt.
+- Expected diagnostic:
+  - If v38 failed because of wrong non-majority cluster amplification, v39 should recover strict `best@4` and `mean@4` toward v36 while preserving high parseable and low clip rates.
+  - If v39 still collapses, the problem is not only non-majority cluster selection; the next direction should gate prompt-level update capacity by disagreement/entropy rather than only constraining selected rollouts.
+
+### 2026-07-05 B200 v39 completed strict-n4 result: majority guard partially recovers v38, still below strict baseline
+
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4.sh`.
+  - Worker `985258`, same B200 worker used for the clean v38 run.
+  - Pre-run health was good:
+    - `/proc/self` OK.
+    - `/proc/meminfo` OK.
+    - `PROC_COUNT=82`.
+    - 8x `NVIDIA B200` idle.
+    - Driver `580.105.08`.
+    - `cuInit: 0`.
+- Strict goal-relevant config:
+  - Local model source `/opt/tiger/qwen2.5_math_7b`.
+  - Worker-local model copy `/tmp/qwen2_5_math_7b_local_v39_majority_guard_strict_n4_20step`.
+  - `trainer.total_training_steps=20`.
+  - `trainer.test_freq=20`.
+  - `trainer.val_before_train=False`.
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - Lean loopback Ray/c10d settings inherited from v38.
+- Algorithm delta versus v38:
+  - v38 used `ttrl.sps_selection_require_majority=False`.
+  - v39 used `ttrl.sps_selection_require_majority=True`.
+  - Everything else was intentionally kept as close as possible to v38 to isolate the majority-guard effect.
+- Result artifacts:
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4_metrics.txt`.
+  - Ray task log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4_throughput_summary.txt`.
+  - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v39_majority_guard_strict_n4_proc_health.txt`.
+- Run status:
+  - Training and strict validation completed with status `0`.
+  - Reached `training/global_step=20`.
+  - After exit, the MLX worker procfs broke again:
+    - `PROC_SELF_BAD_AFTER`.
+    - `PROC_MEMINFO_BAD_AFTER`.
+    - `PROC_COUNT_AFTER 0`.
+    - Final snapshot also `PROC_COUNT_FINAL 0`.
+  - Do not run more Ray/psutil/CUDA training on worker `985258`; it must be replaced/restarted before any further GPU experiment.
+- Strict validation result:
+  - `val-core/MATH-TTT/acc/mean@4=0.5880281690140845`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.7715452716297786`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.6142736418511066`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9617706237424547`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.05533199195171026`.
+  - `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.09816357374057301`.
+- Step-20 internal metrics:
+  - `train/sps/weighted_label_confidence=0.485`.
+  - `train/sps/answer_sharp_confidence=0.777`.
+  - `train/sps/answer_effective_K=2.966`.
+  - `train/sps/majority_sharp_confidence=0.732`.
+  - `train/sps/selected_parseable_rate=1.000`.
+  - `train/sps/selected_clip_rate=0.008`.
+  - `train/sps/selected_cluster_rate=0.699`.
+  - `train/sps/selection_fallback_rate=0.000`.
+  - `train/sps/train_weight=0.655`.
+  - `train/label_accuracy=0.750`.
+  - `train/reward_accuracy=0.293`.
+  - `train/majority_voting_reward=0.571`.
+  - `train/ground_truth_reward=0.652`.
+  - `train/pass@32=0.875`.
+  - `train/majority_ratio=0.422`.
+- Timing:
+  - Step 1 `timing_s/step=31.791`, `perf/total_num_tokens=255108`, `perf/throughput=1003.056`.
+  - Step 19 `timing_s/step=22.060`, `perf/total_num_tokens=222065`, `perf/throughput=1258.280`.
+  - Step 20 includes validation: `timing_s/testing=233.480`, `timing_s/step=259.845`.
+  - Throughput summary over steps 11-20 includes validation step 20: average `timing_s/step=48.433`, `whole_machine_tokens_per_s=4879.205`.
+- Interpretation:
+  - Majority guard did what it was intended to do relative to v38: it prevented complete wrong-cluster collapse and recovered `mean@4` from `45.07%` to `58.80%`, and `best@4` from `66.33%` to `77.15%`.
+  - However, v39 is still worse than strict v35/v36 (`68.96%/70.37% mean@4`) and far below the goal `>85%`.
+  - The failure is therefore not only non-majority cluster selection. Even when selected rollout support is parseable, non-clipped, and majority guarded (`selected_parseable_rate=1.0`, `selected_clip_rate=0.008`, `selection_fallback_rate=0.0`), 20-step updates still degrade strict candidate quality versus v36.
+  - Do not commit v39 as an algorithm improvement. Keep it as a documented negative/diagnostic result.
+  - Next algorithmic direction should be more conservative than v39:
+    - avoid selecting/sharpening 32 train rollouts aggressively when prompt-level confidence is mixed;
+    - gate or downweight the whole prompt when `majority_ratio`, `weighted_label_confidence`, and `majority_sharp_confidence` disagree;
+    - consider returning closer to v36 sample selection while adding a prompt-level "do no harm" capacity gate instead of stronger rollout-level projection.
+
+### 2026-07-05 v40 plan: return to v36 selection, add prompt-level consistency capacity
+
+- Motivation:
+  - v38 and v39 both show that rollout-level sharpened support projection is too aggressive for the 20-step strict-n4 objective on Qwen2.5-Math-7B.
+  - v39 recovered part of v38 by requiring selected rollouts to match the raw majority pseudo label, but still underperformed v36.
+  - Therefore the next test should keep the v36 sample path (`sps_rollout_selection=first`) and only make prompt-level update capacity more conservative.
+- Code change:
+  - `verl/verl/trainer/ppo/ttrl_utils.py`:
+    - Added optional `consistency_capacity` and `consistency_disagreement_penalty` arguments to `apply_sps_weighted_ttrl_gt()`.
+    - Default behavior is unchanged.
+    - When enabled, the prompt update weight is capped by `majority_sharp_confidence`.
+    - If SPS weighted answer disagrees with the raw majority answer, this capacity is further multiplied by `consistency_disagreement_penalty`.
+    - Added `sps_consistency_capacity_list` to `batch.non_tensor_batch` for metrics.
+  - `verl/verl/trainer/ppo/ray_trainer.py`:
+    - Wires config keys `ttrl.sps_consistency_capacity` and `ttrl.sps_consistency_disagreement_penalty` into `apply_sps_weighted_ttrl_gt()`.
+    - Logs `train/sps/consistency_capacity`.
+  - `verl/verl/trainer/config/ppo_trainer_ttrl.yaml`:
+    - Added defaults:
+      - `sps_consistency_capacity: false`.
+      - `sps_consistency_disagreement_penalty: 0.5`.
+- Runner prepared:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4.sh`.
+  - Based on the B200-safe v38 wrapper:
+    - local model `/opt/tiger/qwen2.5_math_7b`, copied to `/tmp/qwen2_5_math_7b_local_v40_consistency_capacity_strict_n4_20step`;
+    - B200 CUDA compat preflight;
+    - loopback Ray/c10d settings;
+    - strict validation `actor_rollout_ref.rollout.val_kwargs.n=4`;
+    - `trainer.validation_answer_selection_enable=False`;
+    - `trainer.total_training_steps=20`, `trainer.test_freq=20`, `trainer.val_before_train=False`.
+  - Algorithm settings:
+    - `ttrl.sps_answer_sharpen_capacity=True`.
+    - `ttrl.sps_consistency_capacity=True`.
+    - `ttrl.sps_consistency_disagreement_penalty=0.35`.
+    - `ttrl.sps_rollout_selection=first`.
+    - `ttrl.sps_reuse_rollout_log_probs_as_old=True`.
+    - `ttrl.sps_reuse_base_log_probs_as_ref=True`.
+- Validation before running:
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4.sh` passed.
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` passed.
+  - The v40 runner has no leftover `v38`/`r38` identifiers.
+- Current blocker:
+  - Worker `985258` is no longer usable because v39 completed with status 0 but broke procfs on exit:
+    - `PROC_SELF_BAD_AFTER`.
+    - `PROC_MEMINFO_BAD_AFTER`.
+    - `PROC_COUNT_AFTER 0`.
+  - Do not run v40 on this worker.
+  - Next GPU action requires a fresh/restarted healthy worker, then run the standard preflight before starting v40.
+
+### 2026-07-05 B200 v40 completed strict-n4 result: conservative consistency capacity does not beat v36
+
+- Run context:
+  - Worker `985302`, 8x `NVIDIA B200`.
+  - Host `trial-301565874-trialrun-301565874-worker-0`.
+  - Pre-run health was good:
+    - `/proc/self` OK.
+    - `/proc/meminfo` OK.
+    - `PROC_COUNT_BEFORE 74` inside the wrapper.
+    - Driver `580.105.08`.
+    - B200 CUDA compat preflight cleared stale compat conf and verified `cuInit: 0`.
+  - Local model source `/opt/tiger/qwen2.5_math_7b`.
+  - Worker-local copy `/tmp/qwen2_5_math_7b_local_v40_consistency_capacity_strict_n4_20step`.
+- Strict goal-relevant config:
+  - `trainer.total_training_steps=20`.
+  - `trainer.test_freq=20`.
+  - `trainer.val_before_train=False`.
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - `ttrl.sps_rollout_selection=first`.
+  - `ttrl.sps_answer_sharpen_capacity=True`.
+  - `ttrl.sps_consistency_capacity=True`.
+  - `ttrl.sps_consistency_disagreement_penalty=0.35`.
+  - `ttrl.sps_reuse_rollout_log_probs_as_old=True`.
+  - `ttrl.sps_reuse_base_log_probs_as_ref=True`.
+  - Loopback Ray/c10d settings were active: `MY_HOST_IP=127.0.0.1`, `MASTER_ADDR=127.0.0.1`, `GLOO/NCCL/TP_SOCKET_IFNAME=lo`, `+ray_init.no_runtime_env=True`, `+ray_init.include_dashboard=False`, `+ray_init.node_ip_address=127.0.0.1`.
+- Result artifacts:
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4_metrics.txt`.
+  - Ray task log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4_throughput_summary.txt`.
+  - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v40_consistency_capacity_strict_n4_proc_health.txt`.
+- Run status:
+  - Training and strict validation completed with status `0`.
+  - Reached `training/global_step=20`.
+  - After exit, worker `985302` procfs broke:
+    - `PROC_SELF_BAD_AFTER`.
+    - `PROC_MEMINFO_BAD_AFTER`.
+    - `PROC_COUNT_AFTER 0`.
+    - Final snapshot also has `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL 0`.
+  - Do not run more Ray/psutil/CUDA training on `985302`; the next GPU experiment requires a fresh/restarted healthy worker.
+- Strict validation result:
+  - `val-core/MATH-TTT/acc/mean@4=0.6966800804828974`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8312957746478873`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7168913480885312`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9652917505030181`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.036720321931589535`.
+  - `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.08356195938411792`.
+- Step-20 internal metrics:
+  - `train/sps/weighted_label_confidence=0.593`.
+  - `train/sps/agreement_rate=1.000`.
+  - `train/sps/train_weight=0.773`.
+  - `train/sps/answer_sharp_confidence=0.849`.
+  - `train/sps/answer_effective_K=2.186`.
+  - `train/sps/majority_sharp_confidence=0.849`.
+  - `train/sps/consistency_capacity=0.849`.
+  - `train/label_accuracy=0.750`.
+  - `train/reward_accuracy=0.441`.
+  - `train/majority_voting_reward=0.481`.
+  - `train/ground_truth_reward=0.496`.
+  - `train/pass@32=0.875`.
+  - `train/majority_ratio=0.574`.
+  - `response_length/clip_ratio=0.074`.
+- Timing:
+  - Step 1 `timing_s/step=32.874`, `perf/total_num_tokens=294321`.
+  - After warmup, non-validation steps were mostly `22-28s` per step.
+  - Step 20 includes final validation: `timing_s/testing=234.309`, `timing_s/step=257.980`.
+  - Throughput summary over steps 11-20 includes validation step 20: average `timing_s/step=47.384`, `whole_machine_tokens_per_s=5424.113`.
+  - Excluding validation, the warm section reaches roughly `10k-12k` whole-machine tokens/s by `perf/total_num_tokens / timing_s/step` on multiple steps.
+- Interpretation:
+  - v40 is close to v36 but is not an improvement under the strict goal metric:
+    - v35 strict baseline: `mean@4=0.6896378269617707`.
+    - v36 best strict run: `mean@4=0.7037223340040242`.
+    - v40: `mean@4=0.6966800804828974`.
+  - The conservative consistency capacity did what it was designed to do internally: late steps show high sharpened confidence and consistency capacity (`answer_sharp_confidence` around `0.85-0.93`, `consistency_capacity` around `0.85-0.93`) with lower clip ratio than v35/v36.
+  - However, strict `mean@4` stayed below v36 while `best@4=83.13%` remains below the target `85%`. This means the remaining gap is not just update-capacity safety; the four validation samples still do not contain enough correct candidates.
+  - Do not commit v40 as an algorithm improvement. Keep the code as a documented experimental mechanism, but the current best strict-n4 20-step result remains v36.
+  - Next algorithmic direction should be justified by the v40 internal pattern:
+    - train-time support has high `pass@32` but validation `best@4` is only `83.13%`, so the goal needs candidate-quality improvement at low sample count, not more validation-time selection;
+    - late training `majority_ratio` improves to about `0.57-0.66` but is still not enough for `mean@4>85%`;
+    - a plausible next step is to add a training-side low-budget consistency objective or auxiliary reward that explicitly increases the probability mass of the majority/parseable answer under the first few samples, while retaining v36/v40's conservative capacity gates.
+
+### 2026-07-06 v41 plan: align train sampling temperature with strict low-budget validation
+
+- Motivation from v40:
+  - v40's training internals improved late in training (`answer_sharp_confidence` around `0.85-0.93`, `majority_ratio` around `0.57-0.66`, lower clip ratio), but final strict `best@4=0.8313` remained below the `0.85` target.
+  - The train-time support still showed high `pass@32` (`0.875-1.0` on many steps), so the issue is not only whether a correct answer exists in a wide 32-sample support. The strict metric needs the model's first 4 low-temperature samples to be better.
+  - Therefore v41 should not add validation-time selection or rollout-level projection. It should make the training sampling distribution closer to final validation and ask the update to improve that low-budget distribution directly.
+- Single intended algorithm change versus v40:
+  - Lower training rollout temperature from `1.0` to `0.7`.
+  - Set `ttrl.sps_proposal_temperature=0.7` consistently with the training rollout distribution.
+  - Keep final validation unchanged: strict `actor_rollout_ref.rollout.val_kwargs.n=4`, validation temperature inherited from the base runner as `0.6`, and `trainer.validation_answer_selection_enable=False`.
+- Everything else stays as close as possible to v40:
+  - Local model source `/opt/tiger/qwen2.5_math_7b`.
+  - `trainer.total_training_steps=20`, `trainer.test_freq=20`, `trainer.val_before_train=False`.
+  - `ttrl.sps_rollout_selection=first`.
+  - `ttrl.sps_answer_sharpen_capacity=True`.
+  - `ttrl.sps_consistency_capacity=True`.
+  - `ttrl.sps_consistency_disagreement_penalty=0.35`.
+  - `ttrl.sps_reuse_rollout_log_probs_as_old=True`.
+  - `ttrl.sps_reuse_base_log_probs_as_ref=True`.
+  - Loopback Ray/c10d settings from v40.
+- Runner prepared:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4.sh`.
+- Expected diagnostic:
+  - If v41 is directionally correct, strict `best@4` should improve beyond v40/v36, and `mean@4` should improve without any validation-time answer selection.
+  - If `pass@32` or `majority_ratio` collapses, the lowered training temperature is too exploitative for 20-step adaptation and the next direction should use a separate low-budget auxiliary batch instead of changing the main exploration distribution.
+- Current blocker:
+  - Worker `985302` broke procfs after v40 (`PROC_COUNT_AFTER 0`) and must not be used for v41.
+  - v41 can only run after a fresh/restarted healthy worker passes `/proc`, `nvidia-smi`, and CUDA `cuInit` checks.
+
+### 2026-07-06 B200 CUDA/cuBLAS infra validation and v41 strict-n4 result
+
+- Run context:
+  - Worker `986493`, host `trial-301587284-trialrun-301587284-worker-0`, 8x `NVIDIA B200`.
+  - Driver `580.105.08`, CUDA `cuInit: 0`.
+  - Pre-run health was good: `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_BEFORE 80/83` inside the smoke/full wrappers.
+  - Root disk was still only `14G` free, but this is no longer a hard gate per the latest user instruction. `/tmp` had about `3.0T` free and all caches/Ray tmp/model copy were placed under `/tmp`.
+- CUDA/cuBLAS dependency finding:
+  - `ldconfig` still reports many empty mixed-version NVIDIA libraries under `/lib/x86_64-linux-gnu`, including 535/570/580 variants such as empty `libcuda.so.535.*`, `libcuda.so.570.*`, `libcuda.so.580.126.20`, and many `libnvidia-*` files. This remains strong evidence for the "mixed CUDA/cuBLAS dependency can poison startup" hypothesis.
+  - New helper: `/opt/tiger/TTRL/verl/examples/ttrl/setup_ttrl_cuda_env.sh`.
+  - The helper prepends venv cu12.9 user-space libraries to `LD_LIBRARY_PATH`:
+    - `nvidia/nvjitlink/lib`
+    - `nvidia/cublas/lib`
+    - `nvidia/cuda_runtime/lib`
+    - `nvidia/cudnn/lib`
+    - `nvidia/nccl/lib`
+    - `nvidia/cuda_nvrtc/lib`
+    - `nvidia/cusolver/lib`
+    - `nvidia/cusparse/lib`
+    - `nvidia/cuda_cupti/lib`
+  - It also redirects `TMPDIR`, HF/torch/XDG/vLLM/Triton/TorchInductor caches to `/tmp/ttrl_cache/<exp>`.
+  - Driver compat remains handled by `/opt/tiger/TTRL/verl/examples/ttrl/check_cuda_compat_preflight.sh`: driver `>=580` clears cuda compat conf; driver `<580` enables `/usr/local/cuda-12.9/compat`.
+  - Verified by `ldd libtorch_cuda.so` and actual GEMM process `/proc/<pid>/maps`:
+    - `libcuda.so.580.105.08` from `/usr/lib/x86_64-linux-gnu`.
+    - `libcublas.so.12`, `libcublasLt.so.12`, `libcudnn.so.9`, `libnccl.so.2`, `libnvJitLink.so.12`, `libcudart.so.12` from `/opt/tiger/modelchef/.venv/lib/python3.11/site-packages/nvidia/...`.
+  - GEMM smoke succeeded in both the 1-step smoke wrapper and the 20-step wrapper, and `/proc` stayed healthy afterward.
+- v41 runner semantic correction:
+  - Low-temperature v41 uses `actor_rollout_ref.rollout.temperature=0.7` and `ttrl.sps_proposal_temperature=0.7`.
+  - The original plan's old-logprob/ref reuse settings were invalid under this low-temperature distribution.
+  - Actual runnable config:
+    - `ttrl.sps_reuse_rollout_log_probs_as_old=False`.
+    - `ttrl.sps_reuse_base_log_probs_as_ref=False`.
+  - These are required by the semantic guards in `verl/trainer/ppo/ray_trainer.py`; reusing rollout logprobs as old logprobs or base logprobs as ref logprobs is only semantics-preserving at temperature `1.0`.
+- Smoke artifacts:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_1step_v41_cublas_smoke.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_1step_v41_cublas_smoke.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_1step_v41_cublas_smoke_metrics.txt`.
+  - Ray task log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_1step_v41_cublas_smoke_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_1step_v41_cublas_smoke_throughput_summary.txt`.
+  - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_1step_v41_cublas_smoke_proc_health.txt`.
+  - Result:
+    - Status `0`.
+    - Step 1 completed.
+    - `timing_s/step=34.271`.
+    - `perf/total_num_tokens=271215`.
+    - Whole-machine throughput by `tokens / step_time`: `7913.834 tokens/s`.
+    - Final health after cleanup: `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_FINAL 85`, all 8 GPUs `0 MiB`, no Ray/TTRL residual process.
+- v41 full run artifacts:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4_metrics.txt`.
+  - Ray task log snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4_throughput_summary.txt`.
+  - Proc/GPU health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_20step_v41_lowtemp_consistency_strict_n4_proc_health.txt`.
+  - Status:
+    - Training and strict validation completed with status `0`.
+    - Reached `training/global_step=20`.
+    - Final health after cleanup: `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_FINAL 87`, all 8 GPUs `0 MiB`, no Ray/TTRL residual process.
+  - Strict validation result:
+    - `val-core/MATH-TTT/acc/mean@4=0.6956740442655935`.
+    - `val-core/MATH-TTT/acc/best@4/mean=0.8292273641851107`.
+    - `val-core/MATH-TTT/acc/maj@4/mean=0.7201830985915494`.
+    - `val-aux/MATH-TTT/format_score/mean@4=0.966297786720322`.
+    - `val-aux/MATH-TTT/response_clip/mean@4=0.043259557344064385`.
+    - `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.08095732167802594`.
+  - Step-20 internal metrics:
+    - `train/sps/weighted_label_confidence=0.655`.
+    - `train/sps/agreement_rate=1.000`.
+    - `train/sps/train_weight=0.773`.
+    - `train/sps/answer_sharp_confidence=0.832`.
+    - `train/sps/answer_effective_K=2.357`.
+    - `train/sps/majority_sharp_confidence=0.832`.
+    - `train/sps/consistency_capacity=0.832`.
+    - `train/label_accuracy=0.750`.
+    - `train/reward_accuracy=0.320`.
+    - `train/majority_voting_reward=0.578`.
+    - `train/ground_truth_reward=0.605`.
+    - `train/pass@32=0.875`.
+    - `train/majority_ratio=0.643`.
+    - `response_length/clip_ratio=0.039`.
+  - Timing:
+    - Step 1 `timing_s/step=34.857`, `perf/total_num_tokens=271215`.
+    - Warm non-validation steps were mostly `22-29s`; late examples:
+      - Step 15 `22.775s`.
+      - Step 16 `23.585s`.
+      - Step 18 `23.418s`.
+      - Step 19 `22.747s`.
+    - Step 20 includes final validation: `timing_s/testing=231.519`, `timing_s/step=258.243`.
+    - Existing throughput summary over steps 11-20 includes validation step 20 and is therefore low: average `timing_s/step=48.060`, `whole_machine_tokens_per_s=4872.785`.
+    - Recomputed non-validation throughput:
+      - Steps 2-19: average step `26.518s`, whole-machine `9456.099 tokens/s`.
+      - Steps 11-19: average step `24.706s`, whole-machine `9524.335 tokens/s`.
+      - Steps 13-19: average step `23.732s`, whole-machine `9204.438 tokens/s`.
+- Interpretation:
+  - Infra result is positive for this worker/run shape: forcing venv cu12.9 user-space CUDA libraries plus driver-version compat preflight completed a GEMM smoke, a 1-step TTRL smoke, and a full 20-step TTRL+validation run without procfs loss. This does not prove root cause globally, but it is the strongest current mitigation evidence for the cuBLAS/CUDA-mix hypothesis.
+  - Caveat: despite passing `+ray_init.include_dashboard=False`, Ray still started dashboard/dashboard-agent processes with `--disable-frontend`. This did not break the run, but Ray init config should be checked later if reducing Ray side services remains a priority.
+  - Algorithmically, v41 is not an improvement:
+    - v36 remains the best strict-n4 20-step result: `mean@4=0.7037223340040242`.
+    - v40: `mean@4=0.6966800804828974`.
+    - v41: `mean@4=0.6956740442655935`.
+  - Lowering the training rollout/proposal temperature to `0.7` improved training speed and drove late training support to high internal sharpness (`answer_sharp_confidence` often `0.90+`, `majority_ratio` often `0.65-0.80`), but it did not improve final strict `best@4` or `mean@4`.
+  - This suggests the remaining bottleneck is not just making the training distribution colder. The method needs a training-side signal that improves low-budget candidate correctness, not only majority concentration. A reasonable next algorithm step is to combine low-budget candidates with a correctness-oriented internal consistency test, e.g. require agreement between majority answer, weighted label confidence, and low-temperature/base support before increasing update weight.

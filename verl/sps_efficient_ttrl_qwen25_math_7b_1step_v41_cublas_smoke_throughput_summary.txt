@@ -1,0 +1,5 @@
+task_log=/tmp/r41_cublas_smoke/ray/session_latest/logs/worker-d54c3f5ce223031d0cc8a0c0a07cb8ad649c4fcbe5162ea4d4230614-ffffffff-77000.out
+steps=1-1
+timing_s/step=34.271
+perf/total_num_tokens=271215.000
+whole_machine_tokens_per_s=7913.834
