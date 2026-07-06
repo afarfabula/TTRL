@@ -417,6 +417,8 @@ def apply_sps_weighted_ttrl_gt(
     base_support_capacity=False,
     base_support_temperature=1.0,
     base_support_disagreement_penalty=0.35,
+    cross_view_capacity=False,
+    cross_view_disagreement_penalty=0.35,
 ):
     """
     Apply an SPS-weighted self-consistency pseudo label to the batch.
@@ -467,6 +469,7 @@ def apply_sps_weighted_ttrl_gt(
     base_support_top_confidence_list = []
     base_support_agreement_list = []
     base_support_capacity_list = []
+    cross_view_capacity_list = []
 
     temp = max(float(weight_temperature), 1e-6)
     sharpen_beta = max(float(answer_sharpen_beta), 1e-6)
@@ -522,6 +525,7 @@ def apply_sps_weighted_ttrl_gt(
             base_support_top_confidence_list.append(0.0)
             base_support_agreement_list.append(0.0)
             base_support_capacity_list.append(0.0)
+            cross_view_capacity_list.append(0.0)
             continue
 
         answer_scores = {
@@ -602,6 +606,15 @@ def apply_sps_weighted_ttrl_gt(
         if low_budget_gt != majority_gt:
             low_budget_capacity_value *= max(0.0, min(1.0, float(low_budget_disagreement_penalty)))
         low_budget_capacity_value *= low_budget_parseable_rate * max(0.0, 1.0 - low_budget_clip_rate)
+        cross_view_capacity_value = float(
+            np.sqrt(max(base_support_majority_confidence, 0.0) * max(low_budget_majority_mass, 0.0))
+        )
+        cross_view_capacity_value *= low_budget_parseable_rate * max(0.0, 1.0 - low_budget_clip_rate)
+        cross_penalty = max(0.0, min(1.0, float(cross_view_disagreement_penalty)))
+        if base_support_gt != majority_gt:
+            cross_view_capacity_value *= cross_penalty
+        if low_budget_gt != majority_gt:
+            cross_view_capacity_value *= cross_penalty
 
         use_sps_label = True
         if confidence_filter or confidence_weight:
@@ -643,6 +656,8 @@ def apply_sps_weighted_ttrl_gt(
                 prompt_weight = min(prompt_weight, low_budget_capacity_value)
             if base_support_capacity:
                 prompt_weight = min(prompt_weight, base_support_capacity_value)
+            if cross_view_capacity:
+                prompt_weight = min(prompt_weight, cross_view_capacity_value)
             if clip_penalty > 0:
                 prompt_weight *= max(0.0, 1.0 - float(clip_penalty) * prompt_clip_ratio)
             power = max(float(weight_power), 1e-6)
@@ -668,6 +683,7 @@ def apply_sps_weighted_ttrl_gt(
         base_support_top_confidence_list.append(base_support_top_confidence)
         base_support_agreement_list.append(base_support_agreement)
         base_support_capacity_list.append(base_support_capacity_value)
+        cross_view_capacity_list.append(cross_view_capacity_value)
 
     for i in range(num_prompts):
         data_item = batch[i]
@@ -706,6 +722,7 @@ def apply_sps_weighted_ttrl_gt(
     )
     batch.non_tensor_batch["sps_base_support_agreement_list"] = np.array(base_support_agreement_list, dtype=float)
     batch.non_tensor_batch["sps_base_support_capacity_list"] = np.array(base_support_capacity_list, dtype=float)
+    batch.non_tensor_batch["sps_cross_view_capacity_list"] = np.array(cross_view_capacity_list, dtype=float)
     return batch
 
 

@@ -120,3 +120,15 @@ v43 已完成 50 step，strict `val_kwargs.n=4` 且禁用 validation answer sele
 v43 的 step 50 内部指标：`answer_sharp_confidence=0.969`、`low_budget_majority_mass=0.719`、`base_support_capacity=0.781`、`base_support_agreement=1.000`、`train_weight=0.577`、`ground_truth_reward=0.781`。这说明 base/ref support 作为保守 capacity 有帮助，但晚期大多和 majority 同向，独立纠错能力不够强。下一版应保留 v42/v43 的保守容量栈，但加入更有区分度的内部 correctness 信号，例如低温自检/改写一致性、base support 和 first4 冲突惩罚、answer-cluster margin，而不是继续单纯提高锐化强度。
 
 infra 正常：runner 退出状态 0，最终 `/proc/self` 和 `/proc/meminfo` 正常，`PROC_COUNT_FINAL=102`。非 validation 训练步 2-49 平均 `24.802s/step`，整机约 `10.22k token/s`；step 50 包含 final validation，`testing=225.862s`、整步 `247.066s`。
+
+## v44 计划：first4 和 base/ref 的 cross-view capacity
+
+v44 不增加生成次数，也不改变 validation。它把 v42 的 first4 低预算视角和 v43 的 base/ref 支持视角合成一个训练期容量：`sqrt(base_support_majority_confidence * low_budget_majority_mass)`，再乘 first4 可解析率和非截断率；如果 base/ref top answer 或 first4 local majority 不同意 raw majority，就乘 `0.35` 惩罚。
+
+这个设计来自 v43 的现象：base/ref support 有提升，但晚期多数时候和 majority 同向，单独 hard cap 不够像 verifier。v44 要求两个内部视角同时支持同一个 majority 答案簇，才允许较强更新；任一视角冲突就降低更新。它仍然不用 Math500 标注，不做 validation-time selection，不使用 best-of/major vote/n=32 作为达标指标。runner 是 `verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v44_cross_view_capacity_strict_n4.sh`，最终仍只看 strict `mean@4` 是否达到 85%。
+
+v44 已完成 50 step strict n=4，结果为 `mean@4=73.84%`、`best@4=84.26%`、`maj@4=75.27%`。相比 v43 的 `mean@4=73.59%` 和 `best@4=83.81%` 是小幅提升，但仍远低于 85% 目标。这里仍然只认 `mean@4`，`best@4/maj@4` 只是诊断。
+
+v44 的 step 50 内部指标显示容量信号确实很强：`cross_view_capacity=0.844`、`base_support_capacity=0.791`、`base_support_agreement=1.000`、`low_budget_majority_mass=0.906`、`low_budget_agreement=1.000`、`answer_sharp_confidence=0.979`、`weighted_label_confidence=0.793`、`pass@32=1.000`。问题是这些内部一致性仍没有足够转化成 4 条低预算样本的正确率，说明 base/ref 和 first4 多数时候只是确认同一个 majority 簇，独立纠错能力不够。
+
+v44 infra 正常：退出状态 0，最终 `/proc/self` 和 `/proc/meminfo` 正常，`PROC_COUNT_FINAL=104`，8 张 B200 显存均释放到 `0 MiB`。非 validation steps 2-49 平均约 `24.77s/step`、整机约 `10.23k tokens/s`；包含最终 validation 的 steps 41-50 汇总为 `47.596s/step`、`4923.941 tokens/s`。下一步不要再单纯提高锐化或容量，而应加入更能区分正确性的内部信号，例如 answer-cluster margin / ambiguity control：只有当 majority 答案在 sharpened distribution、first4、base/ref 三个视角里都相对第二簇有明确 margin 时才强更新，对高置信但低 margin 的题降权。

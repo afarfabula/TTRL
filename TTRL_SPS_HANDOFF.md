@@ -7875,3 +7875,80 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
     - add an independent self-check/rephrase consistency view generated at low temperature for only a small subset of rollouts, using it as train-time capacity rather than validation-time selection;
     - use answer-cluster margin rather than only top confidence, because v43 shows high confidence and high agreement can still be wrong.
   - Goal is not complete: strict `mean@4=0.7359 < 0.85`.
+
+### 2026-07-07 v44 plan: cross-view capacity from first4 support and base/ref support
+
+- Motivation from v43:
+  - v43 improved strict 50-step `mean@4` from `0.7193` to `0.7359`, so base/ref answer-cluster support is useful.
+  - But at step 50 `base_support_agreement=1.000` and `base_support_capacity=0.781`, so base/ref support mostly agrees with the sampled majority late in training. It is a weak independent verifier by itself.
+  - v42's low-budget first4 view and v43's base/ref view both gave useful but incomplete capacity signals:
+    - low-budget first4 asks whether the strict validation-like sampling view already puts mass on majority;
+    - base/ref support asks whether the original/reference model also supports that answer cluster.
+  - A direct hard-min of the two views can be too conservative when they agree, while either view disagreeing with majority should still be a strong risk signal.
+- Algorithm change:
+  - Add `sps_cross_view_capacity` in `apply_sps_weighted_ttrl_gt()`.
+  - For each prompt, compute:
+    - `base_support_majority_confidence`: base/ref answer-cluster probability on the raw majority answer;
+    - `low_budget_majority_mass`: fraction of the first `k=4` train rollouts whose parsed answer equals the raw majority answer.
+  - Cross-view capacity:
+    - `sqrt(base_support_majority_confidence * low_budget_majority_mass)`;
+    - multiply by first4 parseable and non-clipped rates;
+    - if base/ref top answer disagrees with raw majority, multiply by `sps_cross_view_disagreement_penalty=0.35`;
+    - if first4 local majority disagrees with raw majority, multiply by the same penalty.
+  - When enabled, cap prompt train weight by this cross-view value in addition to the existing v42/v43 capacity stack.
+- Why this is justified:
+  - It is still fully unsupervised and uses no Math500 labels.
+  - It does not add validation-time selection, best-of, majority selection, or n=32 validation.
+  - It directly targets the v43 failure mode: high majority/base agreement can still be wrong, so prompts should be trusted most when both independent internal views put mass on the same low-budget answer cluster.
+- Code/runner prepared:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: adds `cross_view_capacity`, `cross_view_disagreement_penalty`, computes `sps_cross_view_capacity_list`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: wires config and logs `train/sps/cross_view_capacity`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds defaults with behavior off.
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v44_cross_view_capacity_strict_n4.sh`: same infra and strict validation as v43, with `ttrl.sps_cross_view_capacity=True`.
+- Static checks:
+  - `bash -n` passed for the v44 runner.
+  - `py_compile` passed for `ttrl_utils.py` and `ray_trainer.py`.
+- Expected diagnostic:
+  - If v44 helps, `cross_view_capacity` should stay high on prompts where both first4 and base/ref support majority, while reducing updates on prompts where one view disagrees.
+  - A real success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85`.
+  - If `best@4` remains below `0.85`, the remaining bottleneck is still candidate correctness, and future work needs a stronger self-check signal rather than another capacity-only variant.
+
+### 2026-07-07 v44 result: cross-view capacity is a small improvement, still far from target
+
+- Run:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v44_cross_view_capacity_strict_n4.sh`.
+  - Strict validation remained unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time best-of, majority vote, `n=32` selection, answer selection, or ground-truth selection was used as the success metric.
+- Final strict validation:
+  - `val-core/MATH-TTT/acc/mean@4=0.738430583501006`.
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8425714285714286`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7526820925553319`.
+  - Auxiliary: `response_clip/mean@4=0.013078470824949699`, `format_score/mean@4=0.9673038229376257`, `response_avg_logprob/mean@4=-0.08232701611161697`.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.708`.
+  - `train/sps/cross_view_capacity=0.844`.
+  - `train/sps/base_support_capacity=0.791`.
+  - `train/sps/base_support_agreement=1.000`.
+  - `train/sps/low_budget_capacity=0.906`.
+  - `train/sps/low_budget_majority_mass=0.906`.
+  - `train/sps/low_budget_agreement=1.000`.
+  - `train/sps/answer_sharp_confidence=0.979`.
+  - `train/sps/weighted_label_confidence=0.793`.
+  - `train/pass@32=1.000`, `train/majority_ratio=0.779`, `train/ground_truth_reward=0.789`.
+- Timing:
+  - Non-validation steps 2-49 averaged about `24.77s/step`, whole-machine throughput about `10.23k tokens/s`.
+  - Steps 11-49 averaged about `24.26s/step`, whole-machine throughput about `9.99k tokens/s`.
+  - Steps 41-49 averaged about `25.27s/step`, whole-machine throughput about `9.56k tokens/s`.
+  - Runner-generated steps 41-50 throughput summary includes final validation, so it is lower: `47.596s/step`, `4923.941 tokens/s`.
+  - Final validation step included `timing_s/testing=228.175`, `timing_s/step=248.521`.
+- Infra health:
+  - Exit status `0`.
+  - Final `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT_FINAL=104`.
+  - All 8 B200 GPUs were released to `0 MiB`.
+  - The established CUDA/cuBLAS infra recipe remained healthy with caches under `/tmp/ttrl_cache/<exp>`.
+- Interpretation:
+  - v44 improves over v43 by `+0.25pp` strict `mean@4` (`0.7359154929577465 -> 0.738430583501006`) and `+0.45pp` strict `best@4` (`0.8380925553319919 -> 0.8425714285714286`), so it is a real but small improvement and should be committed as an improvement record.
+  - The failure mode is clearer: at step 50 the model has very high low-budget agreement and high answer sharpness, and `best@4` is close to but still below `0.85`. The remaining issue is not validation-time selection; the first four sampled candidates still do not contain enough correct answers.
+  - Base/ref support and first4 support are useful conservative capacity signals, but by late training they mostly agree with majority and are not an independent enough correctness verifier.
+  - Next algorithm should target candidate correctness more directly while staying unsupervised. A promising direction is answer-cluster margin / ambiguity control: allow strong updates only when the supported majority answer has a clear margin over the second answer cluster across the sharpened distribution, first4 view, and base/ref support; penalize high-confidence but low-margin prompts because those are likely self-consistent wrong clusters.
+  - Goal is not complete: strict `mean@4=0.7384 < 0.85`.

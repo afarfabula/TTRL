@@ -1,0 +1,5 @@
+task_log=/tmp/r44cross/ray/session_latest/logs/worker-3c0bdf2e8789f87fb76520acaf3dc826e5a3206adf04b618d0b7a1f4-ffffffff-223079.out
+steps=41-50
+timing_s/step=47.596
+perf/total_num_tokens=234359.400
+whole_machine_tokens_per_s=4923.941

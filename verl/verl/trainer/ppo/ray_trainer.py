@@ -1408,6 +1408,12 @@ class RayPPOTrainer:
                                         base_support_disagreement_penalty=self.config.ttrl.get(
                                             "sps_base_support_disagreement_penalty", 0.35
                                         ),
+                                        cross_view_capacity=self.config.ttrl.get(
+                                            "sps_cross_view_capacity", False
+                                        ),
+                                        cross_view_disagreement_penalty=self.config.ttrl.get(
+                                            "sps_cross_view_disagreement_penalty", 0.35
+                                        ),
                                     )
                                 with marked_timer("sps_compute_reward", timing_raw):
                                     sps_reward_tensor, sps_info = compute_sps_reward(
@@ -1501,6 +1507,10 @@ class RayPPOTrainer:
                                     )
                                     sps_info["sps/base_support_agreement"] = float(
                                         batch.non_tensor_batch["sps_base_support_agreement_list"].mean()
+                                    )
+                                if "sps_cross_view_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/cross_view_capacity"] = float(
+                                        batch.non_tensor_batch["sps_cross_view_capacity_list"].mean()
                                     )
                                 if sps_mode != "answer_rule_conf_weight":
                                     gen_batch_output = gen_batch_output.union(
