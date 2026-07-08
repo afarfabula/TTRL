@@ -1,6 +1,6 @@
 # TTRL × SPS 实验交接文档
 
-最后更新：2026-06-25
+最后更新：2026-07-08
 
 本文档记录在 `/opt/tiger/TTRL`（内嵌 verl 0.4.1 + TTRL 补丁）上，把「SPS（base-model 序列 logprob）reward」接入 TTRL 替代 majority voting 的实现、实验、结论与后续优化方向。
 
@@ -8227,3 +8227,3246 @@ Qwen3-8B v21 answer sharpen 50-step final 结果
   - Next algorithm should focus on train-time conversion from candidate existence to low-budget average correctness without validation-time selection. A plausible direction is a contrastive or capacity-weighted objective that separates internally supported correct-looking candidates from the other first-four samples, while avoiding the v46/v47 failure of blindly repairing toward majority clusters.
   - v48 should be committed locally as an improvement record after documentation. v45-v47 remain failed/neutral trials documented for context and should not be described as improvement commits.
   - Goal is not complete: strict `mean@4=0.7455 < 0.85`; current best is v48.
+
+### 2026-07-07 v49 plan: first4 process-weighted sample shaping
+
+- Motivation from v48:
+  - v48 is the current best strict 50-step result and raises diagnostic `best@4` above 85% (`0.8602`), but strict `mean@4` is still only `0.7455`.
+  - This means the training process can create at least one good low-budget candidate, but probability mass is not reliably placed on all first-four low-budget samples.
+  - v45 showed that another prompt-level capacity cap is not enough, and v46/v47 showed that repairing samples toward the raw majority cluster can reinforce wrong clusters.
+  - Therefore v49 should not change validation and should not repair/replace samples. It should change the train-time per-sample weight so first-four rollouts that are both in the pseudo-label cluster and process-consistent receive stronger reward, while first-four rollouts that are parseable but conflict with the pseudo label or have inconsistent process receive lower reward.
+- Algorithm change:
+  - Add default-off `ttrl.sps_process_sample_weight`.
+  - Reuse the v48 process parser and raw-majority pseudo label from `apply_sps_weighted_ttrl_gt()`.
+  - For each generated rollout, compute a sample weight:
+    - start at `1.0`;
+    - if the answer equals the raw majority pseudo label and the rollout is process-consistent, multiply by `sps_process_sample_positive` (v49 starts with `1.25`);
+    - if the answer equals the raw majority but process is inconsistent, multiply by `sps_process_sample_inconsistent` (v49 starts with `0.75`) because v48 showed process consistency is useful but not reliable enough for a hard rejection;
+    - if the answer is parseable but conflicts with the raw majority, multiply by `sps_process_sample_negative` (v49 starts with `0.35`);
+    - if it is unparseable or clipped, multiply by `sps_process_sample_invalid` (v49 starts with `0.25`);
+    - apply the extra shaping only to the first `sps_low_budget_k=4` train samples for each prompt; the remaining train samples stay at `1.0` so the global 32-sample support is not collapsed.
+  - Store the sample weights in `gen_batch_output.non_tensor_batch["sps_sample_weight"]`; after selection and batch union, multiply `token_level_scores` by this sample weight in addition to the existing prompt weight.
+  - Log `process_sample_weight`, `process_sample_positive_rate`, `process_sample_inconsistent_rate`, `process_sample_negative_rate`, and `process_sample_invalid_rate`.
+- Why this is justified:
+  - It directly targets the v48 gap between `best@4` and `mean@4`: instead of asking whether any good candidate exists, it asks whether each low-budget training sample should carry full reward.
+  - It uses only internal model signals and the existing pseudo label. No Math500 labels, validation-time selection, best-of, majority vote result as final metric, `n=32` selection, or ground-truth selection are used.
+  - It avoids the v46/v47 failure mode because it does not replace rollouts with majority-cluster samples; conflicting samples are retained but carry smaller reward.
+  - The initial constants are semantic, not post-hoc tuning: boost internally consistent pseudo-label samples mildly (`1.25`), downweight same-answer but process-inconsistent samples mildly (`0.75`), and strongly downweight invalid/conflicting first-four samples (`0.25/0.35`) because those are exactly the samples that damage strict `mean@4`.
+- Runner:
+  - Planned runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4.sh`.
+  - Based on v48 with `ttrl.sps_process_sample_weight=True`.
+  - Keeps strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling may count as success.
+
+### 2026-07-07 v49 result: process sample weighting regresses and is not an improvement
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v49_process_sample_weight_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7258551307847082`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8366257545271629`, `val-core/MATH-TTT/acc/maj@4/mean=0.7421247484909457`.
+  - This is below v48 `mean@4=0.7454728370221329`, so v49 is a regression and must not be committed as an improvement.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.545`.
+  - `train/sps/answer_sharp_confidence=0.971`, `train/sps/answer_effective_K=1.068`.
+  - `train/sps/low_budget_capacity=0.621`, `train/sps/low_budget_majority_mass=0.688`, `train/sps/low_budget_agreement=0.750`.
+  - `train/sps/base_support_capacity=0.793`, `train/sps/cross_view_capacity=0.649`.
+  - `train/sps/process_consistency_capacity=0.983`, `train/sps/process_majority_support=0.983`, `train/sps/process_consistent_rate=0.930`, `train/sps/process_majority_consistent_rate=0.768`.
+  - `train/sps/process_sample_weight=0.963`, `train/sps/process_sample_positive_rate=0.688`, `train/sps/process_sample_negative_rate=0.250`, `train/sps/process_sample_invalid_rate=0.062`.
+  - `train/sps_process_sample_weight_applied=0.995`, `train/ground_truth_reward=0.758`, `train/pass@32=1.000`, `train/majority_ratio=0.779`.
+- Timing and infra:
+  - Training command exit status `0`.
+  - Final validation step included `timing_s/testing=232.803`, `timing_s/step=256.231`.
+  - Runner-generated steps 41-50 summary includes final validation: `50.246s/step`, `228714.800 tokens/step`, `4551.873 tokens/s`.
+  - Runner final `/proc` remained healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=89`.
+  - Final GPU snapshot caught teardown-window residual memory on GPU7. Re-check live GPU occupancy before the next experiment.
+- Interpretation:
+  - v49 did not create a useful negative learning signal. The implementation multiplied `token_level_scores` by a first4 sample weight, but first4 samples that conflict with the pseudo label usually already have pseudo-label reward `0`; multiplying `0` by `0.35` is still `0`.
+  - The mechanism therefore mostly perturbed positive sample scale and prompt dynamics without suppressing wrong low-budget samples. It also reduced candidate existence: diagnostic `best@4` fell from v48 `0.8602` to `0.8366`.
+  - Next algorithm should not continue per-sample multiplicative weighting. It should give a small explicit train-time negative reward only to clearly bad low-budget samples, and only under a conservative gate where majority has enough low-budget, base/ref, and process support. This follows the new literature signal that useful test-time RL changes are sparse and often concentrated at high-uncertainty or wrong-branch decisions.
+  - Goal is not complete: strict `mean@4=0.7259 < 0.85`; current best remains v48 `mean@4=0.7454728370221329`.
+
+### 2026-07-07 literature refresh and v50 plan: gated low-budget negative pseudo-labeling
+
+- Recent arXiv refresh used as design input:
+  - `arXiv:2504.16084` TTRL: majority-vote pseudo labels can train at test time, but confirmation bias is the central failure mode.
+  - `arXiv:2505.21444` Can Large Reasoning Models Self-Train?: self-reward can help but can collapse or reward-hack, so capacity/gating should remain conservative.
+  - `arXiv:2505.21493` Reinforcing General Reasoning without Verifiers: verifier-free RL works by internal distribution shaping, but the target signal must avoid spurious consensus.
+  - `arXiv:2505.22660` Maximizing Confidence Alone Improves Reasoning: entropy/confidence are useful dense signals, but v38/v41 showed confidence alone can sharpen wrong clusters in this repo.
+  - `arXiv:2506.06395` Confidence Is All You Need: self-confidence rewards can be effective on Qwen2.5-Math-like models, but should be calibrated by support and consistency here.
+  - `arXiv:2506.01369` Incentivizing LLMs to Self-Verify Their Answers: self-verification should be integrated with generation; v48's process consistency is a cheap version but saturates by step 50.
+  - `arXiv:2510.17472` Certified Self-Consistency: majority confidence is a certificate of the sampled terminal distribution, not a proof of correctness. This supports using majority only as a gated signal.
+  - `arXiv:2510.17923` COMPASS: combines answer and path self-scoring for TTRL and explicitly addresses the risk of majority-vote pseudo-label errors.
+  - `arXiv:2511.17938` SPINE: useful RL changes are token/branch selective, not uniform sequence updates. This motivates sparse low-budget correction rather than more prompt-wide capacity.
+  - `arXiv:2602.01288` EDIS: entropy dynamics can identify reasoning uncertainty and improve RL training; uncertainty should modulate reward, not just final answer selection.
+  - `arXiv:2603.19880` SCRL: introduces entropy-gated negative pseudo-labeling for TTRL to penalize implausible trajectories without deleting low-frequency candidates. This is the closest match to the v50 design.
+  - `arXiv:2603.15417` Amplification Effects in TTRL: majority-based TTRL can amplify reasoning and safety vulnerabilities, matching v38/v46/v47 failures.
+- Motivation from v48-v49:
+  - v48 showed candidate existence is high enough (`best@4=86.02%`) but strict mean remains low (`74.55%`).
+  - v49 showed multiplicative sample weights do not suppress wrong first4 samples because wrong pseudo-label samples often have zero reward already.
+  - The next change should therefore produce an actual negative terminal reward for bad first4 samples, while using v48's process/base/low-budget support gates to avoid the v38/v46 failure of suppressing plausible minority trajectories.
+- Algorithm change:
+  - Add default-off `ttrl.sps_low_budget_negative_reward`.
+  - In `apply_sps_weighted_ttrl_gt()`, compute a first4 negative reward vector aligned with generated rollouts and stored in `gen_batch_output.non_tensor_batch["sps_low_budget_negative_reward"]`.
+  - Activate the negative reward only when the prompt-level gate is true:
+    - `low_budget_majority_mass >= sps_low_budget_negative_min_support` (`0.65`);
+    - `process_majority_consistent_rate >= sps_low_budget_negative_process_min` (`0.70`);
+    - `base_support_majority_confidence >= sps_low_budget_negative_base_min` (`0.65`);
+    - base/ref top answer and first4 local majority both agree with raw majority.
+  - Within the gated first4 samples, assign `-sps_low_budget_negative_value` (`-0.35`) to unparseable/clipped samples and to conflicting answers with inconsistent process; assign half strength to parseable conflicting samples under strong base support. Other samples receive `0`.
+  - In `ray_trainer.py`, add this vector to the terminal-token reward before GRPO advantage computation, and log `low_budget_negative_rate`, `low_budget_negative_gate`, `sps_low_budget_negative_reward_applied`, and `sps_low_budget_negative_active_rate`.
+- Why this is justified:
+  - It directly repairs the v49 mechanism failure: zero-reward wrong samples now receive an explicit small negative signal instead of a no-op multiplicative downweight.
+  - It is sparse and gated, following SPINE/EDIS/SCRL-style guidance: only low-budget samples that are both damaging to strict mean@4 and contradicted by multiple internal views are penalized.
+  - It avoids validation-time scaling: validation remains `n=4`, answer selection disabled, and success is still only strict `mean@4`.
+  - It is not random tuning. The default gate thresholds come from internal v48/v49 support levels (`low_budget_majority_mass` around `0.69-0.75`, process support around `0.77`, base support around `0.79`) and are chosen to activate only where majority support is already credible.
+- Runner:
+  - Planned runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4.sh`.
+  - Based on v48 with `ttrl.sps_low_budget_negative_reward=True`.
+  - Keeps strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling may count as success.
+
+### 2026-07-07 v50 result: gated low-budget negative reward does not beat v48
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v50_low_budget_negative_strict_n4_throughput_summary.txt`.
+- Infra note:
+  - The first launch failed before training because Ray's AF_UNIX socket path exceeded the 107-byte limit:
+    `validate_socket_filename failed: AF_UNIX path length cannot exceed 107 bytes`.
+  - The runner was fixed by shortening `RAY_DIR` to `/tmp/r50neg`; the rerun completed with exit status `0`.
+  - Preflight and final health were good: driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, venv cu12.9 CUDA libraries loaded first, `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=94`, and all 8 B200 GPUs released to `0 MiB`.
+- Strict validation:
+  - Validation stayed low-budget and real: `val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7409456740442656`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8345593561368209`, `val-core/MATH-TTT/acc/maj@4/mean=0.7545130784708249`.
+  - This is below v48 `mean@4=0.7454728370221329`, so v50 is not an improvement and must not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.660`.
+  - `train/sps/answer_sharp_confidence=0.979`, `train/sps/answer_effective_K=1.047`.
+  - `train/sps/low_budget_capacity=0.906`, `train/sps/low_budget_majority_mass=0.906`, `train/sps/low_budget_agreement=1.000`.
+  - `train/sps/base_support_capacity=0.787`, `train/sps/cross_view_capacity=0.837`, `train/sps/margin_capacity=0.884`.
+  - `train/sps/process_consistency_capacity=0.989`, `train/sps/process_majority_support=0.989`, `train/sps/process_consistent_rate=0.930`, `train/sps/process_majority_consistent_rate=0.766`.
+  - `train/sps/low_budget_negative_rate=0.062`, `train/sps/low_budget_negative_gate=0.750`.
+  - `train/ground_truth_reward=0.785`, `train/pass@32=1.000`, `train/majority_ratio=0.775`.
+- Timing:
+  - Runner-generated steps 41-50 summary includes final validation: `50.061s/step`, `236023.800 tokens/step`, `4714.705 tokens/s`.
+  - Non-validation late training steps were mostly around `23-29s/step`; the summary is pulled down by final validation.
+- Interpretation:
+  - v50 fixed the v49 implementation issue in the narrow sense: bad first-four samples can now receive a real negative terminal reward instead of multiplying an already-zero pseudo-label reward.
+  - However, the strict metric still did not improve. The negative signal was sparse (`low_budget_negative_rate=0.062`) and appeared to reduce candidate existence: diagnostic `best@4` fell from v48 `0.8601911468812877` to v50 `0.8345593561368209`.
+  - The key lesson is that explicitly penalizing minority/conflicting low-budget rollouts is risky even under conservative low-budget/base/process gates. It can over-prune useful exploration before the model has shifted probability mass onto correct low-budget samples.
+  - Do not continue v50-style negative pseudo-labeling by only increasing penalty strength or relaxing gates; that would be post-hoc tuning and likely worsens the v46/v47/v50 error-cluster amplification pattern.
+  - Goal is not complete: strict `mean@4=0.7409 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v51 plan: low-budget soft support reward instead of negative pruning
+
+- Motivation from v48-v50:
+  - v48 remains the best strict 50-step result (`mean@4=0.7455`) and its `best@4=0.8602` shows useful low-budget candidates can exist.
+  - v49 showed multiplicative first-four sample weights are mostly a no-op for wrong pseudo-label samples because many already have zero reward.
+  - v50 repaired that no-op with explicit negative reward, but `best@4` fell to `0.8346`; this suggests the failure is over-pruning minority/conflicting candidates, not insufficient penalty strength.
+  - Therefore v51 should not tune v50's negative reward. It should add a small positive, continuous train-time signal for first-four candidates whose own answer cluster has internal support, even if that answer is not the raw majority. This targets low-budget candidate quality without validation-time selection and without forcing every useful trajectory into the majority cluster.
+- Algorithm change:
+  - Add default-off `ttrl.sps_low_budget_soft_reward` and `ttrl.sps_low_budget_soft_value`.
+  - For each answer cluster, compute an unsupervised soft support score from:
+    - sharpened SPS answer probability (`sharp_prob_by_answer`);
+    - base/ref answer probability (`base_prob_by_answer`);
+    - process-consistent fraction inside that answer cluster;
+    - sampled cluster mass, with square-root scaling so minority clusters are not erased but tiny singleton noise is still downweighted.
+  - Normalize support by the strongest cluster in the prompt. For the first `sps_low_budget_k=4` train rollouts only, add a small positive terminal reward `sps_low_budget_soft_value * normalized_support` if the rollout is parseable and non-clipped.
+  - Do not add negative reward. Non-majority low-budget samples can receive positive reward if their answer cluster has base/process/sharpened support. Invalid or clipped samples receive `0`, not a penalty.
+  - Log `low_budget_soft_reward_mean`, `low_budget_soft_reward_rate`, `low_budget_soft_nonmajority_rate`, `low_budget_soft_nonmajority_reward`, `low_budget_soft_support_effective_K`, `sps_low_budget_soft_reward_applied`, and `sps_low_budget_soft_active_rate`.
+- Why this is justified:
+  - It follows the literature themes already recorded for v50 (verifier-free RL, entropy/capacity control, distribution sharpening), but changes the direction based on v50's empirical failure: preserve supported alternatives instead of penalizing conflicts.
+  - It directly targets the strict `mean@4` gap: improve the average quality of the first four samples by giving any internally supported low-budget candidate a small reward, not by selecting a best sample at validation.
+  - The initial coefficient `0.25` is deliberately smaller than the base SPS group-normalized reward scale and smaller than v50's `0.35` negative reward. The reason is internal: v50 showed over-strong correction can reduce `best@4`; v51 should be a weak auxiliary support signal rather than a replacement objective.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_low_budget_soft_reward` and metrics in `apply_sps_weighted_ttrl_gt()`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs metrics, and adds the soft reward to the terminal token before GRPO advantage computation.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: default-off config keys.
+- Runner:
+  - Planned runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4.sh`.
+  - Based on the v48/v50 capacity stack but with `ttrl.sps_low_budget_negative_reward=False`, `ttrl.sps_low_budget_soft_reward=True`, `ttrl.sps_low_budget_soft_value=0.25`, and `ttrl.sps_rollout_selection=first`.
+  - Keeps strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - No validation-time answer selection, best-of, majority vote, `n=32` selection, ground-truth selection, or inference-time scaling may count as success.
+
+### 2026-07-07 v51 result: soft support reward also does not beat v48
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v51_low_budget_soft_support_strict_n4_throughput_summary.txt`.
+- Infra:
+  - Preflight used the current required recipe on worker `986717`: `/proc/self` and `/proc/meminfo` healthy, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, and the CUDA user-space libraries loaded from `/opt/tiger/modelchef/.venv` cu12.9 paths.
+  - The run exited with status `0`; final proc/GPU health stayed healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=103`, and all 8 B200 GPUs released to `0 MiB`.
+  - Runner-generated steps 41-50 summary, including final validation, was `49.592s/step`, `226604.000 tokens/step`, `4569.394 tokens/s`. Non-validation late training steps were mostly around `23-34s/step`; the final validation step had `timing_s/testing=227.044` and `timing_s/step=249.456`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7434607645875252`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8439376257545271`, `val-core/MATH-TTT/acc/maj@4/mean=0.7575090543259558`.
+  - Aux metrics: `format_score/mean@4=0.9678068410462777`, `response_clip/mean@4=0.014587525150905433`, `response_avg_logprob/mean@4=-0.08470448923870637`.
+  - This is below v48 `mean@4=0.7454728370221329`; v51 is not an improvement and must not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.661`.
+  - `train/sps/weighted_label_confidence=0.815`, `train/sps/unique_answer_count=10.125`.
+  - `train/sps/answer_sharp_confidence=0.967`, `train/sps/answer_effective_K=1.089`.
+  - `train/sps/low_budget_capacity=0.769`, `train/sps/low_budget_majority_mass=0.812`, `train/sps/low_budget_agreement=0.875`.
+  - `train/sps/base_support_capacity=0.813`, `train/sps/cross_view_capacity=0.763`, `train/sps/margin_capacity=0.813`.
+  - `train/sps/process_consistency_capacity=0.988`, `train/sps/process_majority_support=0.988`, `train/sps/process_consistent_rate=0.961`, `train/sps/process_majority_consistent_rate=0.797`.
+  - `train/sps/low_budget_soft_reward_mean=0.205`, `train/sps/low_budget_soft_reward_rate=0.969`, `train/sps/low_budget_soft_nonmajority_rate=0.156`, `train/sps/low_budget_soft_nonmajority_reward=0.003`, `train/sps/low_budget_soft_support_effective_K=1.314`.
+  - `train/ground_truth_reward=0.789`, `train/pass@32=1.000`, `train/majority_ratio=0.807`.
+- Interpretation:
+  - v51 executed the intended mechanism: almost every first-four parseable, non-clipped sample received a weak positive soft-support reward by step 50.
+  - However, the support distribution became too concentrated. The non-majority soft reward nearly vanished by step 50 (`low_budget_soft_nonmajority_reward=0.003`, `low_budget_soft_support_effective_K=1.314`), and diagnostic `best@4` did not recover to v48 (`0.8439` vs `0.8602`).
+  - The failure mode is different from v50 but points in the same direction: adding direct first-four reward, even positive-only, mostly reinforces the already self-consistent majority basin once answer/process/base signals become sharp. It does not add enough independent correctness signal to convert candidate existence into strict average correctness.
+  - Do not continue by simply increasing `sps_low_budget_soft_value` or lowering support thresholds; that would be post-hoc coefficient tuning and likely accelerates majority-basin self-imitation.
+  - The next algorithm should use internal uncertainty to decide when not to reinforce a sharp majority basin. A more promising direction is conservative anti-collapse capacity: keep v48's process-consistency signal, but reduce or neutralize prompt/sample reinforcement when answer sharpness is already high while low-budget candidate diversity has collapsed, unless there is an independent base/process margin improvement.
+  - Goal is not complete: strict `mean@4=0.7435 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v52 plan: anti-collapse capacity for sharp majority basins
+
+- Motivation from v48-v51:
+  - v48 remains the best strict result because process consistency improved candidate existence, but by step 50 it was already saturated (`process_consistency_capacity=0.988`).
+  - v50 showed that explicit negative correction of first-four conflicts can reduce candidate existence (`best@4` fell to `0.8346`).
+  - v51 showed that a positive-only first-four soft support reward also collapses toward the majority basin: step 50 `low_budget_soft_nonmajority_reward=0.003`, `low_budget_soft_support_effective_K=1.314`, and `best@4=0.8439`, still below v48.
+  - Therefore the next change should not add a stronger first-four reward or another majority repair. It should instead detect when the internal answer distribution is already over-sharpened relative to the independent low-budget/base margins and reduce further reinforcement.
+- Algorithm change:
+  - Add default-off `ttrl.sps_anti_collapse_capacity`.
+  - Compute an anti-collapse cap inside `apply_sps_weighted_ttrl_gt()` after the existing sharp/base/low-budget margins are available.
+  - The cap activates only when all of these internal conditions hold:
+    - answer-cluster sharp confidence is already high: `answer_sharp_confidence >= 0.95`;
+    - answer distribution has nearly collapsed: `answer_effective_K <= 1.25`;
+    - first-four samples already concentrate on the majority: `low_budget_majority_mass >= 0.75`;
+    - sharpened majority margin is meaningfully larger than the weaker of base/ref and first-four margins: `sharp_majority_margin - min(base_support_majority_margin, low_budget_majority_margin) >= 0.15`.
+  - When active, compute a smooth collapse score from the excesses above those semantic thresholds and cap prompt training weight down toward `sps_anti_collapse_min_weight=0.45`. It is a cap, not a reward; it cannot make a prompt stronger than v48.
+  - Log `train/sps/anti_collapse_capacity`, `train/sps/anti_collapse_active_rate`, and `train/sps/anti_collapse_margin_gap`.
+- Why this is justified:
+  - It is not post-hoc accuracy tuning. The thresholds come from the late-step internal failure pattern shared by v44/v48/v50/v51: `answer_sharp_confidence` around `0.97-0.98`, `answer_effective_K` close to `1`, and high low-budget majority mass can coexist with strict `mean@4` near `74%`.
+  - It directly follows the literature themes already logged for confidence/entropy/capacity control: confidence should be useful only when calibrated by diversity and independent support, not maximized unconditionally.
+  - It preserves strict evaluation and avoids validation-time scaling. Validation remains `n=4`, answer selection disabled, and success remains only strict `mean@4`.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: adds anti-collapse capacity computation and stores prompt-level metrics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config and logs anti-collapse metrics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off config keys.
+- Runner:
+  - Planned runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4.sh`.
+  - Based on v48, not v50/v51: no `sps_low_budget_negative_reward`, no `sps_low_budget_soft_reward`, no rollout repair.
+  - Enabled configs: `ttrl.sps_anti_collapse_capacity=True`, `ttrl.sps_anti_collapse_min_weight=0.45`, `ttrl.sps_anti_collapse_sharp_min=0.95`, `ttrl.sps_anti_collapse_effective_k_max=1.25`, `ttrl.sps_anti_collapse_low_budget_mass_min=0.75`, `ttrl.sps_anti_collapse_margin_gap_min=0.15`.
+  - Keeps strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+
+### 2026-07-07 v52 result: anti-collapse capacity regresses and the worker procfs broke after teardown
+
+- Run:
+  - Worker: `986717`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v52_anti_collapse_capacity_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7298792756539235`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8417444668008048`, `val-core/MATH-TTT/acc/maj@4/mean=0.744927565392354`.
+  - Aux metrics: `format_score/mean@4=0.9627766599597586`, `response_clip/mean@4=0.017605633802816902`, `response_avg_logprob/mean@4=-0.08248333806187004`.
+  - This is below v48 `mean@4=0.7454728370221329`; v52 is not an improvement and must not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.565`.
+  - `train/sps/weighted_label_confidence=0.773`, `train/sps/unique_answer_count=12.500`.
+  - `train/sps/answer_sharp_confidence=0.972`, `train/sps/answer_effective_K=1.063`.
+  - `train/sps/low_budget_capacity=0.703`, `train/sps/low_budget_majority_mass=0.719`, `train/sps/low_budget_agreement=1.000`.
+  - `train/sps/base_support_capacity=0.771`, `train/sps/cross_view_capacity=0.720`, `train/sps/margin_capacity=0.779`.
+  - `train/sps/anti_collapse_capacity=1.000`, `train/sps/anti_collapse_active_rate=0.375`, `train/sps/anti_collapse_margin_gap=0.443`.
+  - `train/sps/process_consistency_capacity=0.990`, `train/sps/process_majority_support=0.990`, `train/sps/process_consistent_rate=0.932`, `train/sps/process_majority_consistent_rate=0.752`.
+  - `train/ground_truth_reward=0.750`, `train/pass@32=1.000`, `train/majority_ratio=0.758`.
+- Infra:
+  - Preflight before launch was healthy: `/proc/self` and `/proc/meminfo` existed, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke passed, and CUDA user-space libraries loaded from `/opt/tiger/modelchef/.venv` cu12.9 paths.
+  - The training command exited with status `0`, but procfs broke immediately after teardown: `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER=0`, and final snapshot also had `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`.
+  - Because `/proc` is broken, worker `986717` must not be used for any further Ray/CUDA training. A new healthy worker is required before the next GPU experiment.
+  - Final GPU snapshot still showed teardown-window residual memory on GPUs 1 and 5, including `[Not Found]` PID `256263` on GPU5. Do not trust this worker for more experiments.
+  - Runner-generated steps 41-50 summary, including final validation, was `49.962s/step`, `230291.400 tokens/step`, `4609.359 tokens/s`. Non-validation late training steps were mostly around `22-34s/step`; final validation step had `timing_s/testing=230.787` and `timing_s/step=254.357`.
+- Interpretation:
+  - v52 executed the intended anti-collapse mechanism: during late steps, `anti_collapse_active_rate` often reached `0.25-0.75`, so high-sharpness prompts were being capped.
+  - The result regressed, which means prompt-level anti-collapse alone removes useful update strength without adding the missing correctness signal. It did not recover v48 candidate existence (`best@4=0.8417` vs v48 `0.8602`) and it reduced strict mean.
+  - The key new evidence is that simply weakening over-sharp majority basins is not enough. The next algorithm should preserve v48's process-consistency candidate-existence gain, but explicitly keep independently supported non-majority first-four candidates alive when the majority basin is sharp and the non-majority answer has base/process support.
+  - Do not continue by only lowering `sps_anti_collapse_min_weight` or relaxing the v52 trigger; that would be post-hoc capacity tuning and likely further reduce useful learning.
+  - Goal is not complete: strict `mean@4=0.7299 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 literature refresh for the next iteration
+
+- New arXiv search/read pass for this goal covered at least these recent papers and preprints:
+  - `arXiv:2504.16084` TTRL: establishes majority/self-consistency pseudo labels for test-time RL, but the current experiments show majority confidence alone is not reliable enough for strict `n=4`.
+  - `arXiv:2505.21444` Can Large Reasoning Models Self-Train?: consistency-based self-reward can help, but self-training can collapse; this matches v51's non-majority support disappearing by step 50.
+  - `arXiv:2505.16022` NOVER: verifier-free RL can use internal signals, but must avoid external labels. This supports continuing with base/process/entropy signals only.
+  - `arXiv:2505.22660` Maximizing Confidence Alone Improves Reasoning: confidence/entropy rewards are useful in some regimes, but v38/v41/v52 show confidence minimization or anti-collapse by itself does not solve low-budget candidate correctness here.
+  - `arXiv:2506.06395` Confidence Is All You Need: self-confidence RL can work on Qwen2.5-Math-like setups, but the reward must be calibrated; raw confidence is not enough.
+  - `arXiv:2505.22617` The Entropy Mechanism of RL for Reasoning LMs: entropy collapse can saturate performance. This supports measuring `answer_effective_K` and avoiding unconditional sharpening.
+  - `arXiv:2508.11016` CURE: critical-token branching can prevent entropy collapse. Full branching is too invasive for this infra, but the useful idea is to preserve alternative supported branches rather than delete them.
+  - `arXiv:2508.11356` ETTRL: exploration/exploitation balance matters in TTRL. Current v50-v52 failures show this balance should be answer-cluster local, not only prompt-level.
+  - `arXiv:2510.17472` Certified Self-Consistency: majority vote certifies the sampled mode, not correctness. This is the main reason not to train only toward raw majority.
+  - `arXiv:2510.17923` COMPASS: combines answer and path self-scoring to reduce majority pseudo-label error. This matches the repo's v48 process-consistency signal, but v48 saturates and needs a non-majority preservation term.
+  - `arXiv:2511.01191` Self-Harmony: explicitly studies harmonizing self-supervision and self-play in TTRL; the useful design lesson is to avoid pure self-imitation when pseudo labels become overconfident.
+  - `arXiv:2512.15146` Beyond Majority Voting: fine-grained rewards and exploration beyond consensus can help, but too much exploration hurts. This supports a small, gated non-majority rescue rather than broad exploration.
+  - `arXiv:2512.04359` SENT: semantic and token entropy should be used together to avoid entropy collapse. Here the available analogue is answer-cluster effective K plus process/base support.
+- Design implication:
+  - v53 should not be another prompt-level capacity cap and should not repair first-four samples into the majority cluster.
+  - The next change should be sparse and local: when a first-four rollout is parseable, non-clipped, process-consistent, and belongs to a non-majority answer cluster with independent base/process support, give it a small positive terminal reward even if the majority cluster is sharper.
+  - This directly targets the v51 failure (`low_budget_soft_nonmajority_reward=0.003`) and v52 failure (anti-collapse reduced useful learning but did not add correctness signal).
+
+### 2026-07-07 v53 pre-run audit: low-budget non-majority rescue
+
+- Algorithm:
+  - Add default-off `ttrl.sps_low_budget_rescue_reward`.
+  - For each prompt, only the first `sps_low_budget_k=4` training rollouts are eligible.
+  - A rollout receives a small positive terminal rescue reward only if it is parseable, non-clipped, process-consistent, not the raw majority answer, and its answer cluster has independent support from base/ref probability, process consistency, and cluster mass.
+  - Initial enabled values in the v53 runner are `sps_low_budget_rescue_value=0.15`, `sps_low_budget_rescue_min_base=0.08`, `sps_low_budget_rescue_min_process=0.50`, `sps_low_budget_rescue_min_cluster_mass=0.03125`, and `sps_low_budget_rescue_min_support=0.15`.
+  - The rescue support intentionally excludes sharpened answer probability, because v51 showed sharpened support collapses to the majority basin and gives almost no non-majority reward by step 50.
+- Implementation audit before launching GPU training:
+  - Static checks passed: `git diff --check`, runner `bash -n`, and `py_compile` for `ttrl_utils.py` and `ray_trainer.py`.
+  - A pre-run code review found that low-budget negative/soft/rescue reward injection was originally nested under the `"sps_reward" in batch.batch` branch. That branch is not used by `answer_rule_conf_weight`, so v53 would have logged rescue diagnostics but not applied the terminal rescue reward.
+  - Fixed `ray_trainer.py` so low-budget negative/soft/rescue terminal rewards are applied for all SPS-enabled paths when their per-sample arrays exist in `batch.non_tensor_batch`, while preserving the existing `sps_reward` replacement behavior for modes that use it.
+  - Re-ran the same static checks after the fix; all passed.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v53_low_budget_nonmajority_rescue_strict_n4.sh`.
+  - Based on v48/v52 capacity stack but disables `sps_anti_collapse_capacity` and enables only the v53 rescue reward among the new first-four reward variants.
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+- Status:
+  - v53 has not yet been run after this pre-run fix. A new healthy worker is required because worker `986717` had broken `/proc` after v52 teardown.
+
+### 2026-07-07 v53 launch attempt 1: pre-step AF_UNIX path failure, then short-path fix
+
+- Worker:
+  - Released broken worker `986717` after confirming `PROC_SELF_BAD`, `PROC_MEMINFO_BAD`, and `PROC_COUNT=0`.
+  - Launched and logged into new worker `986961` with the required 8x B200 Arnold command.
+  - Preflight on `986961` was healthy: `/proc/self` and `/proc/meminfo` existed, `PROC_COUNT` was nonzero, 8 B200 GPUs were visible, `cuInit=0`, driver `580.105.08`, compat action `clear_compat`, GEMM smoke passed, and cuBLAS/cuDNN/NCCL/NVJitLink loaded from the venv cu12.9 paths.
+- Failure:
+  - The first v53 launch reached Ray and TaskRunner config validation, but failed before any training step: TaskRunner stderr showed repeated `OSError: AF_UNIX path too long` while progress was still `0/50`.
+  - No `training/global_step` row was produced, so this is an infra launch failure, not an algorithm result.
+  - After interrupting the stuck launch, worker `986961` remained healthy: `/proc` stayed valid and GPUs released to `0 MiB`.
+- Fix:
+  - Shortened the v53 runner paths to reduce Ray/vLLM IPC socket length:
+    - `RAY_DIR=/tmp/r53`
+    - `LOCAL_MODEL=/tmp/qm25v53`
+    - `ttrl_setup_cuda_env "q25v53"`
+  - Re-ran static checks after the short-path fix: `git diff --check`, runner `bash -n`, and `py_compile` for `ttrl_utils.py` and `ray_trainer.py` all passed.
+
+### 2026-07-07 v53 result: non-majority rescue is too sparse and regresses
+
+- Run:
+  - Worker: `986961`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v53_low_budget_nonmajority_rescue_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v53_low_budget_nonmajority_rescue_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v53_low_budget_nonmajority_rescue_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v53_low_budget_nonmajority_rescue_strict_n4_proc_health.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v53_low_budget_nonmajority_rescue_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed strict and low-budget: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main metric: `val-core/MATH-TTT/acc/mean@4=0.7399396378269618`.
+  - Diagnostics only: `best@4=0.8437082494969819`, `maj@4=0.7558812877263581`.
+  - Aux: `format_score/mean@4=0.9693158953722334`, `response_clip/mean@4=0.01358148893360161`, `response_avg_logprob/mean@4=-0.08428488473241148`.
+  - This is below current best v48 `mean@4=0.7454728370221329`, so v53 is not an improvement and should not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.560`, `weighted_label_confidence=0.816`, `unique_answer_count=9.375`.
+  - `answer_sharp_confidence=0.970`, `answer_effective_K=1.070`, `low_budget_capacity=0.672`, `low_budget_majority_mass=0.688`, `low_budget_agreement=0.875`.
+  - `base_support_capacity=0.814`, `cross_view_capacity=0.699`, `process_consistency_capacity=0.994`, `process_majority_support=0.994`, `process_consistent_rate=0.951`, `process_majority_consistent_rate=0.793`.
+  - The v53 reward injection path was active earlier (`train/sps_low_budget_rescue_reward_applied` became nonzero on steps such as 43-44), but by step 50 it collapsed to zero: `low_budget_rescue_reward_mean=0.000`, `low_budget_rescue_rate=0.000`, `low_budget_rescue_support=0.000`, `train/sps_low_budget_rescue_reward_applied=0.000`.
+- Infra and performance:
+  - Successful preflight before the run: `/proc/self` and `/proc/meminfo` OK, nonzero `PROC_COUNT`, 8 B200 visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke OK, cuBLAS/cuDNN/NCCL/nvJitLink loaded from the venv cu12.9 paths.
+  - Runner exit status `0`; post-run procfs remained healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=78`.
+  - Throughput summary for steps 41-50, including final validation: `50.118s/step`, `226902.100 tokens/step`, `4527.348 tokens/s`. Non-validation late steps were mostly around 22-32s; final validation step had `timing_s/testing=230.745` and `timing_s/step=255.312`.
+- Interpretation:
+  - v53 proves the terminal reward injection fix works, but the non-majority rescue support disappears late in training.
+  - It repeats the core v51/v52 failure: the answer distribution becomes over-sharp (`answer_sharp_confidence` near `0.97`, `effective_K` near `1`), while sparse alternative support is not durable enough to move strict `mean@4`.
+  - Do not continue by simply lowering v53 thresholds or increasing `rescue_value`; that would be post-hoc tuning and risks rewarding noisy minority clusters.
+  - Current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v54 plan: low-budget local-majority supported reward
+
+- Motivation:
+  - v48's best signal is that process consistency improves candidate existence (`best@4=0.8602`) but does not put enough probability mass onto the actual first-four samples (`mean@4=0.7455`).
+  - v46/v47 showed that repairing first-four samples toward the 32-sample raw majority can amplify wrong answer clusters.
+  - v53 showed that only rescuing non-majority candidates is too sparse by step 50.
+  - Therefore v54 targets the answer distribution that strict validation actually samples from: the first-four local answer cluster, not the global 32-sample raw majority and not validation-time selection.
+- Algorithm:
+  - Add default-off `ttrl.sps_low_budget_local_reward`.
+  - For each prompt, compute the local majority answer within the first `sps_low_budget_k=4` training rollouts.
+  - If that local answer has enough local mass, base/ref support, and process-consistency support, add a small terminal reward only to first-four rollouts that are parseable, non-clipped, process-consistent, and equal to the local first-four majority.
+  - Initial constants are semantic rather than validation-fit tuning: `sps_low_budget_local_value=0.12`, `sps_low_budget_local_min_mass=0.50`, `sps_low_budget_local_min_base=0.08`, `sps_low_budget_local_min_process=0.50`, `sps_low_budget_local_min_support=0.15`.
+  - This is intentionally weaker than v51's broad soft reward and v50's negative reward. It should create gradient for the locally stable first-four candidate without replacing samples or using validation-time scaling.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes local first-four support, writes `sps_low_budget_local_reward`, and logs local reward/support/mass/agreement metrics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs `train/sps/low_budget_local_*`, and injects the terminal reward into `token_level_scores`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off v54 config keys.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4.sh`.
+  - Based on v48 capacity stack, disables v53 `sps_low_budget_rescue_reward`, enables `sps_low_budget_local_reward=True`.
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+- Current infra status before running:
+  - Live shell had `/proc/self` and `/proc/meminfo` OK with `PROC_COUNT=110`, but `check_cuda_compat_preflight.sh` failed because `/proc/driver/nvidia/version` was missing. This is not a valid GPU preflight.
+  - Per infra recipe, do not start Ray/CUDA training until `/proc/driver/nvidia/version`, `nvidia-smi`, `cuInit=0`, and CUDA library path checks all pass.
+
+### 2026-07-07 v54 result: local-majority reward is active but amplifies low-budget error clusters
+
+- Run:
+  - Worker: `986961`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v54_low_budget_local_majority_reward_strict_n4_throughput_summary.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7223340040241448`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8329839034205231`, `val-core/MATH-TTT/acc/maj@4/mean=0.7358329979879275`.
+  - Aux: `format_score/mean@4=0.9647887323943662`, `response_clip/mean@4=0.018108651911468814`, `response_avg_logprob/mean@4=-0.08476292134554948`.
+  - This is below current best v48 `mean@4=0.7454728370221329`; v54 is not an improvement and must not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.678`, `weighted_label_confidence=0.802`, `unique_answer_count=11.625`.
+  - `answer_sharp_confidence=0.980`, `answer_effective_K=1.044`.
+  - `low_budget_capacity=0.792`, `low_budget_majority_ratio=0.812`, `low_budget_majority_mass=0.812`, `low_budget_agreement=0.875`.
+  - `base_support_capacity=0.801`, `cross_view_capacity=0.771`.
+  - `process_consistency_capacity=0.992`, `process_majority_support=0.992`, `process_consistent_rate=0.945`, `process_majority_consistent_rate=0.783`.
+  - The v54 local reward mechanism stayed active through the final step: `low_budget_local_reward_mean=0.084`, `low_budget_local_rate=0.750`, `low_budget_local_support=0.798`, `low_budget_local_mass=0.812`, `low_budget_local_agreement=0.875`, `train/sps_low_budget_local_reward_applied=0.011`, `train/sps_low_budget_local_active_rate=0.094`.
+  - `train/ground_truth_reward=0.777`, `train/pass@32=1.000`, `train/majority_ratio=0.791`.
+- Infra and performance:
+  - Runner exit status `0`; post-run procfs stayed healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=83`.
+  - Final GPU snapshot showed all 8 B200 GPUs released to `0 MiB`.
+  - Steps 41-50, including final validation: `timing_s/step=50.264`, `perf/total_num_tokens=230714.400`, `whole_machine_tokens_per_s=4590.016`.
+  - Non-validation late steps were mostly around `22-36s`; final validation step had `timing_s/testing=231.193` and `timing_s/step=255.566`.
+- Interpretation:
+  - v54 did not fail because the auxiliary reward was missing: `train/sps_low_budget_local_reward_applied` was nonzero at step 50.
+  - It failed because first-four local majority is still only a self-consistency signal. When the local cluster is wrong, the added terminal reward increases sharpness (`answer_sharp_confidence=0.980`, `effective_K=1.044`) and reduces candidate existence (`best@4=0.8330` vs v48 `0.8602`).
+  - This extends the v46/v47 lesson from global majority repair to local first-four majority reward: training toward a majority-like cluster, even a low-budget one, can amplify wrong clusters without an independent correctness signal.
+  - Do not continue by increasing `sps_low_budget_local_value` or loosening local support gates. The next algorithm should preserve v48's process-consistency candidate-existence gain while using a sharper conflict detector to avoid rewarding local/global majority clusters when independent supports disagree.
+  - Goal is not complete: strict `mean@4=0.7223340040241448 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v55 plan: support-conflict abstention capacity
+
+- Motivation:
+  - v48 remains the best strict 50-step result because process consistency improves candidate existence without directly rewriting samples.
+  - v52 showed broad anti-collapse capacity is too blunt: reducing weight whenever sharpness is high removes useful update strength without adding correctness information.
+  - v54 showed local first-four majority reward is unsafe: the mechanism was active, but it sharpened low-budget error clusters and reduced `best@4`.
+  - Therefore v55 keeps v48's capacity stack and adds a narrower abstention signal only when the SPS answer distribution is already sharp but independent supports do not confirm the raw majority.
+- Algorithm:
+  - Add default-off `ttrl.sps_support_conflict_capacity`.
+  - Trigger only under sharp distribution conditions: `answer_sharp_confidence >= 0.90` and `answer_effective_K <= 2.0`.
+  - Compute a conflict score from independent training-only signals:
+    - base/ref top answer disagrees with raw majority;
+    - base/ref probability on raw majority is below `0.55`;
+    - first-four local majority disagrees with raw majority;
+    - first-four raw-majority mass is below `0.50`;
+    - process-majority support is below `0.70`.
+  - Convert the mean conflict score into a prompt capacity in `[sps_support_conflict_min_weight, 1]`, with `sps_support_conflict_min_weight=0.15`, and take `min(prompt_weight, support_conflict_capacity)`.
+  - This is not a new reward and does not favor a minority answer. It is an abstention mechanism: when the model is very confident but independent views disagree, do less self-imitation rather than sharpening either cluster.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes support-conflict capacity and logs `sps_support_conflict_*` arrays.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config and logs `train/sps/support_conflict_capacity`, `train/sps/support_conflict_active_rate`, and `train/sps/support_conflict_score`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off config keys.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.sh`.
+  - Based on v48 capacity stack, disables v53 rescue and v54 local reward, enables only `ttrl.sps_support_conflict_capacity=True` among the post-v48 mechanisms.
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+- Expected diagnostic:
+  - If v55 helps, `best@4` should stay close to v48 while `mean@4` improves through fewer overconfident wrong-cluster updates.
+  - If it regresses like v52, that means even conflict-aware abstention removes too much useful gradient and the next direction should use a positive independent correctness signal instead of more capacity caps.
+
+### 2026-07-07 v55 result: support-conflict abstention is too weak/sparse and does not improve
+
+- Run:
+  - Worker: `986961`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_throughput_summary.txt`.
+- Static checks before launch:
+  - `git diff --check` passed for the docs, `ttrl_utils.py`, `ray_trainer.py`, `ppo_trainer_ttrl.yaml`, and the v55 runner.
+  - `bash -n` passed for the v55 runner.
+  - `PYTHONPATH=/opt/tiger/TTRL/verl /opt/tiger/modelchef/.venv/bin/python -m py_compile ...` passed for `ttrl_utils.py` and `ray_trainer.py`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7303822937625755`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8424144869215292`, `val-core/MATH-TTT/acc/maj@4/mean=0.7451207243460765`.
+  - Aux: `format_score/mean@4=0.96579476861167`, `response_clip/mean@4=0.012072434607645875`, `response_avg_logprob/mean@4=-0.08552311989279666`.
+  - This is below current best v48 `mean@4=0.7454728370221329`; v55 is not an improvement and must not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.486`, `weighted_label_confidence=0.778`, `unique_answer_count=12.625`.
+  - `answer_sharp_confidence=0.966`, `answer_effective_K=1.085`.
+  - `low_budget_capacity=0.666`, `low_budget_majority_ratio=0.719`, `low_budget_majority_mass=0.719`, `low_budget_agreement=1.000`.
+  - `base_support_capacity=0.775`, `cross_view_capacity=0.668`.
+  - `process_consistency_capacity=0.979`, `process_majority_support=0.979`, `process_consistent_rate=0.949`, `process_majority_consistent_rate=0.750`.
+  - v55 mechanism did trigger but only weakly at the final step: `support_conflict_capacity=0.987`, `support_conflict_active_rate=0.125`, `support_conflict_score=0.015`.
+  - Earlier steps showed intermittent stronger activity, e.g. step 3 `support_conflict_active_rate=0.375`, step 17 `0.375`, step 35 `0.250`, but not enough to change final strict mean.
+  - `train/ground_truth_reward=0.789`, `train/pass@32=1.000`, `train/majority_ratio=0.762`.
+- Infra and performance:
+  - Preflight before the run was healthy: `/proc/self` and `/proc/meminfo` existed, `PROC_COUNT=84`, 8 B200 GPUs visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke passed, and cuBLAS/cuDNN/NCCL/nvJitLink loaded from the venv cu12.9 paths.
+  - Runner exit status was `0`, but procfs broke immediately after teardown: `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER=0`, and final snapshot also had `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`.
+  - Final GPU snapshot showed residual teardown-window memory on GPUs 4/5/6, including `[Not Found]` PID `143680` using about `31148 MiB` on GPU5. Do not use worker `986961` for further Ray/CUDA experiments.
+  - Steps 41-50, including final validation: `timing_s/step=49.694`, `perf/total_num_tokens=229575.400`, `whole_machine_tokens_per_s=4619.828`.
+  - Non-validation late steps were mostly about `24-28s`; final validation step had `timing_s/testing=231.867` and `timing_s/step=255.900`.
+- Interpretation:
+  - v55 supports the current diagnosis that pure capacity/abstention is not enough. It avoided the direct local-majority reward failure of v54, but its conflict score was usually small by late training because base/ref, low-budget local majority, and process support often agreed with the same majority basin.
+  - As a result, v55 mostly behaves like a lightly damped v48/v52-style capacity variant and does not add the missing independent correctness signal needed to turn candidate existence into strict low-budget `mean@4`.
+  - Do not continue by simply lowering `sps_support_conflict_base_min`, raising `sps_support_conflict_sharp_min`, or reducing `sps_support_conflict_min_weight`; that would be post-hoc threshold tuning and likely repeat v52's loss of useful gradient.
+  - Next algorithm direction should introduce an internal positive correctness signal that is not majority/local-majority imitation, for example a cheap self-verification/process-answer agreement score that can distinguish correct supported candidates from self-consistent wrong clusters without validation-time selection.
+  - Goal is not complete: strict `mean@4=0.7303822937625755 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v55 result: conflict-aware abstention is too weak/late and regresses
+
+- Run:
+  - Worker: `986961`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_proc_health.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4_throughput_summary.txt`.
+- Static/preflight evidence:
+  - Static checks passed before launch:
+    - `git -C /opt/tiger/TTRL diff --check -- TTRL_SPS_HANDOFF.md TTRL_SPS_CN_SUMMARY.md verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py verl/verl/trainer/config/ppo_trainer_ttrl.yaml verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.sh`
+    - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v55_support_conflict_capacity_strict_n4.sh`
+    - `PYTHONPATH=/opt/tiger/TTRL/verl /opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Manual worker preflight before launch was healthy: `/proc/self` and `/proc/meminfo` present, `PROC_COUNT=83`, 8 B200 visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke OK, and loaded cuBLAS/cuDNN/NCCL/nvJitLink from `/opt/tiger/modelchef/.venv` cu12.9 paths.
+  - The runner repeated the same preflight and launched Ray on `127.0.0.1`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7303822937625755`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8424144869215292`, `val-core/MATH-TTT/acc/maj@4/mean=0.7451207243460765`.
+  - Aux: `format_score/mean@4=0.96579476861167`, `response_clip/mean@4=0.012072434607645875`, `response_avg_logprob/mean@4=-0.08552311989279666`.
+  - This is below current best v48 `mean@4=0.7454728370221329`; v55 is not an improvement and must not be committed as an improvement record.
+- Step-50 internal metrics:
+  - `train/sps/train_weight=0.486`, `weighted_label_confidence=0.778`, `unique_answer_count=12.625`.
+  - `answer_sharp_confidence=0.966`, `answer_effective_K=1.085`.
+  - `low_budget_capacity=0.666`, `low_budget_majority_ratio=0.719`, `low_budget_majority_mass=0.719`, `low_budget_agreement=1.000`.
+  - `base_support_capacity=0.775`, `cross_view_capacity=0.668`.
+  - `process_consistency_capacity=0.979`, `process_majority_support=0.979`, `process_consistent_rate=0.949`, `process_majority_consistent_rate=0.750`.
+  - v55 mechanism was wired in and intermittently active, but weak by step 50: `support_conflict_capacity=0.987`, `support_conflict_active_rate=0.125`, `support_conflict_score=0.015`. Earlier checkpoints showed stronger but still modest activation, e.g. step 17 `active_rate=0.375`, `score=0.089`.
+  - `train/ground_truth_reward=0.789`, `train/pass@32=1.000`, `train/majority_ratio=0.762`.
+- Infra and performance:
+  - Training command exited with status `0`.
+  - Steps 41-50, including final validation: `timing_s/step=49.694`, `perf/total_num_tokens=229575.400`, `whole_machine_tokens_per_s=4619.828`.
+  - Non-validation late steps were mostly around `24-30s`; final validation step had `timing_s/testing=231.867` and `timing_s/step=255.900`.
+  - Important infra failure after teardown: `/proc` broke immediately after the run. Proc health file shows `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER=0`, and final snapshot also shows `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`.
+  - GPU teardown left residual memory: GPU5 had `31159 MiB` with PID `143680` shown as `[Not Found]`, plus small residuals on GPU4/GPU6. Worker `986961` must not be used for further Ray/CUDA training; a new healthy worker is required before the next GPU experiment.
+- Interpretation:
+  - v55 did what it was designed to do, but the signal was too sparse/late to improve strict `mean@4`. At step 50 the independent supports already agreed with the majority (`base_support_agreement=1.000`, `low_budget_agreement=1.000`, `process_majority_support=0.979`), so conflict abstention barely changed the final update.
+  - Like v52, it is still a capacity-only method: it avoids some overconfident conflict cases but does not create a new correctness signal. It also did not preserve v48 candidate existence (`best@4=0.8424` vs v48 `0.8602`).
+  - Do not continue by only lowering `sps_support_conflict_sharp_min`, increasing `support_conflict_score`, or reducing `min_weight`; that would become post-hoc capacity tuning and risks repeating v52's gradient-removal failure.
+  - The next algorithm should move away from prompt-level capacity caps and toward an explicit independent positive signal for candidates whose final answer is supported by process/base evidence before the distribution collapses. A plausible next direction is answer-cluster margin distillation: reward or weight only clusters where base/ref and process-consistent support agree with the answer cluster and penalize nothing else, with an early-step or entropy gate so the signal is applied before step-50 majority support has already saturated.
+  - Goal is not complete: strict `mean@4=0.7303822937625755 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v56 plan: independent-support first-four reward
+
+- Motivation:
+  - v55 established that conflict-aware capacity is wired correctly but too weak/late by step 50; it remains a capacity-only method and does not create a correctness signal.
+  - v51/v54 showed that using sharpened answer probability or local/global majority as a positive reward target can collapse into majority self-imitation and amplify wrong clusters.
+  - v56 therefore adds a positive signal, but excludes sharpened SPS probability from the support score. The reward is based only on independent training-time evidence: base/ref answer probability, process-consistent cluster ratio, and sampled cluster mass.
+- Algorithm:
+  - Add default-off `ttrl.sps_independent_support_reward`.
+  - For each answer cluster, compute:
+    - `base_prob_by_answer[answer]` from the ref/base policy answer distribution;
+    - `process_cluster_conf` = fraction of rollouts in that answer cluster that are process-consistent;
+    - `cluster_mass = count(answer) / n`.
+  - Independent support is `(base * process * sqrt(cluster_mass)) ** (1/3)`.
+  - Only first-four training samples are eligible. A sample gets a small terminal reward if it is parseable, non-clipped, process-consistent, and its answer cluster passes:
+    - `base >= 0.12`;
+    - `process >= 0.65`;
+    - `cluster_mass >= 0.0625` (at least two out of 32, or equivalent support);
+    - normalized independent support >= `0.20`.
+  - Initial reward value is `0.18`. If the supported cluster is the majority and independent-support effective K is already collapsed (`<=1.15`), the reward is halved. Non-majority supported clusters can receive the full reward when independent support remains diverse.
+  - This does not use ground truth, does not change validation, does not select answers at validation time, and does not reward raw/local majority directly.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_independent_support_reward`, plus reward rate, non-majority rate, mean support value, and independent support effective K.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs `train/sps/independent_support_*`, and injects the terminal reward.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off v56 config keys.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4.sh`.
+  - Based on v48 capacity stack, disables v53 rescue, v54 local reward, and v55 support-conflict capacity; enables only `ttrl.sps_independent_support_reward=True` among the post-v48 mechanisms.
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+- Current infra status:
+  - Worker `986961` is broken after v55 (`PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`) and must not be reused for Ray/CUDA training.
+  - v56 needs a new healthy worker and the full preflight before launch.
+
+### 2026-07-07 original MajVote TTRL baseline: Qwen2.5-Math-7B 50-step strict n=4
+
+- Run:
+  - Worker: `987078`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_majvote_qwen25_math_7b_50step_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_metrics.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_proc_health.txt`.
+- Purpose:
+  - This is the requested original/simple majority-vote TTRL 50-step baseline for Qwen2.5-Math-7B, using the same strict low-budget validation protocol as the SPS runs.
+  - It disables SPS with `ttrl.sps_enable=False`, so the training path uses the original majority pseudo-label signal.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Validation reward count was `1988=497*4`, matching the full filtered MATH-TTT/MATH500 validation set with four rollouts per prompt.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7288732394366197`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8364587525150906`, `val-core/MATH-TTT/acc/maj@4/mean=0.743665995975855`.
+  - Aux: `format_score/mean@4=0.9617706237424547`, `response_clip/mean@4=0.01659959758551308`, `response_avg_logprob/mean@4=-0.07901386488789687`.
+- Infra and performance:
+  - Preflight before launch was healthy: `/proc/self` and `/proc/meminfo` existed, `PROC_COUNT` was populated, 8 B200 GPUs visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke passed, and CUDA libraries loaded from the expected venv cu12.9 paths.
+  - The first launch attempt failed before training because Ray AF_UNIX socket paths were too long. The runner was fixed to use short paths: `RAY_DIR=/tmp/rmvq25`, `LOCAL_MODEL=/tmp/q25maj`.
+  - Ray launched on loopback with `+ray_init.node_ip_address=127.0.0.1`; the log monitor still emitted `/var/log/tiger/stdout` permission noise, but it did not block training or validation.
+  - Runner exit status was `0`; after teardown `/proc` remained healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=82`; all 8 GPUs returned to `0 MiB`.
+  - Steps 41-50 including final validation: `timing_s/step=46.943`, `perf/total_num_tokens=243824.800`, `whole_machine_tokens_per_s=5194.050`.
+  - Late non-validation steps were mostly around `22-28s`; final validation step had `timing_s/testing=230.116` and `timing_s/step=250.654`.
+- Interpretation:
+  - Original MajVote TTRL at 50 steps reaches strict `mean@4=72.89%`, below the current best SPS strict 50-step v48 result `mean@4=74.55%`.
+  - The comparison supports the current direction: the SPS/process-consistency family improves over plain majority pseudo-labeling in this 50-step low-budget setting, but the best confirmed gain is still small and far from the `85%` goal.
+  - This baseline is a comparison record, not an algorithm improvement; no improvement commit is required from this result.
+
+### 2026-07-07 v56 launch attempt 1/2: AF_UNIX short-path fixes before real training
+
+- Worker:
+  - Worker `987078`, 8x B200, stayed healthy throughout these failed pre-step attempts.
+  - Manual and runner preflight were healthy: `/proc/self` and `/proc/meminfo` present, `PROC_COUNT` populated, 8 B200 GPUs visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke OK, and cuBLAS/cuDNN/NCCL/nvJitLink loaded from the venv cu12.9 paths.
+- Attempt 1:
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4.sh`.
+  - It failed before training because Ray's plasma socket path exceeded the AF_UNIX 107-byte limit under the long experiment cache root:
+    - `/tmp/ttrl_cache/sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4/ray/ray/session_.../sockets/plasma_store`.
+  - Fix: set `RAY_DIR=/tmp/r56` while keeping model and non-socket caches under `/tmp/ttrl_cache/<exp>`.
+- Attempt 2:
+  - Ray started successfully with `RAY_TMPDIR=/tmp/r56`, and TaskRunner reached `Training Progress: 0/50`.
+  - It then hit a second AF_UNIX path issue in Python multiprocessing while sharing torch storages:
+    - `torch.multiprocessing.reductions.reduce_storage -> multiprocessing.resource_sharer.DupFd -> SocketListener.bind`
+    - error: `OSError: AF_UNIX path too long`.
+  - Root cause: `TMPDIR` was still the long experiment path (`/tmp/ttrl_cache/<long-exp>/tmp`), and Python multiprocessing creates resource-sharer sockets under `TMPDIR`.
+  - Fix: set `SHORT_TMPDIR=/tmp/t56` and export `TMPDIR="$SHORT_TMPDIR"` immediately before training; also clean/create both `/tmp/r56` and `/tmp/t56` at launch.
+- Health after interruption:
+  - No `training/global_step` completed, no valid validation metric exists, and this is not an algorithm result.
+  - After manual interruption, no Ray/training process remained, all 8 GPUs returned to `0 MiB`, and `/proc` stayed healthy (`PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=88` in the script snapshot; manual check also showed populated `/proc`).
+- Runner status:
+  - Static checks passed after the short `TMPDIR` fix:
+    - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4.sh`
+    - `git -C /opt/tiger/TTRL diff --check -- TTRL_SPS_HANDOFF.md TTRL_SPS_CN_SUMMARY.md verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py verl/verl/trainer/config/ppo_trainer_ttrl.yaml verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4.sh`
+  - General infra rule learned: for Ray + torch multiprocessing runs, both `RAY_TMPDIR` and `TMPDIR` must be short. Long cache roots are acceptable for HF/vLLM/Triton/TorchInductor/model copies, but not for AF_UNIX socket-bearing temp dirs.
+
+### 2026-07-07 v56 result: independent-support reward activates but does not improve strict mean@4
+
+- Run:
+  - Worker: `987078`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4_metrics.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v56_independent_support_reward_strict_n4_proc_health.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7379275653923542`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8385251509054326`, `val-core/MATH-TTT/acc/maj@4/mean=0.7518812877263582`.
+  - Aux: `format_score/mean@4=0.971327967806841`, `response_clip/mean@4=0.01056338028169014`, `response_avg_logprob/mean@4=-0.08567095844129427`.
+  - This is below the current best v48 strict `mean@4=0.7454728370221329`; v56 is not an improvement and must not be committed as an algorithm improvement.
+- Step-50 internal metrics:
+  - The v56 reward path was active: `independent_support_reward_mean=0.118`, `independent_support_rate=0.719`, `independent_support_nonmajority_rate=0.000`, `train/sps_independent_support_reward_applied=0.015`, `train/sps_independent_support_active_rate=0.090`.
+  - The distribution was already sharply collapsed by step 50: `answer_sharp_confidence=0.970`, `answer_effective_K=1.070`, `weighted_label_confidence=0.806`, `unique_answer_count=9.750`.
+  - Low-budget and process signals were also strong: `low_budget_capacity=0.719`, `low_budget_majority_ratio=0.750`, `low_budget_agreement=0.875`, `base_support_capacity=0.803`, `process_consistency_capacity=0.998`, `process_majority_support=0.998`.
+  - Training diagnostics: `train/ground_truth_reward=0.793`, `train/pass@32=1.000`, `train/majority_ratio=0.787`.
+- Infra and performance:
+  - Short-path fixes were required before the successful run: `RAY_DIR=/tmp/r56` and `TMPDIR=/tmp/t56`.
+  - The successful run reached all 50 steps and runner exited with status `0`.
+  - Steps 41-50 including final validation: `timing_s/step=49.713`, `perf/total_num_tokens=225834.200`, `whole_machine_tokens_per_s=4542.759`.
+  - Final validation step had `timing_s/testing=230.816` and `timing_s/step=254.612`; non-validation late steps were mostly about `25-30s`.
+  - Important infra failure after teardown: `/proc` broke immediately after the run, despite the run itself finishing. Proc health shows `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER=0`, and final snapshot also has `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`.
+  - GPU teardown left a residual `[Not Found]` process on GPU4: `PID 108218`, about `30712 MiB`. Do not use worker `987078` for further Ray/CUDA experiments.
+- Interpretation:
+  - v56 confirms that an independent-support positive reward can be wired in and can become active without validation-time selection. It also increases internal training correctness by late training (`ground_truth_reward=0.793`).
+  - However, it still does not improve strict low-budget `mean@4`; it lands at `73.79%`, between MajVote baseline `72.89%` and current best v48 `74.55%`.
+  - The main failure mode is that the independent-support reward mostly ends up supporting the same majority basin by step 50. `independent_support_nonmajority_rate=0.000`, while `process_majority_support=0.998` and `base_support_agreement=1.000`; so the reward behaves like another majority-confirming sharpening signal rather than a mechanism that promotes alternative correct first-four candidates.
+  - Next algorithm should not simply increase `sps_independent_support_value` or loosen support thresholds. The internal evidence says the signal is already active but too aligned with the collapsed majority. A better next direction is to make the positive support explicitly margin-aware or disagreement-aware earlier in training: reward support only when it improves first-four candidate diversity/correctness under non-collapsed independent-support effective K, or add a counter-signal when support is entirely majority-confirming after sharp collapse.
+  - Goal remains incomplete: strict `mean@4=0.7379275653923542 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v57 plan: margin-aware independent-support reward
+
+- Motivation:
+  - v56 proved the independent-support reward was wired and active, but its step-50 support had already collapsed into the same majority basin: `independent_support_nonmajority_rate=0.000`, `process_majority_support=0.998`, `base_support_agreement=1.000`, `answer_effective_K=1.070`.
+  - Therefore v57 is not a value/threshold sweep. The failure is structural: majority-confirming support is still self-imitation. v57 keeps the same base/ref + process + cluster-mass support score, but changes when majority samples are allowed to receive the reward.
+- Algorithm:
+  - Add default-compatible config keys:
+    - `ttrl.sps_independent_support_majority_margin_max`
+    - `ttrl.sps_independent_support_competition_min`
+  - For each prompt, compute independent-support top-2 margin and competition ratio from the answer-cluster support distribution.
+  - Non-majority first-four samples can still receive the full small positive reward when they are parseable, non-clipped, process-consistent, and pass the existing base/process/mass/support gates.
+  - Majority first-four samples receive reward only when independent support has not collapsed and there is a competing supported cluster:
+    - `independent_support_effective_K > entropy_gate`;
+    - `top1_support - top2_support <= majority_margin_max`;
+    - `top2_support / top1_support >= competition_min`.
+  - In the v57 runner this is set to `majority_margin_max=0.12` and `competition_min=0.35`. These are semantic gates chosen from the v56 failure mode, not post-hoc acc tuning: if support is already a single dominant majority mode, majority samples get no extra reward. If there is meaningful support competition, majority samples can get a half-scale reward while non-majority supported samples keep full scale.
+- Metrics:
+  - New logged diagnostics:
+    - `train/sps/independent_support_margin`
+    - `train/sps/independent_support_competition_rate`
+    - `train/sps/independent_support_majority_gate_rate`
+  - These should show whether v57 actually finds non-collapsed or competitive support. If `competition_rate` and `nonmajority_rate` remain near zero, the idea did not create the missing first-four correctness signal.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes margin/competition gates and suppresses majority reward when support is collapsed.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes the new config and logs the new diagnostics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-compatible config keys.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4.sh`.
+- Validation:
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85`; `best@4` and `maj@4` remain diagnostics only.
+- Infra:
+  - Use short socket-bearing paths: `RAY_DIR=/tmp/r57`, `TMPDIR=/tmp/t57`.
+  - Do not use broken worker `987078`; it ended v56 with empty `/proc` and a residual `[Not Found]` GPU process.
+  - Before launch, require the full B200 preflight: `/proc/self`, `/proc/meminfo`, populated `/proc`, `nvidia-smi`, driver/compat, `cuInit=0`, GEMM smoke, and actual CUDA/cuBLAS/cuDNN/NCCL/nvJitLink loaded paths.
+
+### 2026-07-07 v57 result: margin-aware gate works mechanically but regresses strict mean@4
+
+- Run:
+  - Worker: `987258`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4_metrics.txt`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4_ray_taskrunner.log`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v57_margin_aware_independent_support_strict_n4_proc_health.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7248490945674044`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8291086519114689`, `val-core/MATH-TTT/acc/maj@4/mean=0.7377303822937624`.
+  - Aux: `format_score/mean@4=0.9708249496981891`, `response_clip/mean@4=0.01659959758551308`, `response_avg_logprob/mean@4=-0.08559657144547633`.
+  - This is below v56 `mean@4=0.7379275653923542` and below the current best v48 strict `mean@4=0.7454728370221329`; v57 is not an improvement and must not be committed as an algorithm improvement.
+- Step-50 internal metrics:
+  - The v57 margin/competition gate did suppress majority-confirming reward: `independent_support_majority_gate_rate=0.000`.
+  - It also produced non-majority support at the end: `independent_support_nonmajority_rate=0.031`, `independent_support_rate=0.031`, `independent_support_reward_mean=0.003`.
+  - However the positive signal was extremely sparse by step 50 and not competitively supported: `independent_support_effective_K=5.507`, `independent_support_margin=0.707`, `independent_support_competition_rate=0.000`.
+  - The answer distribution was still sharply collapsed in first-four behavior: `answer_sharp_confidence=0.959`, `answer_effective_K=1.103`, `process_majority_support=0.987`, `process_consistency_capacity=0.987`.
+  - Other diagnostics: `low_budget_capacity=0.542`, `base_support_capacity=0.793`, `ground_truth_reward=0.793`, `pass@32=1.000`.
+  - Mid-run examples showed the intended mechanism can activate (`nonmajority_rate` up to about `0.156`, `competition_rate=0.375`, `majority_gate_rate=0.094` near late training), but this did not translate into strict validation gain.
+- Infra and performance:
+  - Preflight before launch was healthy: `/proc/self` and `/proc/meminfo` existed, `PROC_COUNT` was populated, 8 B200 GPUs visible, driver `580.105.08`, compat action `clear_compat`, `cuInit=0`, GEMM smoke passed, and CUDA libraries loaded from expected venv cu12.9 paths.
+  - Runner exit status was `0`.
+  - After teardown `/proc` remained healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=79`; all 8 GPUs returned to `0 MiB`.
+  - Steps 41-50 including final validation: `timing_s/step=49.432`, `perf/total_num_tokens=220349.700`, `whole_machine_tokens_per_s=4457.633`.
+  - Final validation step had `timing_s/testing=228.289` and `timing_s/step=253.376`; late non-validation steps were mostly about `22-34s`.
+- Interpretation:
+  - v57 confirms the structural gate is wired correctly: majority samples do not receive extra reward when independent support has collapsed, and sparse non-majority first-four samples can receive reward.
+  - The failure mode is that the resulting non-majority signal is too sparse or misdirected. It removes some majority imitation but does not add a sufficiently reliable correctness signal for first-four outputs.
+  - Do not continue by simply loosening `sps_independent_support_majority_margin_max`, lowering `sps_independent_support_competition_min`, or increasing reward value. That would likely recreate v56's majority-confirming self-imitation and would be validation-driven tuning.
+  - Next direction should use v57's diagnostics to find a stronger internal correctness signal, for example process-answer agreement or low-cost self-verification that can distinguish supported correct candidates from supported but wrong alternative clusters before the first-four distribution collapses.
+  - Goal remains incomplete: strict `mean@4=0.7248490945674044 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v58 plan: process-answer reward without cluster-mass leakage
+
+- Motivation:
+  - v56/v57 showed that positive support rewards can be wired into the terminal score, but the support formula still leaks answer frequency through `sqrt(cluster_mass)` and through cluster-level `logsumexp` base scores.
+  - v56 therefore collapsed into majority self-imitation, while v57 removed most majority reward but left only a very sparse non-majority signal.
+  - v58 changes the correctness proxy rather than loosening v57 thresholds: it uses the sample's own process consistency plus a per-answer mean base/ref support score, so an answer is not rewarded merely because it appeared many times.
+- Algorithm:
+  - Add default-off config keys:
+    - `ttrl.sps_process_answer_reward`
+    - `ttrl.sps_process_answer_value`
+    - `ttrl.sps_process_answer_min_base`
+    - `ttrl.sps_process_answer_min_process`
+    - `ttrl.sps_process_answer_min_support`
+    - `ttrl.sps_process_answer_majority_scale`
+  - For each answer cluster, compute base/ref support from mean normalized logprob within that answer cluster:
+    - `base_answer_mean_score = logsumexp(base_scores_for_answer) - log(cluster_count)`;
+    - softmax these mean scores over answers to obtain `base_mean_prob_by_answer`.
+  - For each first-four sample, require parseable, non-clipped, and process-consistent text. Its answer-level support is:
+    - `sqrt(base_mean_prob_by_answer[answer] * process_consistent_count(answer) / count(answer))`.
+  - Reward only if base mean support, process support, and normalized support pass gates. Majority samples get a reduced reward scale; non-majority samples get full scale.
+  - Runner values are intentionally small and semantic: `value=0.16`, `min_base=0.10`, `min_process=0.60`, `min_support=0.20`, `majority_scale=0.50`.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_process_answer_reward` and diagnostics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs diagnostics, and injects the terminal reward.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off keys.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v58_process_answer_reward_strict_n4.sh`.
+- Validation:
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85`; `best@4` and `maj@4` remain diagnostics only.
+- Expected diagnostics:
+  - `train/sps/process_answer_rate` should be nonzero but not simply equal to majority mass.
+  - `train/sps/process_answer_nonmajority_rate` should stay meaningfully above zero if the signal is adding candidate-level correctness rather than only sharpening the majority.
+  - `train/sps_process_answer_reward_applied` should remain small; a large dense reward would indicate v58 is just another self-training reward.
+
+### 2026-07-07 v58 result: process-answer reward still mostly tracks the majority basin
+
+- Run:
+  - Worker: `987258`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v58_process_answer_reward_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v58_process_answer_reward_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v58_process_answer_reward_strict_n4_metrics.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v58_process_answer_reward_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v58_process_answer_reward_strict_n4_proc_health.txt`.
+  - Ray TaskRunner log: `/tmp/r58/ray/session_latest/logs/worker-c1432347c7caa6bf995deefdb3c899da4ff2274ddd4f44d96e5a517f-ffffffff-38364.out`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7394366197183099`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8441327967806841`, `val-core/MATH-TTT/acc/maj@4/mean=0.7570281690140845`.
+  - Aux: `format_score/mean@4=0.9683098591549296`, `response_clip/mean@4=0.01659959758551308`, `response_avg_logprob/mean@4=-0.08221129921988267`.
+  - This is above v57 `mean@4=0.7248490945674044`, but below v56 `mean@4=0.7379275653923542` by only noise-level margin and below the current best v48 strict `mean@4=0.7454728370221329`; v58 is not an improvement and must not be committed as an algorithm improvement.
+- Step-50 internal metrics:
+  - The reward activated without becoming dense: `process_answer_reward_mean=0.057`, `process_answer_rate=0.688`, `train/sps_process_answer_reward_applied=0.007`, `train/sps_process_answer_active_rate=0.086`.
+  - However it still mostly followed the majority basin: `process_answer_nonmajority_rate=0.031`, `low_budget_majority_ratio=0.875`, `low_budget_majority_mass=0.875`, `process_majority_support=0.996`.
+  - The answer distribution was essentially collapsed: `answer_sharp_confidence=0.976`, `answer_effective_K=1.060`, `sharp_majority_margin=0.966`.
+  - Other diagnostics: `low_budget_capacity=0.852`, `base_support_capacity=0.820`, `cross_view_capacity=0.818`, `process_consistency_capacity=0.996`, `ground_truth_reward=0.828`, `pass@32=1.000`.
+  - Step 49 briefly had more diversity (`answer_effective_K=2.353`, `process_answer_nonmajority_rate=0.031`) but the final validation still did not improve strict first-four average correctness.
+- Infra and performance:
+  - Runner exit status was `0`.
+  - After teardown `/proc` remained healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=85`; all 8 GPUs returned to `0 MiB`.
+  - Steps 41-50 including final validation: `timing_s/step=50.540`, `perf/total_num_tokens=231805.900`, `whole_machine_tokens_per_s=4586.538`.
+  - Final validation step had `timing_s/testing=230.530` and `timing_s/step=253.011`; late non-validation steps were mostly about `26-30s`.
+- Interpretation:
+  - v58 correctly removed the direct cluster-count term from the support formula, but the remaining process-consistency and mean base/ref support still become majority-confirming once the first-four distribution has sharpened.
+  - The high `best@4=0.8441` vs strict `mean@4=0.7394` again shows that candidate existence is not the bottleneck; the bottleneck is moving correctness into the low-budget average without validation-time selection.
+  - Do not continue by simply lowering `process_answer_min_base`, lowering `process_answer_min_support`, or increasing `process_answer_value`; the reward is already active and the failure mode is directionality, not lack of activation.
+  - Next algorithm direction should introduce an internal signal that is anti-majority when the majority basin is already overconfident, or a verifier-free consistency signal that can prefer minority correct candidates before collapse. Pure support/capacity sharpening has repeatedly saturated around `72-75%` strict mean@4.
+  - Goal remains incomplete: strict `mean@4=0.7394366197183099 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v59 plan: contrastive alternative reward under over-sharp majority collapse
+
+- Motivation:
+  - v48 remains the best strict 50-step result because process consistency improves candidate existence, and its diagnostic `best@4=0.8601911468812877` proves that at least one correct first-four candidate often exists.
+  - v50-v58 show that positive support rewards, local-majority rewards, and process-answer rewards are active but mostly become majority-confirming by step 50.
+  - v58's step-50 metrics are the direct trigger for v59: `process_answer_rate=0.688` but `process_answer_nonmajority_rate=0.031`, while `answer_sharp_confidence=0.976`, `answer_effective_K=1.060`, and `process_majority_support=0.996`. The failure is not lack of reward activation; it is that the reward direction still follows an over-sharp majority basin.
+- Algorithm:
+  - Add default-off config keys:
+    - `ttrl.sps_contrastive_alt_reward`
+    - `ttrl.sps_contrastive_alt_value`
+    - `ttrl.sps_contrastive_alt_majority_penalty`
+    - `ttrl.sps_contrastive_alt_min_base`
+    - `ttrl.sps_contrastive_alt_min_process`
+    - `ttrl.sps_contrastive_alt_min_support`
+    - `ttrl.sps_contrastive_alt_sharp_min`
+    - `ttrl.sps_contrastive_alt_effective_k_max`
+    - `ttrl.sps_contrastive_alt_low_budget_mass_min`
+    - `ttrl.sps_contrastive_alt_majority_support_min`
+  - Reuse v58's count-neutral answer support:
+    - `base_answer_mean_score = logsumexp(base_scores_for_answer) - log(cluster_count)`;
+    - `base_mean_prob_by_answer = softmax(base_answer_mean_score)`;
+    - `process_answer_support = sqrt(base_mean_prob_by_answer * process_consistent_rate(answer))`.
+  - Enable the contrastive gate only when the prompt is already over-sharp and majority-supported:
+    - `answer_sharp_confidence >= 0.92`;
+    - `answer_effective_K <= 1.35`;
+    - first-four majority mass `>= 0.70`;
+    - base/ref majority confidence and process-majority support both `>= 0.70`.
+  - If the gate is active, first-four samples that are non-majority, parseable, non-clipped, process-consistent, and have enough mean base/process support get a small positive reward. If at least one such alternative exists, first-four majority samples get a smaller negative terminal reward. The scale is modulated by a collapse score from sharp confidence and effective-K collapse.
+  - v59 runner values are intentionally conservative and structural: `value=0.14`, `majority_penalty=0.06`, `min_base=0.08`, `min_process=0.60`, `min_support=0.18`, `sharp_min=0.92`, `effective_k_max=1.35`, `low_budget_mass_min=0.70`, `majority_support_min=0.70`.
+- Why this is not post-hoc tuning:
+  - v59 is not lowering thresholds because v58 had low acc. It changes direction based on internal diagnostics: the existing reward is active but majority-confirming.
+  - It follows the literature theme already logged for verifier-free RL and entropy/capacity control: confidence should guide training only when calibrated by uncertainty, and overconfident self-consensus should not be reinforced unconditionally.
+  - It does not use Math500 labels, validation answers, best-of selection, majority vote as a final metric, `n=32` validation-time selection, or ground-truth selection.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_contrastive_alt_reward` and diagnostics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs diagnostics, and injects terminal reward.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off keys.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v59_contrastive_alt_strict_n4.sh`.
+- Validation:
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85`; `best@4` and `maj@4` remain diagnostics only.
+- Expected diagnostics:
+  - `train/sps/contrastive_alt_gate` should be nonzero mainly after answer distribution becomes sharp.
+  - `train/sps/contrastive_alt_rate` should be sparse but above zero; if it is zero throughout, v59 cannot affect the bottleneck.
+  - `train/sps/contrastive_alt_majority_penalty_rate` should be nonzero only when an eligible alternative exists; a dense penalty would mean the method is merely anti-majority rather than contrastive.
+  - `train/sps_contrastive_alt_reward_applied` should remain small; the mechanism is intended as a directional correction, not a new dense reward.
+
+### 2026-07-07 v59 result: contrastive alternative reward was too sparse and did not improve strict mean@4
+
+- Run:
+  - Worker: `987258`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v59_contrastive_alt_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v59_contrastive_alt_strict_n4.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v59_contrastive_alt_strict_n4_metrics.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v59_contrastive_alt_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v59_contrastive_alt_strict_n4_proc_health.txt`.
+  - Ray TaskRunner log: `/tmp/r59/ray/session_latest/logs/worker-3d28967460ade021c30d2a6dfe959146d84bb39b831530169a8c82d4-ffffffff-75187.out`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7404426559356136`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8424728370221328`, `val-core/MATH-TTT/acc/maj@4/mean=0.7546519114688129`.
+  - Aux: `format_score/mean@4=0.971327967806841`, `response_clip/mean@4=0.013837022132796781`, `response_avg_logprob/mean@4=-0.08375072337113605`.
+  - This is slightly above v58 `mean@4=0.7394366197183099`, but below current best v48 strict `mean@4=0.7454728370221329`; v59 is not an improvement and must not be committed as an algorithm improvement.
+- Step-50 internal metrics:
+  - The over-sharp gate existed but did not find an eligible alternative on the final batch: `contrastive_alt_gate=0.750`, `contrastive_alt_rate=0.000`, `contrastive_alt_majority_penalty_rate=0.000`, `train/sps_contrastive_alt_reward_applied=0.000`, `train/sps_contrastive_alt_active_rate=0.000`.
+  - Earlier training did trigger the mechanism, but only sparsely: examples include step 28/29/30 with `contrastive_alt_rate=0.031`, `contrastive_alt_majority_penalty_rate=0.094`, and `train/sps_contrastive_alt_active_rate=0.016`.
+  - The final distribution was still majority-collapsed: `answer_sharp_confidence=0.977`, `answer_effective_K=1.051`, `low_budget_majority_ratio=0.844`, `low_budget_majority_mass=0.844`, `process_majority_support=0.996`, `base_support_majority_confidence=0.811`.
+  - Other step-50 diagnostics: `low_budget_capacity=0.789`, `base_support_capacity=0.811`, `cross_view_capacity=0.766`, `process_consistency_capacity=0.996`, `ground_truth_reward=0.809`, `pass@32=1.000`.
+- Infra and performance:
+  - Runner exit status was `0`.
+  - Steps 41-50 including final validation: `timing_s/step=50.353`, `perf/total_num_tokens=229139.300`, `whole_machine_tokens_per_s=4550.685`.
+  - Final validation step had `timing_s/testing=230.405` and `timing_s/step=253.903`; late non-validation steps were mostly about `24-33s`.
+  - After teardown, `/proc` was broken again even though all 8 GPUs returned to `0 MiB`: `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`. Do not run more Ray/CUDA work on worker `987258`; a new healthy worker is required.
+- Interpretation:
+  - v59 changed the direction correctly in principle, but the eligible alternative signal was too sparse to move strict first-four behavior.
+  - The run reinforces the v50-v58 conclusion: support/capacity/process-consistency signals can identify candidate existence, but by step 50 they mostly confirm the majority basin unless an earlier or stronger verifier-free correctness signal is available.
+  - `best@4=0.8425` remains far above strict `mean@4=0.7404`, so the bottleneck is still not validation-time candidate existence; it is training-time redistribution of correctness into the four sampled answers without any inference-time selection.
+  - Do not continue by simply lowering `contrastive_alt_min_*` thresholds or increasing `contrastive_alt_value`; that would be post-hoc activation tuning. A next attempt needs an earlier anti-collapse signal, or a process/verifier-free correctness proxy that activates before the majority basin becomes over-sharp.
+  - Goal remains incomplete: strict `mean@4=0.7404426559356136 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 literature refresh for v60
+
+Read recent arXiv-related work as design input, not as a method stack:
+
+1. SPINE: Token-Selective Test-Time Reinforcement Learning with Entropy-Band Regularization, arXiv:2511.17938. Key idea: uniform sequence updates collapse because most tokens are low-entropy followers; updates should focus on decision/fork points and keep uncertainty inside a band.
+2. ETTRL: Balancing Exploration and Exploitation in LLM Test-Time Reinforcement Learning Via Entropy Mechanism, arXiv:2508.11356. Key idea: early pseudo-label bias can create overconfidence and diversity loss; entropy-aware advantage shaping improves exploration/exploitation.
+3. Self-Harmony: Learning to Harmonize Self-Supervision and Self-Play in Test-Time Reinforcement Learning, arXiv:2511.01191. Key idea: majority voting can collapse to spurious popular answers; stable answers across complementary views are more reliable than raw frequency.
+4. Intuitor / Learning to Reason without External Rewards, arXiv:2505.19590. Key idea: intrinsic confidence/self-certainty can be a useful unsupervised reward, but it needs calibration against collapse.
+5. RENT / Maximizing Confidence Alone Improves Reasoning, arXiv:2505.22660. Key idea: entropy minimization can improve reasoning without labels, but our v38-v59 evidence shows unqualified sharpening can amplify wrong basins.
+6. RLSC / Confidence Is All You Need, arXiv:2506.06395. Key idea: model self-confidence can support low-step math adaptation on Qwen2.5-Math-7B; this motivates using confidence, but not as raw majority imitation.
+7. CORE-PO / Self-Training Large Language Models with Confident Reasoning, arXiv:2505.17454. Key idea: final-answer confidence alone ignores reasoning-path quality; reasoning-level confidence is needed.
+8. Can Large Reasoning Models Self-Train?, arXiv:2505.21444. Key idea: self-training can improve, but prolonged self-reward can reward-hack and collapse, matching our repeated majority-basin failures.
+9. The Unreasonable Effectiveness of Entropy Minimization in LLM Reasoning, arXiv:2505.15134. Key idea: entropy minimization is a strong intrinsic objective; for this project it must be constrained by low-budget correctness signals.
+10. Test-Time Learning for Large Language Models, arXiv:2505.20633. Key idea: sample-efficient test-time learning should emphasize informative examples rather than uniform updates.
+11. SCOPE / Beyond Majority Voting, arXiv:2512.15146. Key idea: majority voting gives sparse/biased rewards; subgroup or reasoning-aware confidence can provide finer feedback.
+12. Certified Self-Consistency, arXiv:2510.17472. Key idea: TTRL implicitly sharpens the terminal answer distribution toward the mode; the sharpness/bias trade-off is central.
+13. SIREN / Rethinking Entropy Regularization in Large Reasoning Models, arXiv:2509.25133. Key idea: naive entropy regularization can explode globally; selective entropy control is required.
+
+Design implication for our data:
+
+- v36/v48 show calibrated answer-sharpen capacity helps.
+- v38/v39/v46/v47/v54 show raw sharpening, majority repair, or local-majority reward can amplify wrong answer clusters.
+- v55 shows conflict-only abstention is too weak and too late.
+- v56/v58 show positive support/process rewards become majority-confirming by step 50.
+- v57/v59 show anti-majority or alternative rewards are structurally reasonable but too sparse if applied only after collapse.
+
+Therefore v60 should not add another answer reward. It should control when prompts are allowed to contribute strong gradients, using the answer-cluster entropy/effective-K band as an internal training-capacity signal. The aim is to preserve v48's useful process-consistency candidate generation while reducing both low-entropy majority self-imitation and high-entropy noisy pseudo-labels.
+
+### 2026-07-07 v60 plan: entropy-band capacity for prompt-level training weight
+
+- Motivation:
+  - v59 failed because the anti-collapse alternative signal only triggered after the prompt was already over-sharp and then was too sparse.
+  - The literature above suggests entropy needs to be controlled as a band, not monotonically minimized or maximized.
+  - Our internal metrics already expose the necessary prompt-level state: `answer_effective_K`, `answer_sharp_confidence`, `low_budget_majority_mass`, `base_support_majority_confidence`, `process_majority_support`, parse rate, and clip rate.
+- Algorithm:
+  - Add default-off config keys:
+    - `ttrl.sps_entropy_band_capacity`
+    - `ttrl.sps_entropy_band_min_weight`
+    - `ttrl.sps_entropy_band_low_k`
+    - `ttrl.sps_entropy_band_high_k`
+    - `ttrl.sps_entropy_band_sharp_min`
+    - `ttrl.sps_entropy_band_low_budget_mass_min`
+    - `ttrl.sps_entropy_band_support_min`
+  - When enabled, compute a prompt-level capacity multiplier:
+    - Low-entropy collapse gate: active when `answer_effective_K < low_k`, `answer_sharp_confidence >= sharp_min`, first-four majority mass is high, and base/process majority support are high. This is the v56/v58/v59 majority-confirming failure mode.
+    - High-entropy/noisy gate: active when `answer_effective_K > high_k`, first-four parseable rate is low, or first-four clip rate is high. This avoids training heavily on diffuse or malformed pseudo-labels.
+    - In either gate, reduce the prompt training weight toward `min_weight`; in the middle entropy band, leave the v48 capacity stack unchanged.
+  - Initial v60 runner values: `min_weight=0.45`, `low_k=1.25`, `high_k=4.0`, `sharp_min=0.92`, `low_budget_mass_min=0.70`, `support_min=0.70`.
+- Why this is not post-hoc tuning:
+  - These thresholds are tied to observed internal failure regimes, not validation accuracy: v59 step 50 had `answer_effective_K=1.051`, `answer_sharp_confidence=0.977`, `low_budget_majority_mass=0.844`, and `process_majority_support=0.996`, exactly the over-sharp majority basin to downweight.
+  - v60 does not select answers, does not use labels, and does not change validation. It only makes the existing training signal less uniform across prompt uncertainty regimes.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_entropy_band_capacity` and low/high active diagnostics, then applies it to prompt weight when enabled.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config and logs `train/sps/entropy_band_*`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off keys.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4.sh`.
+- Validation:
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85`; `best@4` and `maj@4` remain diagnostics only.
+- Expected diagnostics:
+  - `train/sps/entropy_band_low_active_rate` should rise when answer distribution collapses near `effective_K ~= 1`.
+  - `train/sps/entropy_band_high_active_rate` should stay small unless the batch is noisy/invalid.
+  - `train/sps/entropy_band_capacity` should lower only a subset of prompts, not collapse all training weights to the floor.
+  - If strict `mean@4` does not improve and `best@4` also drops, the mechanism is too blunt and is suppressing useful gradients rather than preventing harmful majority imitation.
+
+### 2026-07-07 v60 result: entropy-band capacity was active but too blunt
+
+- Run:
+  - Worker: `987433`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4.log`.
+  - Ray TaskRunner log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4_ray_taskrunner.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4_metrics.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v60_entropy_band_capacity_strict_n4_proc_health.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7293762575452716`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.841595573440644`, `val-core/MATH-TTT/acc/maj@4/mean=0.7460120724346077`.
+  - Aux: `format_score/mean@4=0.971830985915493`, `response_clip/mean@4=0.01358148893360161`, `response_avg_logprob/mean@4=-0.0852041127168624`.
+  - This is below v59 `mean@4=0.7404426559356136` and below current best v48 strict `mean@4=0.7454728370221329`; v60 is not an improvement and must not be committed as an algorithm improvement.
+- Step-50 internal metrics:
+  - The entropy-band mechanism was active: `entropy_band_capacity=0.722`, `entropy_band_low_active_rate=0.750`, `entropy_band_high_active_rate=0.000`, `entropy_band_score=0.506`.
+  - It targeted the intended over-sharp regime: `answer_sharp_confidence=0.969`, `answer_effective_K=1.073`, `low_budget_majority_ratio=0.750`, `low_budget_majority_mass=0.750`, `base_support_majority_confidence=0.789`, `process_majority_support=0.992`.
+  - Other step-50 diagnostics: `low_budget_capacity=0.750`, `base_support_capacity=0.789`, `cross_view_capacity=0.765`, `process_consistency_capacity=0.992`, `ground_truth_reward=0.766`, `pass@32=1.000`.
+- Infra and performance:
+  - Runner exit status was `0`.
+  - Steps 41-50 including final validation: `timing_s/step=50.362`, `perf/total_num_tokens=234881.200`, `whole_machine_tokens_per_s=4663.858`.
+  - Final validation step had `timing_s/testing=229.819` and `timing_s/step=255.018`; late non-validation steps were mostly about `22-34s`.
+  - After teardown, worker `987433` stayed healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=76`, and all 8 GPUs returned to `0 MiB`.
+- Interpretation:
+  - v60 confirmed that entropy-band capacity can detect the late low-entropy majority basin using internal metrics only.
+  - The strict result regressed, and `best@4` also stayed below v58/v59, so the mechanism likely suppressed useful gradients along with harmful majority self-imitation. This matches the v60 expected diagnostic for a too-blunt capacity rule.
+  - Do not continue by simply lowering `min_weight` or widening the low-entropy gate. That would further suppress training and is not justified by the result.
+  - A more plausible next direction is selective token/decision-point or process-step credit assignment: keep the answer-cluster capacity idea, but apply it to where the trajectory forks or where process evidence disagrees, instead of reducing the whole prompt's training weight.
+  - Goal remains incomplete: strict `mean@4=0.7293762575452716 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 v61 plan: first-four low-budget rebalance reward
+
+- Motivation:
+  - v60 correctly detected the over-sharp majority-collapse regime, but prompt-level capacity was too blunt and reduced useful gradients.
+  - v59 showed that a contrastive alternative direction is structurally reasonable, but it was too sparse when it waited for a fully supported non-majority answer after collapse.
+  - v48 remains best because process consistency preserves candidate existence; the remaining bottleneck is redistributing correctness into the first four sampled answers without validation-time answer selection.
+- Algorithm:
+  - Add a default-off `ttrl.sps_low_budget_rebalance_reward`.
+  - Keep the v48 capacity stack and disable v60 `sps_entropy_band_capacity`.
+  - Use the same internally justified over-sharp gate as v60/v59:
+    - `answer_sharp_confidence >= 0.92`
+    - `answer_effective_K <= 1.35`
+    - first-four majority mass `>= 0.70`
+    - base/process majority support `>= 0.70`
+  - Only inside the first-four training rollouts, find non-majority candidates that are parseable, non-clipped, process-consistent, and have count-neutral base/process support.
+  - Add a small terminal reward to eligible alternatives and a smaller terminal penalty to first-four majority samples only when at least one eligible alternative exists.
+  - Initial structural values:
+    - `ttrl.sps_low_budget_rebalance_alt_value=0.10`
+    - `ttrl.sps_low_budget_rebalance_majority_penalty=0.04`
+    - `ttrl.sps_low_budget_rebalance_min_base=0.06`
+    - `ttrl.sps_low_budget_rebalance_min_process=0.55`
+    - `ttrl.sps_low_budget_rebalance_min_support=0.12`
+- Why this is not post-hoc threshold tuning:
+  - The trigger comes directly from v60 step-50 internal metrics (`answer_effective_K ~= 1`, high first-four majority mass, high process majority support), but v61 changes granularity rather than making the v60 gate stronger.
+  - It avoids prompt-wide suppression and acts only on the exact low-budget first-four samples that define strict `mean@4`.
+  - It does not use Math500 labels, does not change validation, and does not perform inference-time answer selection.
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_low_budget_rebalance_reward` and diagnostics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs `train/sps/low_budget_rebalance_*`, and injects terminal reward.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off config keys.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4.sh`.
+- Static checks before launch:
+  - `/opt/tiger/modelchef/.venv/bin/python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` passed.
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4.sh` passed.
+  - `git -C /opt/tiger/TTRL diff --check -- ...` passed for the v61 touched files.
+- Validation:
+  - Strict validation remains unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85`; `best@4` and `maj@4` remain diagnostics only.
+- Expected diagnostics:
+  - `train/sps/low_budget_rebalance_gate` should be nonzero under the same over-sharp regimes v60 detected.
+  - `train/sps/low_budget_rebalance_alt_rate` should be sparse but not always zero; if it is always zero, the method cannot affect first-four distribution.
+  - `train/sps_low_budget_rebalance_active_rate` should remain small; a high rate would mean the method has become another broad reward perturbation.
+
+### 2026-07-07 v61 result: local rebalance triggered but stayed too sparse and did not improve strict mean@4
+
+- Run:
+  - Worker: `987433`, 8x B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4.log`.
+  - Ray TaskRunner log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4_ray_taskrunner.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4_metrics.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v61_lowbudget_rebalance_strict_n4_proc_health.txt`.
+- Strict validation:
+  - Validation stayed low-budget and real: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7328973843058351`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.8384305835010059`, `val-core/MATH-TTT/acc/maj@4/mean=0.7495613682092555`.
+  - Aux: `format_score/mean@4=0.9617706237424547`, `response_clip/mean@4=0.015593561368209255`, `response_avg_logprob/mean@4=-0.08317972258927012`.
+  - This is above v60 `mean@4=0.7293762575452716`, but below v59 `0.7404426559356136` and below current best v48 strict `0.7454728370221329`; v61 is not an improvement and must not be committed as an algorithm improvement.
+- Internal metrics:
+  - Across 50 training steps, v61 was not dead but remained sparse: `active_steps=12/50`, average `low_budget_rebalance_gate=0.435`, average `alt_rate=0.00868`, average `majority_penalty_rate=0.02632`, average terminal active rate `0.00444`.
+  - Step 50 hit the intended regime: `answer_sharp_confidence=0.984`, `answer_effective_K=1.036`, `low_budget_majority_mass=0.812`, `base_support_majority_confidence=0.816`, `process_majority_support=0.991`.
+  - Step 50 v61 action was visible but small: `low_budget_rebalance_gate=0.750`, `alt_rate=0.062`, `majority_penalty_rate=0.188`, `active_rate=0.031`, `support=0.245`, `base=0.042`, `process=0.250`.
+  - Other step-50 diagnostics: `pass@32=1.000`, `ground_truth_reward=0.801`, `low_budget_capacity=0.792`, `cross_view_capacity=0.788`, `process_consistency_capacity=0.991`.
+- Infra and performance:
+  - Runner exit status was `0`.
+  - Full B200 preflight passed before training: `/proc` healthy, `cuInit=0`, GEMM OK, and actual cuBLAS/cuDNN/NCCL/nvJitLink libraries loaded from `/opt/tiger/modelchef/.venv` cu12.9 paths.
+  - Steps 41-50 including final validation: `timing_s/step=49.798`, `perf/total_num_tokens=229895.200`, `whole_machine_tokens_per_s=4616.564`.
+  - Final validation step had `timing_s/testing=227.576` and `timing_s/step=250.756`; late non-validation steps were mostly about `22-33s`.
+  - After teardown, worker `987433` stayed healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=82`, and all 8 GPUs returned to `0 MiB`.
+- Interpretation:
+  - v61 fixed v60's blunt prompt-wide suppression mechanically: it did not globally reduce capacity and it did trigger in exactly the over-sharp majority regime.
+  - It still did not improve strict low-budget `mean@4`, because the eligible non-majority alternative signal is too sparse and too weak to change the first-four sampling distribution before validation.
+  - The result repeats the v59 lesson in a more local form: anti-majority/rebalance directions are plausible, but waiting until the majority basin is already very sharp leaves too few alternatives with enough support.
+  - Do not continue by simply increasing `alt_value` or lowering all support thresholds; that would be post-hoc tuning and risks the v38/v54 wrong-cluster amplification failure.
+  - A next algorithm should create an earlier, denser verifier-free signal before majority collapse, for example process-step disagreement localization, answer-revision self-check features, or token-level branch credit where the trajectory first commits to the final answer.
+  - Goal remains incomplete: strict `mean@4=0.7328973843058351 < 0.85`; current best remains v48 `mean@4=0.7454728370221329` from commit `86dfdf8`.
+
+### 2026-07-07 original MajVote TTRL baseline rerun on worker 987433: strict n=4 result and procfs teardown failure
+
+- User request:
+  - Rerun the original/simple majority-vote TTRL 50-step baseline on the new healthy B200 worker before continuing SPS algorithm changes.
+  - Keep the same strict low-budget validation protocol: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+- Run:
+  - Worker: `987433`, 8x NVIDIA B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_majvote_qwen25_math_7b_50step_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4.log`.
+  - Ray TaskRunner snapshot: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_ray_taskrunner.log`.
+  - Metrics snapshot: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_metrics.txt`.
+  - Throughput summary: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_throughput_summary.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/majvote_qwen25_math_7b_50step_strict_n4_proc_health.txt`.
+- Preflight:
+  - Entered the existing single worker with `NO_COLOR=1 TERM=dumb mlx worker login 987433`; no worker launch or kill was performed.
+  - Initial `/proc` was healthy: `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT=76-78`.
+  - 8 GPUs were idle before launch.
+  - B200 CUDA compat preflight passed: driver `580.105.08`, action `clear_compat`, `cuInit=0`.
+  - Training preflight loaded CUDA userspace from `/opt/tiger/modelchef/.venv` cu12.9 paths: cuBLAS `12.9.1.4`, CUDA runtime `12.9.79`, cuDNN `9.15.1.9`, NCCL `2.27.6`, nvJitLink `12.9.86`; GEMM smoke passed.
+- Strict validation result:
+  - Main strict metric: `val-core/MATH-TTT/acc/mean@4=0.7349094567404426`.
+  - Diagnostics only: `val-core/MATH-TTT/acc/best@4/mean=0.838338028169014`, `val-core/MATH-TTT/acc/maj@4/mean=0.7466961770623741`.
+  - Other validation diagnostics: `format_score/mean@4=0.966297786720322`, `response_clip/mean@4=0.01609657947686117`, `response_avg_logprob/mean@4=-0.08062427979612899`.
+  - This is close to the previous same-run baseline `mean@4=0.7288732394366197`, but still below current best SPS v48 `mean@4=0.7454728370221329` and far below the active target `0.85`.
+  - It is a control/baseline result, not an algorithm improvement; do not create an improvement commit from this run.
+- Training dynamics and throughput:
+  - Runner exit status was `0`.
+  - Step 50 train metrics: `train/majority_voting_reward=0.750`, `train/ground_truth_reward=0.750`, `train/pass@32=1.000`, `train/majority_ratio=0.770`.
+  - Late non-validation step times were mostly about `21-26s`; examples: step 46 `21.125s`, step 47 `21.734s`, step 48 `25.216s`, step 49 `22.957s`.
+  - Final validation step: `timing_s/testing=229.116`, `timing_s/step=250.373`.
+  - Steps 41-50 including validation: `timing_s/step=46.567`, `perf/total_num_tokens=240917.400`, `whole_machine_tokens_per_s=5173.587`.
+- Infra issue:
+  - Despite successful training exit, teardown broke the worker procfs namespace again.
+  - The main runner printed BRPC warnings around teardown: missing `/proc/self/stat`, `/proc/self/fd`, `/proc/self/statm`, `/proc/loadavg`, and `/proc/self/io`.
+  - Final proc health recorded `PROC_SELF_BAD_AFTER`, `PROC_MEMINFO_BAD_AFTER`, `PROC_COUNT_AFTER=0`, then `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL=0`.
+  - Several GPU allocations were left transiently visible after exit, including one stale `[Not Found]` compute app on GPU 6, but final query showed most GPUs released.
+  - This worker must not be reused for Ray/CUDA experiments. The evidence again points to the Ray/vLLM/training teardown path as the high-risk moment, not startup or initial CUDA preflight.
+- Interpretation:
+  - The original MajVote 50-step baseline under strict n=4 is reproducibly in the `72.9-73.5%` mean@4 band on Qwen2.5-Math-7B.
+  - SPS v48 remains the best strict 50-step result at `74.55%`, only about `+1.06pp` over this rerun baseline and still far from `85%`.
+  - The algorithm goal remains incomplete. Before any next GPU run, a fresh healthy worker is required because current worker `987433` has `PROC_COUNT=0` after teardown.
+
+### 2026-07-07 v62 static implementation: process-quality terminal reward, not yet launched
+
+- Status:
+  - Implemented v62 as a default-off algorithm change and created a strict runner.
+  - No GPU/Ray run has been launched after the MajVote teardown failure, because worker `987433` has broken `/proc` (`PROC_COUNT=0`) and must not be reused.
+  - This section is a design/implementation record only. It is not an improvement result and must not be committed as an algorithm improvement until a strict 50-step run beats the current best.
+- Motivation:
+  - v61 showed that first-four rebalance triggers in the intended over-sharp majority regime, but eligible non-majority alternatives are too sparse once the majority basin has already collapsed.
+  - The literature scan across recent TTRL/self-training/confidence-RL directions points to earlier, denser internal signals rather than late rescue or uniform majority sharpening.
+  - v62 therefore uses process quality as a local verifier-free signal on the first four training rollouts: reward clean answer-bearing trajectories and penalize visibly bad trajectories before relying on answer-cluster alternatives.
+- Algorithm:
+  - New default-off switch: `ttrl.sps_process_quality_reward`.
+  - For only the first `sps_low_budget_k` samples, add a small terminal reward when the rollout is parseable, non-clipped, has a final boxed answer near the tail, has no conflicting boxed answers, has no revision text after the final boxed answer, and is marked process-consistent by the existing `_score_process_consistency`.
+  - Add a small terminal penalty for first-four samples that are clipped, unparseable, have conflicting boxed answers, revise after the final answer, or fail the tail-position check.
+  - If the prompt is already in an over-sharp majority-collapse regime (`answer_sharp_confidence>=0.92`, `answer_effective_K<=1.35`, first-four majority mass `>=0.70`), majority-sample positive reward is suppressed to `0.25x`, while non-majority clean samples keep full positive scale.
+  - Bad majority samples receive the full negative scale; bad non-majority samples receive half negative scale, so the penalty does not simply become another majority projection mechanism.
+  - Initial structural values:
+    - `ttrl.sps_process_quality_positive=0.08`
+    - `ttrl.sps_process_quality_negative=0.10`
+    - `ttrl.sps_process_quality_sharp_min=0.92`
+    - `ttrl.sps_process_quality_effective_k_max=1.35`
+    - `ttrl.sps_process_quality_mass_min=0.70`
+    - `ttrl.sps_process_quality_majority_scale=0.25`
+    - `ttrl.sps_process_quality_nonmajority_scale=1.0`
+    - `ttrl.sps_process_quality_bad_majority_scale=1.0`
+    - `ttrl.sps_process_quality_bad_nonmajority_scale=0.5`
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`: computes `sps_process_quality_reward` and diagnostics.
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`: passes config, logs `train/sps/process_quality_*`, and injects the terminal reward.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`: adds default-off v62 config keys.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4.sh`.
+- Runner protocol:
+  - Keeps the v48/v61 base capacity stack: answer sharpen, consistency, low-budget, base-support, cross-view, and process-consistency capacities.
+  - Disables v61 `ttrl.sps_low_budget_rebalance_reward`.
+  - Enables only v62 `ttrl.sps_process_quality_reward`.
+  - Keeps strict validation unchanged: `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, `trainer.test_freq=50`, `trainer.val_before_train=False`.
+  - Uses short runtime paths: `RAY_DIR=/tmp/r62`, `SHORT_TMPDIR=/tmp/t62`, and model/cache under `/tmp/ttrl_cache/${EXP}`.
+- Static checks:
+  - `python -m py_compile verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py` passed.
+  - `bash -n verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4.sh` passed.
+  - `git diff --check -- ...` passed for the v62 touched files.
+  - Runner scan found no stale v61 experiment names, v61 short paths, or `sps_low_budget_rebalance_reward=True`.
+- Expected diagnostics for the future GPU run:
+  - `train/sps/process_quality_reward_mean`
+  - `train/sps/process_quality_positive_rate`
+  - `train/sps/process_quality_negative_rate`
+  - `train/sps/process_quality_bad_rate`
+  - `train/sps/process_quality_collapse_gate`
+  - `train/sps_process_quality_reward_applied`
+  - `train/sps_process_quality_active_rate`
+- Next action:
+  - Wait for a fresh healthy worker, then run the v62 runner only after the standard `/proc`, driver/compat, `cuInit=0`, GEMM, and loaded-library preflight passes.
+  - Success still requires strict `val-core/MATH-TTT/acc/mean@4 >= 0.85` after exactly 50 training steps. `best@4`, `maj@4`, or any validation-time answer selection do not count.
+
+### 2026-07-07 v62 runner guard update before worker relaunch
+
+- Current terminal/environment check:
+  - Host is the devbox master, not a GPU worker: `NVIDIA_VISIBLE_DEVICES=none`.
+  - `/proc` on master is healthy: `/proc/self` OK, `/proc/meminfo` OK, `PROC_COUNT=113`.
+  - `nvidia-smi` exits `0` but returns no GPU rows on master, so `nvidia-smi` exit status alone is not a sufficient GPU gate.
+  - `mlx worker list` shows only worker `987433`, which is already documented as broken after MajVote teardown and must not be reused.
+- Safety change:
+  - Added an explicit v62 runner gate after CUDA preflight and before model copy/training:
+    - `GPU_COUNT_BEFORE_TRAIN` is computed from `nvidia-smi --query-gpu=index`.
+    - If fewer than 8 GPU rows are visible, the runner records `GPU_COUNT_BEFORE_TRAIN_BAD expected=8 actual=<n>` and exits with code `86`.
+  - This prevents accidental Ray/CUDA launch from the devbox master or a partially attached worker.
+- Static checks:
+  - `bash -n verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4.sh` passed.
+  - `git diff --check -- verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4.sh` passed.
+- Next worker action:
+  - To avoid two workers simultaneously, release broken worker `987433` first, then launch a fresh 8x B200 worker using the documented queue/resource command.
+  - After login, verify `/proc`, 8 GPU visibility, driver/compat, `cuInit=0`, GEMM, and actual CUDA library paths before running v62.
+- Worker action taken:
+  - Released broken worker `987433` with `NO_COLOR=1 TERM=dumb mlx worker kill 987433`.
+  - Launched one replacement request with:
+    - `NO_COLOR=1 TERM=dumb mlx worker launch --cpu 248 --memory 3800 --gpu 8 --resourcetype arnold --usergroup mlsys_inference --type NVIDIA-B200 --cluster cloudnative-useast1b --queuename compute-598-useast1b-cloudnative-aioci-mlsys.inference-guarantee --namespace /topic/2ebfba22254a08e7 -- bash`
+  - Launch output is logged at `/opt/tiger/mlx_deploy/mlx_launch_output.log`.
+  - New worker object `987681` exists with 8x B200, but as of `2026-07-07 16:36` it is not ready: `podIP` is empty and `mlx worker login 987681` returns `worker has not been ready yet`.
+  - As of `2026-07-07 16:43`, `987681` is still not ready: `mlx worker list` still shows empty `podIP`, and the original launch process is still waiting without new output.
+  - Do not launch another worker while `987681` exists; wait for it to become ready or explicitly release it before retrying.
+
+### 2026-07-07 v63 static implementation: direct sharpened-probability TTRL
+
+- Status:
+  - Implemented a new default-off SPS/TTRL mode, `ttrl.sps_reward_mode=direct_sharpened_prob`.
+  - Static checks passed, but no GPU result has been produced yet in this entry.
+  - This is exploratory algorithm work, not an improvement commit. Commit only if a strict 50-step run clearly improves strict `mean@4`.
+- Motivation:
+  - User reframed majority vote as only one crude distribution-sharpening method, not the pseudo-label core we should keep optimizing.
+  - v36/v48 showed answer sharpening and process/capacity signals can help; v38/v39/v54 showed hard majority/local reward can amplify wrong clusters; v58-v61 showed rescue after majority collapse is too sparse.
+  - v63 therefore removes hard majority pseudo-label training from the new path and directly constructs an unsupervised sharpened target distribution from internal probabilities.
+- PowerFlow mapping:
+  - PowerFlow actor loss fits a trajectory-balance residual:
+    - `delta = logZ + avg_log_prob - beta * avg_ref_log_prob` when boxed reward is disabled.
+    - With reward enabled it uses `beta * (avg_ref_log_prob + (boxed_reward - 1) / 2)`.
+    - It clips current/old importance ratios and optimizes a squared residual weighted by clipped importance.
+  - v63 does not mechanically port the actor/logZ module. It maps the transferable piece into current TTRL's reward path:
+    - For each rollout `y`, compute `flow_score(y) = beta * logp_ref(y|x) - logp_rollout(y|x)`.
+    - Optionally length-normalize by response length, matching existing SPS sequence-score practice.
+    - For each extracted answer cluster `a`, compute `target_logit(a)=logsumexp_y(flow_score(y))`.
+    - The sharpened answer distribution is `softmax(target_logit / target_temperature)`.
+    - Each train rollout receives a terminal soft reward from its answer cluster's target probability; default mode `answer_mass` divides the cluster mass across sampled trajectories, so the total mass per answer matches the sharpened target.
+  - Majority vote is not used to choose a pseudo label in this mode. It is logged only as a diagnostic (`direct_majority_target_mass`, `direct_majority_agreement`, and `majority_ratio`).
+- Code paths:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+    - New function `apply_direct_sharpened_ttrl_reward(...)`.
+    - Produces `sps_reward` directly and logs direct-target diagnostics:
+      - `sps/direct_target_confidence`
+      - `sps/direct_target_entropy`
+      - `sps/direct_target_effective_K`
+      - `sps/direct_target_logz`
+      - `sps/direct_unique_answer_count`
+      - `sps/direct_parseable_rate`
+      - `sps/direct_clip_rate`
+      - `sps/direct_majority_target_mass`
+      - `sps/direct_majority_agreement`
+      - `sps/direct_base_top_confidence`
+      - `sps/direct_base_agreement`
+      - `sps/direct_low_budget_parseable_rate`
+      - `sps/direct_low_budget_clip_rate`
+      - `sps/direct_low_budget_top_mass`
+      - `sps/direct_process_consistent_rate`
+      - `sps/direct_process_top_support`
+      - `sps/direct_reward_mean/std/nonzero_rate`
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+    - Adds `direct_sharpened_prob` to the SPS `K=n_votes_per_prompt` generation path.
+    - Calls `apply_direct_sharpened_ttrl_reward`, unions the resulting `sps_reward`, then selects the first `n_samples_per_prompt` train samples.
+    - Because `sps_reward` is already in `gen_batch_output`, the existing advantage path replaces rule reward with this soft target reward.
+    - The direct path does not call `apply_sps_weighted_ttrl_gt` and does not overwrite reward-model `ground_truth`.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+    - Adds default-off parameters:
+      - `sps_direct_beta: 4.0`
+      - `sps_direct_target_temperature: 1.0`
+      - `sps_direct_reward_scale: 1.0`
+      - `sps_direct_per_sample_mode: answer_mass`
+      - `sps_direct_reward_floor: 0.0`
+  - Runner:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4.sh`
+- Runner protocol:
+  - Qwen2.5-Math-7B local model copied under `/tmp/ttrl_cache/${EXP}/model`.
+  - Generates `n_votes_per_prompt=64` for target construction and trains on `n_samples_per_prompt=32`.
+  - Uses `ttrl.sps_reward_mode=direct_sharpened_prob`, `sps_direct_beta=4.0`, `sps_direct_target_temperature=1.0`, and `sps_direct_per_sample_mode=answer_mass`.
+  - Explicitly sets `ttrl.sps_majority_reward_coef=0.0` and `ttrl.sps_format_reward_coef=0.0`.
+  - Keeps strict validation unchanged:
+    - `actor_rollout_ref.rollout.val_kwargs.n=4`
+    - `trainer.validation_answer_selection_enable=False`
+    - `trainer.total_training_steps=50`
+    - `trainer.test_freq=50`
+    - `trainer.val_before_train=False`
+  - Keeps the safety gate `GPU_COUNT_BEFORE_TRAIN >= 8`.
+  - Uses cache/tmp paths under `/tmp/ttrl_cache/${EXP}`, `/tmp/r63`, and `/tmp/t63`.
+- Static checks:
+  - `python -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py` passed.
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4.sh` passed.
+  - `git diff --check -- verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py verl/verl/trainer/config/ppo_trainer_ttrl.yaml verl/examples/ttrl/worker_run_sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4.sh` passed.
+- Comparison targets for the future run:
+  - MajVote 50-step strict baseline: `mean@4=0.7349094567404426`.
+  - Current best SPS v48: `mean@4=0.7454728370221329`.
+  - v62 process-quality: implemented/static-checked, not yet run.
+- Next action:
+  - Use the single existing worker only. Worker commands must include `NO_COLOR=1 TERM=dumb`.
+  - Login to worker `987681` if ready; do not launch a new worker while it exists.
+  - Before training, run standard preflight: `/proc/self`, `/proc/meminfo`, `PROC_COUNT`, 8 GPU visibility, driver/compat, `cuInit=0`, GEMM, and CUDA/cuBLAS/cuDNN/NCCL/NVJitLink loaded-library paths.
+  - Run the v63 runner and record metrics/proc/throughput. If strict `mean@4` improves over v48, commit the algorithm change locally; otherwise document the failure mode and do not commit.
+
+### 2026-07-07 v63 GPU result: direct sharpened-probability TTRL regressed
+
+- Run:
+  - Worker: `987681`, 8x NVIDIA-B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4_proc_health.txt`.
+  - Throughput: `/opt/tiger/TTRL/verl/sps_direct_sharpened_prob_qwen25_math_7b_50step_v63_strict_n4_throughput_summary.txt`.
+  - Exit status: `0`.
+- Preflight:
+  - `/proc/self` and `/proc/meminfo` healthy before launch.
+  - `PROC_COUNT_BEFORE=75`, `PROC_COUNT_AFTER_PREFLIGHT=76`.
+  - 8 B200 GPUs visible before training.
+  - Driver `580.105.08`; compat was cleared.
+  - `cuInit: 0`.
+  - GEMM smoke passed.
+  - Loaded CUDA stack from the venv/cu12.9 paths: cuBLAS, cuDNN, NCCL, nvJitLink, CUDA runtime.
+- Strict validation result after exactly 50 training steps:
+  - `val-core/MATH-TTT/acc/mean@4=0.7258551307847082`.
+  - Diagnostic `best@4=0.8410402414486922`.
+  - Diagnostic `maj@4=0.7426720321931589`.
+  - This is below MajVote 50-step strict baseline `0.7349094567404426` and below current best SPS v48 `0.7454728370221329`.
+  - Therefore v63 is not an improvement and should not be committed as an algorithm record.
+- Training diagnostics:
+  - 50 training steps logged.
+  - Train-only average `perf/time_per_step=27.66698s`, train-only average logged `perf/throughput=1204.869306`.
+  - Runner throughput summary for steps 41-50, including final validation-heavy step: `timing_s/step=50.296`, `perf/total_num_tokens=255753.900`, whole-machine `tokens/s=5084.955`.
+  - Across all 50 logged steps, including final validation step: average `perf/time_per_step=32.24932s`, average logged `perf/throughput=1182.84124`.
+  - Direct-target internal signal averaged `direct_target_confidence=0.61082`, `direct_target_effective_K=5.07714`.
+  - Step 50 target became quite sharp: `direct_target_confidence=0.780`, `direct_target_effective_K=2.536`, `direct_majority_target_mass=0.780`, `direct_majority_agreement=1.000`.
+  - `train/pass@32` averaged `1.0`, but `train/sps_pick_accuracy` averaged only `0.19`; the candidate set often contained a correct answer, but the direct probability target did not reliably assign highest training mass to the correct cluster.
+  - `train/sps_correct_weight_mass` averaged `0.29386`, step 50 `0.392`.
+- Interpretation:
+  - v63 successfully implemented the requested non-majority direct distribution-sharpening path: majority was not used as the training pseudo-label, only logged as a diagnostic.
+  - The probability target did sharpen over training, but the sharpening appears to follow the model/ref probability basin rather than a correctness-correlated basin.
+  - In this first form, directly fitting `softmax(logsumexp(beta * logp_ref - logp_rollout))` is worse than both simple MajVote and v48 SPS. The failure mode is not lack of candidates; it is target misalignment.
+  - Next algorithm direction should not be blind beta/temperature tuning. It should add a verifier-free alignment term before sharpening, for example process self-consistency, revision/final-answer quality, or PowerFlow-style residual confidence that is empirically correlated with correctness on internal metrics.
+- Infra result:
+  - Training finished with status `0`, but teardown again broke procfs inside the worker.
+  - Recorded after/final state:
+    - `PROC_SELF_BAD_AFTER`
+    - `PROC_MEMINFO_BAD_AFTER`
+    - `PROC_COUNT_AFTER 0`
+    - `PROC_SELF_BAD_FINAL`
+    - `PROC_MEMINFO_BAD_FINAL`
+    - `PROC_COUNT_FINAL 0`
+  - All GPUs were released to `0 MiB`, but worker `987681` must be treated as corrupted for further Ray/CUDA experiments.
+  - Do not run more GPU/Ray work on `987681`; use a fresh healthy worker and repeat preflight before any next experiment.
+
+### 2026-07-07 v62 GPU result: process-quality comparison completed
+
+- Run:
+  - Worker: `987816`, 8x NVIDIA-B200.
+  - Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4.sh`.
+  - Main log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4.log`.
+  - Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4_metrics.txt`.
+  - Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4_proc_health.txt`.
+  - Throughput: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v62_process_quality_strict_n4_throughput_summary.txt`.
+  - Exit status: `0`.
+- Strict validation result after exactly 50 training steps:
+  - `val-core/MATH-TTT/acc/mean@4=0.7339034205231388`.
+  - Diagnostic `best@4=0.8304144869215292`.
+  - Diagnostic `maj@4=0.7502515090543259`.
+  - Validation quality diagnostics: `format_score/mean@4=0.9673038229376257`, `response_clip/mean@4=0.014587525150905433`, `response_avg_logprob/mean@4=-0.08406732850605003`.
+- Training diagnostics:
+  - 50 training steps logged.
+  - Average over all logged steps including final validation: `perf/time_per_step=33.5124`, `perf/throughput=1087.04042`.
+  - Final validation-heavy step: `timing_s/testing=229.067`, `timing_s/step=251.816`.
+  - Runner throughput summary for steps 41-50: `timing_s/step=49.728`, `perf/total_num_tokens=228903.500`, whole-machine `tokens/s=4603.120`.
+  - Average `train/sps/process_quality_reward_mean=0.02864`.
+  - Average `train/sps_process_quality_active_rate=0.125`.
+  - Average `train/sps/process_quality_collapse_gate=0.475`.
+  - Average `train/sps/answer_sharp_confidence=0.85878`, `train/sps/answer_effective_K=2.05506`.
+  - Average `train/pass@32=0.935`.
+  - Step 50 showed a very sharp answer distribution: `answer_sharp_confidence=0.976`, `answer_effective_K=1.054`, `weighted_label_confidence=0.808`, `low_budget_majority_mass=0.781`, `majority_ratio=0.799`, `train/pass@32=1.000`.
+  - Step 50 process-quality signal was active and mostly positive: `process_quality_reward_mean=0.040`, `process_quality_positive_rate=0.969`, `process_quality_negative_rate=0.031`, `process_quality_bad_rate=0.031`, `process_quality_collapse_gate=0.625`.
+- Infra result:
+  - Runner status `0`.
+  - Recorded final proc state stayed healthy: `PROC_SELF_OK_FINAL`, `PROC_MEMINFO_OK_FINAL`, `PROC_COUNT_FINAL=77`.
+  - The proc-health file initially showed residual GPU memory for PID `33096`, but a later live check showed all GPUs at `0 MiB`, no training/Ray/vLLM process, and `/proc` healthy with count `72`.
+
+### 2026-07-07 final comparison for direct sharpen goal
+
+| Method | Strict mean@4 | best@4 diag | maj@4 diag | Notes |
+| --- | ---: | ---: | ---: | --- |
+| MajVote 50-step strict rerun | `0.7349094567404426` | `0.838338028169014` | `0.7466961770623741` | Baseline/control; no validation-time answer selection. |
+| Current best SPS v48 | `0.7454728370221329` | `~0.8602` | not central | Best local strict SPS record, commit `86dfdf8`. |
+| v62 process-quality | `0.7339034205231388` | `0.8304144869215292` | `0.7502515090543259` | Clean process signal, but slightly below MajVote and below v48. |
+| v63 direct sharpened probability | `0.7258551307847082` | `0.8410402414486922` | `0.7426720321931589` | Majority-free direct probability target ran, but regressed. |
+
+- Completion audit:
+  - PowerFlow probability/flow residual implementation was read and translated into the v63 TTRL reward path rather than copied mechanically.
+  - v63 does not use majority vote as the pseudo-label core; majority metrics are diagnostic only.
+  - Strict validation was preserved: 50 training steps, `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, and primary metric `val-core/MATH-TTT/acc/mean@4`.
+  - No best-of, majority-vote, n=32 selection, ground-truth selection, or validation-time answer selection was used as the success metric.
+  - v63 was compared against MajVote baseline, v48, and v62.
+  - All experiment artifacts, proc health, throughput summaries, and interpretations are recorded.
+  - Neither v63 nor v62 improved strict `mean@4`, so no local improvement commit was made.
+- Final conclusion:
+  - Directly fitting a sharpened probability target of the form `softmax(logsumexp(beta * logp_ref - logp_rollout))` is technically viable in this infra, but in this first form it sharpens the model/ref probability basin rather than the correctness basin.
+  - The main failure is target alignment, not candidate availability: v63 had high `pass@32`, but low `sps_pick_accuracy`.
+  - Future versions should keep the distribution-sharpening framing, but add a verifier-free alignment term before sharpening, such as process self-consistency, answer revision/final-answer quality, or another internal residual that is empirically correlated with correctness.
+
+## 2026-07-07 new goal: pure sharpened-distribution training toward 75%
+
+Goal: for Qwen2.5-Math-7B on strict Math500/MATH-TTT low-budget validation, build a concise distribution-sharpening training method that does not use TTRL majority pseudo-labels, hard majority reward, validation-time best-of, validation-time majority vote, n=32 selection, ground-truth selection, or any inference-time scaling as the success metric. Strict success is still `val-core/MATH-TTT/acc/mean@4 >= 0.75` after exactly 50 training steps with `actor_rollout_ref.rollout.val_kwargs.n=4` and `trainer.validation_answer_selection_enable=False`.
+
+### Literature/code scan distilled into v64
+
+The useful signal from the scan is not another parameter sweep, but a target-construction change:
+
+1. PowerFlow / escort distributions: target a sharpened distribution rather than a hard pseudo-label; preserve mode structure but change entropy. v63 showed raw `beta * logp_ref - logp_rollout` alone sharpens the wrong basin.
+2. Certified self-consistency / exponential tilting: label-free TTRL-style objectives can be viewed as exponential tilting of the terminal law. This supports making the tilt explicit and auditable instead of hiding it in majority labels.
+3. One-shot entropy minimization: strong adaptation can come from unlabeled entropy shaping, but pure entropy minimization risks overconfidence. v60 similarly found blunt entropy-band downweighting can hurt.
+4. SPINE: useful updates should focus on informative uncertainty/branch points, not uniform sequence-level imitation. In the current infra the low-cost proxy is final-answer/process stability at rollout level.
+5. ETTRL / entropy advantage reshaping: exploration-exploitation balance matters early; avoid collapsing purely to the most frequent answer cluster.
+6. Self-Harmony: majority/self-consistency can amplify self-bias. This directly motivates forbidding majority as the core target constructor.
+7. CORE-PO / confident reasoning: reasoning-level confidence can be useful, but must be derived from the reasoning trace rather than answer frequency alone.
+8. SRGen / self-reflective generation: revision/conflict after final answer is a useful internal instability signal. v62 process-quality showed this signal is dense.
+9. LESS / low-entropy segment analysis: stable reusable reasoning segments correlate with correctness, but stable wrong segments are dangerous; therefore v64 uses process stability only as a tilt combined with probability support, not as a hard accept rule.
+10. ECHO / entropy-confidence hybrid optimization: combine entropy/confidence with confidence-aware pruning or shaping. v64 operationalizes this as a process-conditioned target distribution rather than a selected pseudo-label.
+
+Local evidence that shaped the design:
+
+- v48: answer sharpening/capacity can improve strict `mean@4`, so distribution shaping is still viable.
+- v58-v62: waiting until majority collapse to rescue alternatives is too late or too sparse; process quality is denser but not enough as a terminal add-on.
+- v63: direct PowerFlow-style probability residual target is majority-free, but aligns to model/ref probability basin rather than correctness. It needs a verifier-free alignment tilt before sharpening.
+
+### v64 design: process-tilted sharpened target distribution
+
+v64 keeps the v63 soft-distribution training path but changes the target logit. It is still not a hard label and does not call `apply_sps_weighted_ttrl_gt`.
+
+For each rollout `y`, compute the same length-normalized escort residual:
+
+`flow_score(y) = beta * logp_ref(y|x) - logp_rollout(y|x)`.
+
+Then compute a verifier-free process tilt from the trajectory text:
+
+- parseable final answer: positive;
+- non-clipped response: positive;
+- final boxed answer appears in the tail: positive;
+- process-consistent final answer: positive;
+- boxed-answer conflict: negative;
+- revision/correction after final answer: negative.
+
+For each answer cluster, compute an additional process-stability tilt from its own trajectories:
+
+`cluster_tilt(a) = log(0.05 + consistent_rate(a)) + 0.5 * log(0.05 + tail_rate(a)) - bad_rate(a)`.
+
+The final answer target is:
+
+`target_logit(a) = logsumexp_{y extracts a}(flow_score(y) + process_tilt_strength * centered_process_tilt(y) + cluster_tilt_strength * centered_cluster_tilt(a))`
+
+and the train reward is the soft target mass:
+
+`p*(a) = softmax_a(target_logit(a) / target_temperature)`.
+
+This is a pure sharpened-distribution objective: majority vote is not used to select a pseudo-label or reward. It remains logged only as a diagnostic.
+
+### v64 implementation
+
+- Code:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+    - Extended `apply_direct_sharpened_ttrl_reward(...)` with default-off `process_tilt_strength`, `process_cluster_tilt_strength`, and `mode_id`.
+    - Default values preserve v63 behavior.
+    - Adds diagnostics:
+      - `sps/direct_process_tilt_strength`
+      - `sps/direct_process_cluster_tilt_strength`
+      - `sps/direct_process_tilt_mean`
+      - `sps/direct_process_tilt_std`
+      - `sps/direct_process_cluster_tilt_mean`
+      - `sps/direct_process_cluster_tilt_std`
+      - `sps/direct_process_target_top_support`
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+    - Adds `process_tilted_sharpened_prob` as a direct soft-reward mode.
+    - Uses `n_votes_per_prompt` for target construction, then selects the first train samples exactly as v63.
+    - Does not enter the majority pseudo-label branch.
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+    - Adds default-off `sps_direct_process_tilt_strength` and `sps_direct_process_cluster_tilt_strength`.
+  - Runner:
+    - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4.sh`.
+
+Runner protocol:
+
+- `ttrl.sps_reward_mode=process_tilted_sharpened_prob`.
+- `ttrl.sps_direct_beta=4.0`, `ttrl.sps_direct_target_temperature=1.0`, `ttrl.sps_direct_per_sample_mode=answer_mass`.
+- `ttrl.sps_direct_process_tilt_strength=0.6`, `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+- Majority and format terminal reward coefficients are explicitly `0.0`.
+- Strict validation remains:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`
+  - `trainer.validation_answer_selection_enable=False`
+  - `trainer.total_training_steps=50`
+  - `trainer.test_freq=50`
+  - `trainer.val_before_train=False`
+- Cache/tmp layout:
+  - `/tmp/ttrl_cache/sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4`
+  - `/tmp/r64`
+  - `/tmp/t64`
+
+Static checks passed:
+
+- `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4.sh`
+- `git -C /opt/tiger/TTRL diff --check -- verl/verl/trainer/ppo/ttrl_utils.py verl/verl/trainer/ppo/ray_trainer.py verl/verl/trainer/config/ppo_trainer_ttrl.yaml verl/examples/ttrl/worker_run_sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4.sh`
+
+Next action:
+
+- Run v64 on a healthy 8-GPU worker after the standard preflight.
+- Success threshold: strict `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- If it improves strict `mean@4`, make a local git commit. If it fails, document whether the process tilt changed target entropy/effective_K, first4 distribution, and target/process alignment relative to v63.
+
+### v64 result: process tilt did not solve target alignment
+
+v64 finished on 8x B200 worker `987816` with runner exit status `0`. Strict validation stayed at `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.total_training_steps=50`, and `trainer.val_before_train=False`. No validation-time best-of, majority selection, n=32 selection, or ground-truth selection was used as the success metric.
+
+Final strict metric:
+
+- `val-core/MATH-TTT/acc/mean@4=0.7328973843058351`.
+- Diagnostic only:
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8447364185110664`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7489195171026156`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9743460764587525`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.015593561368209255`.
+
+Comparison under the same strict 50-step `mean@4` protocol:
+
+| Method | strict mean@4 | Notes |
+| --- | ---: | --- |
+| MajVote baseline | `0.7349094567404426` | Simple majority-vote TTRL control |
+| v48 best SPS | `0.7454728370221329` | Best local strict result so far |
+| v62 process-quality | `0.7339034205231388` | Dense process signal, no improvement |
+| v63 direct sharpened probability | `0.7258551307847082` | Pure probability-basin sharpening |
+| v64 process-tilted sharpened probability | `0.7328973843058351` | Pure distribution sharpening with process tilt |
+
+Training/internal metrics:
+
+- 50-step averages:
+  - `direct_target_confidence=0.71632`.
+  - `direct_target_entropy=1.03228`.
+  - `direct_target_effective_K=3.95090`.
+  - `direct_majority_target_mass=0.70908`.
+  - `direct_majority_agreement=0.94`.
+  - `direct_base_top_confidence=0.62984`.
+  - `direct_base_agreement=0.9625`.
+  - `direct_process_consistent_rate=0.82838`.
+  - `direct_process_top_support=0.96790`.
+  - `direct_parseable_rate=0.96660`.
+  - `direct_clip_rate=0.05262`.
+  - `train/pass@32=1.0`.
+  - `train/sps_pick_accuracy=0.3875`.
+  - `train/sps_correct_weight_mass=0.34496`.
+- Step 50 snapshot:
+  - `direct_target_confidence=0.845`.
+  - `direct_target_entropy=0.653`.
+  - `direct_target_effective_K=2.185`.
+  - `direct_majority_target_mass=0.845`.
+  - `direct_majority_agreement=1.0`.
+  - `direct_base_top_confidence=0.826`.
+  - `direct_base_agreement=1.0`.
+  - `direct_process_consistent_rate=0.967`.
+  - `direct_process_target_top_support=0.994`.
+  - `train/sps_pick_accuracy=1.0`.
+  - `train/sps_correct_weight_mass=0.429`.
+
+Throughput and health:
+
+- Non-validation training steps averaged about `26.34s/step` from the logged `timing_s/step` values.
+- Steps 41-50 including final validation averaged `48.272s/step`; whole-machine throughput summary was `4615.017 tokens/s`.
+- Final validation cost was `timing_s/testing=229.327s`; the final logged step was `timing_s/step=250.571`.
+- Proc health after clean exit remained OK:
+  - `PROC_SELF_OK_FINAL`
+  - `PROC_MEMINFO_OK_FINAL`
+  - `PROC_COUNT_FINAL 83`
+- Result artifacts:
+  - `/opt/tiger/TTRL/verl/sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4.log`
+  - `/opt/tiger/TTRL/verl/sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4_metrics.txt`
+  - `/opt/tiger/TTRL/verl/sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4_throughput_summary.txt`
+  - `/opt/tiger/TTRL/verl/sps_process_tilted_sharpened_prob_qwen25_math_7b_50step_v64_strict_n4_proc_health.txt`
+
+Interpretation:
+
+- v64 improved over v63 (`0.73290` vs `0.72586`) but still did not beat the simple MajVote baseline (`0.73491`), did not beat v48 (`0.74547`), and did not reach the active `0.75` target.
+- The process tilt did make the target more stable and more correctness-correlated than v63 in the training diagnostics: `sps_pick_accuracy` improved from the v63 average around `0.19` to `0.3875`. That is a real internal alignment improvement.
+- The failure mode is still target collapse into the model/majority basin. By step 50, `direct_majority_target_mass=0.845`, `direct_majority_agreement=1.0`, `direct_base_top_confidence=0.826`, and `direct_base_agreement=1.0`. The target is formally majority-free, but empirically it often becomes the same answer basin as base/majority.
+- `pass@32=1.0` again shows candidate availability is not the bottleneck. The problem is still selecting and training toward the right basin with unsupervised signals.
+- Since v64 did not improve strict `mean@4`, no local algorithm improvement commit was made. The code path remains useful as a negative result and as the cleanest pure sharpened-distribution implementation to iterate from.
+
+Recommended next paradigm direction:
+
+- Do not tune `beta`, `temperature`, or reward scale just because v64 missed the metric.
+- The next version should break base/majority-basin lock-in explicitly while staying majority-free. A plausible direction is contrastive basin sharpening: construct two distributions, one from high process stability and one from base-probability/majority-consensus stability, then sharpen the residual that is stable in process but not merely base-consensus. This would target the observed failure directly: v64's target agrees too much with the base top cluster even when many alternatives exist.
+
+### v65 design: contrastive process sharpening against base basin
+
+v65 keeps the same pure sharpened-distribution training family and strict validation contract, but changes the target construction to address the v64 failure mode directly. v64's step-50 diagnostics had `direct_base_agreement=1.0`, `direct_majority_agreement=1.0`, and `direct_majority_target_mass=0.845`; therefore the next change should not be another beta/temperature sweep. It should penalize target mass that is already explained by the frozen base/ref distribution.
+
+The v65 target keeps the v64 process tilt:
+
+`raw_logit(a)=logsumexp_y(flow_score(y)+process_tilt+cluster_tilt)`.
+
+Then compute the frozen base/ref answer-cluster distribution:
+
+`p_base(a)=softmax_a logsumexp_y logp_ref(y|x)`.
+
+The final target logit is:
+
+`target_logit(a)=raw_logit(a)-lambda_base*(p_base(a)-1/|A|)*|A|`.
+
+This is a contrastive basin-sharpening objective:
+
+- It still trains a soft distribution, not a hard pseudo-label.
+- It still does not use majority vote to choose the target.
+- Majority remains diagnostic only.
+- The contrast term is based on frozen base/ref support, not ground truth or validation feedback.
+- The internal success proxy is not only final acc; v65 should reduce `direct_base_agreement`, `direct_majority_target_mass`, and possibly increase target diversity while keeping `sps_correct_weight_mass` and `sps_pick_accuracy` from collapsing.
+
+Implementation:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added default-off `base_contrast_strength=0.0` to `apply_direct_sharpened_ttrl_reward(...)`.
+  - Subtracts a centered base/ref probability penalty from answer logits only when the strength is positive.
+  - Logs:
+    - `sps/direct_base_contrast_strength`
+    - `sps/direct_base_contrast_penalty_mean`
+    - `sps/direct_base_contrast_penalty_std`
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added `contrastive_process_sharpened_prob` as a direct soft-reward mode.
+  - Reuses v64 process tilt only for process/contrastive modes.
+  - Uses `mode_id=9.0`.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off `sps_direct_base_contrast_strength: 0.0`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v65_strict_n4.sh`
+  - `ttrl.sps_reward_mode=contrastive_process_sharpened_prob`
+  - `ttrl.sps_direct_process_tilt_strength=0.6`
+  - `ttrl.sps_direct_process_cluster_tilt_strength=0.8`
+  - `ttrl.sps_direct_base_contrast_strength=0.35`
+  - Strict validation unchanged: 50 steps, `val_kwargs.n=4`, `validation_answer_selection_enable=False`.
+
+Static checks passed before launch:
+
+- `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v65_strict_n4.sh`
+- Runner grep found no stale v64/r64/t64/process-tilted names.
+
+Next action:
+
+- Run v65 50-step strict validation on the current healthy worker after the standard preflight.
+- If `mean@4 >= 0.75`, do a completion audit and minimal leakage check.
+- If it misses, document whether the base-contrast term actually reduced base/majority basin agreement and whether that helped or hurt `sps_correct_weight_mass`.
+
+### v65 result: global base contrast is too destructive
+
+v65 finished on 8x B200 worker `987816` with runner exit status `0`. The strict validation protocol was unchanged: 50 steps, `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, and no validation-time best-of or majority selection as the success metric.
+
+Final strict metric:
+
+- `val-core/MATH-TTT/acc/mean@4=0.46981891348088534`.
+- Diagnostic only:
+  - `val-core/MATH-TTT/acc/best@4/mean=0.6835472837022132`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.48600402414486926`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9622736418511066`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.04124748490945674`.
+
+50-step training averages:
+
+- `direct_target_confidence=0.22982`.
+- `direct_target_entropy=2.26380`.
+- `direct_target_effective_K=10.11560`.
+- `direct_majority_target_mass=0.11064`.
+- `direct_majority_agreement=0.0875`.
+- `direct_base_agreement=0.105`.
+- `direct_base_top_confidence=0.41612`.
+- `direct_base_contrast_penalty_std=0.66874`.
+- `direct_process_consistent_rate=0.63258`.
+- `train/pass@32=1.0`.
+- `train/sps_pick_accuracy=0.0225`.
+- `train/sps_correct_weight_mass=0.06696`.
+
+Step 50 snapshot:
+
+- `direct_target_confidence=0.191`.
+- `direct_target_effective_K=11.458`.
+- `direct_majority_target_mass=0.072`.
+- `direct_majority_agreement=0.0`.
+- `direct_base_agreement=0.0`.
+- `train/sps_pick_accuracy=0.0`.
+- `train/sps_correct_weight_mass=0.049`.
+
+Throughput and health:
+
+- Non-validation training steps averaged about `31.19s/step` from logged `timing_s/step`.
+- Steps 41-50 including final validation averaged `52.755s/step`; whole-machine throughput summary was `5339.262 tokens/s`.
+- Final validation cost was `timing_s/testing=231.798s`; final logged step was `timing_s/step=260.370`.
+- Proc health after clean exit remained OK:
+  - `PROC_SELF_OK_FINAL`
+  - `PROC_MEMINFO_OK_FINAL`
+  - `PROC_COUNT_FINAL 89`
+- Result artifacts:
+  - `/opt/tiger/TTRL/verl/sps_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v65_strict_n4.log`
+  - `/opt/tiger/TTRL/verl/sps_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v65_strict_n4_metrics.txt`
+  - `/opt/tiger/TTRL/verl/sps_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v65_strict_n4_throughput_summary.txt`
+  - `/opt/tiger/TTRL/verl/sps_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v65_strict_n4_proc_health.txt`
+
+Interpretation:
+
+- v65 decisively validates the mechanism but rejects the algorithm. It successfully broke base/majority basin lock-in: `direct_base_agreement` dropped from v64 average `0.9625` to `0.105`, and `direct_majority_target_mass` dropped from v64 average `0.70908` to `0.11064`.
+- The same global base-contrast term also destroyed correctness alignment: `sps_correct_weight_mass` dropped from v64 average `0.34496` to `0.06696`, and `sps_pick_accuracy` dropped from v64 average `0.3875` to `0.0225`.
+- `pass@32=1.0` again shows candidates are available. The target is now over-corrected away from the base/majority basin rather than aligned to a better correctness basin.
+- This is a clear negative result and not an improvement, so no local algorithm improvement commit was made.
+
+Recommended next paradigm direction:
+
+- Keep the v65 insight that unconditioned base contrast can break basin lock-in, but make it conditional.
+- v66 should use gated base contrast: subtract base support only when a cluster is base-high but process-weak. If a cluster is both base-high and process-stable, preserve it; otherwise the method suppresses many correct answers.
+- The internal success check for v66 should require:
+  - lower `direct_base_agreement` and `direct_majority_target_mass` than v64;
+  - much higher `sps_correct_weight_mass` than v65;
+  - `sps_pick_accuracy` not collapsing;
+  - strict `mean@4` above v64, with target still `>=0.75`.
+
+### v66 design: gated contrastive process sharpening
+
+v66 turns v65's negative result into a process-conditioned contrast mechanism. The v65 global penalty was:
+
+`raw_logit(a) - lambda_base * centered_base_support(a)`.
+
+It broke base/majority lock-in but suppressed many correct base-supported clusters. v66 instead estimates process support per answer cluster from the same verifier-free process-stability signal already used in v64:
+
+`p_process(a)=softmax_a cluster_tilt(a)`.
+
+Then it only penalizes excess base support:
+
+`excess(a)=max(p_base(a)-p_process(a), 0)`.
+
+The final penalty is gated:
+
+`penalty(a)=lambda_base * sigmoid(gate_strength * (p_base(a)-p_process(a)-margin) * |A|) * excess(a) * |A|`.
+
+Final target:
+
+`target_logit(a)=raw_logit(a)-penalty(a)`.
+
+Important differences from v65:
+
+- no negative penalty, so low-base clusters are not artificially boosted;
+- no penalty when process support is at least comparable to base support;
+- still no majority pseudo-label, no hard reward, and no validation-time scaling;
+- majority remains diagnostic only.
+
+Implementation:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added default-off `base_contrast_gate_strength` and `base_contrast_process_margin`.
+  - Positive gate strength switches base contrast from v65 global centered contrast to gated excess-base contrast.
+  - Logs:
+    - `sps/direct_base_contrast_gate_strength`
+    - `sps/direct_base_contrast_process_margin`
+    - `sps/direct_base_contrast_gate_mean`
+    - `sps/direct_base_contrast_gate_std`
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added `gated_contrastive_process_sharpened_prob` as a direct soft-reward mode.
+  - Uses `mode_id=10.0`.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off gate config.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4.sh`
+  - `ttrl.sps_reward_mode=gated_contrastive_process_sharpened_prob`
+  - `ttrl.sps_direct_base_contrast_strength=0.35`
+  - `ttrl.sps_direct_base_contrast_gate_strength=8.0`
+  - `ttrl.sps_direct_base_contrast_process_margin=0.02`
+
+Static checks passed:
+
+- `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4.sh`
+- Runner grep found no stale v65/r65/t65 names.
+
+### v66 result: gated contrast still over-corrects away from correctness
+
+v66 finished on 8x B200 worker `987816` with runner exit status `0`. Strict validation stayed unchanged: Qwen2.5-Math-7B, 50 training steps, `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, and no validation-time best-of, majority selection, n=32 selection, or ground-truth selection.
+
+Final strict metric:
+
+- `val-core/MATH-TTT/acc/mean@4=0.3148893360160966`.
+- Diagnostic only:
+  - `val-core/MATH-TTT/acc/best@4/mean=0.5113420523138833`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.3196338028169014`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9793762575452716`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.02967806841046278`.
+
+50-step training averages:
+
+- `direct_target_confidence=0.32026`.
+- `direct_target_entropy=2.01404`.
+- `direct_target_effective_K=8.64818`.
+- `direct_majority_target_mass=0.23094`.
+- `direct_majority_agreement=0.275`.
+- `direct_base_top_confidence=0.47912`.
+- `direct_base_agreement=0.2925`.
+- `direct_process_consistent_rate=0.68696`.
+- `direct_process_top_support=0.96306`.
+- `direct_base_contrast_gate_mean=0.24428`.
+- `direct_base_contrast_penalty_std=0.53564`.
+- `train/pass@32=1.0`.
+- `train/sps_pick_accuracy=0.0275`.
+- `train/sps_correct_weight_mass=0.12196`.
+
+Step 50 snapshot:
+
+- `direct_target_confidence=0.197`.
+- `direct_target_effective_K=11.662`.
+- `direct_majority_target_mass=0.096`.
+- `direct_majority_agreement=0.0`.
+- `direct_base_agreement=0.125`.
+- `direct_base_contrast_gate_mean=0.238`.
+- `train/sps_pick_accuracy=0.0`.
+- `train/sps_correct_weight_mass=0.073`.
+- `timing_s/testing=229.194`.
+- `timing_s/step=257.075`.
+
+Throughput and health:
+
+- Non-validation training steps averaged `30.134s/step`.
+- Whole-machine non-validation throughput was `9145.562 tokens/s`.
+- Steps 41-50 including final validation averaged `51.508s/step`.
+- Final validation cost was `timing_s/testing=229.194s`.
+- Proc health after clean exit remained OK and all 8 GPUs were released:
+  - `PROC_SELF_OK_FINAL`
+  - `PROC_MEMINFO_OK_FINAL`
+  - `PROC_COUNT_FINAL 89`
+  - `GPU_FINAL 0..7, 0 MiB, 0 %`
+- Result artifacts:
+  - `/opt/tiger/TTRL/verl/sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4.log`
+  - `/opt/tiger/TTRL/verl/sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4_ray_taskrunner.log`
+  - `/opt/tiger/TTRL/verl/sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4_metrics.txt`
+  - `/opt/tiger/TTRL/verl/sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4_throughput_summary.txt`
+  - `/opt/tiger/TTRL/verl/sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4_proc_health.txt`
+
+Interpretation:
+
+- v66 is a decisive negative result, not an improvement. It is below v65, v64, v63, the MajVote baseline, and v48.
+- The gate partially avoided v65's fully global anti-base behavior: average `direct_base_agreement=0.2925`, higher than v65's `0.105` but far lower than v64's `0.9625`. Average `direct_majority_target_mass=0.23094`, also between v65 and v64.
+- However, correctness alignment still collapsed. Average `sps_correct_weight_mass=0.12196` and `sps_pick_accuracy=0.0275` are only slightly better than v65 and far below v64 (`0.34496` and `0.3875`).
+- `pass@32=1.0` again rules out candidate availability as the bottleneck. The target construction is choosing or weighting the wrong basin.
+- Several late batches show the failure clearly: step 35 had `direct_majority_target_mass=0.078`, `direct_base_agreement=0.0`, and `sps_correct_weight_mass=0.054`; step 49 had `direct_majority_target_mass=0.128`, `direct_base_agreement=0.375`, and `sps_correct_weight_mass=0.055`. The method can move away from base/majority, but it does not move toward correctness.
+- Since v66 did not improve strict `mean@4`, no local algorithm improvement commit was made.
+
+Next paradigm direction:
+
+- Do not continue by lowering/raising `base_contrast_strength`, `gate_strength`, or the process margin. v65 and v66 already show that anti-base contrast is the wrong axis unless it is tied to a stronger correctness proxy.
+- The next pure sharpening attempt should preserve base-supported process-stable clusters by default, and only redistribute probability within a local uncertainty set when there is an independent positive signal. A plausible direction is pairwise/listwise process preference sharpening: build a soft target from within-prompt comparisons such as parseable non-clipped answer stability, tail-box consistency, absence of revision conflict, and ref likelihood margin, but use the comparison only to reweight candidates inside high-support clusters rather than subtracting base mass globally.
+- Another viable direction is entropy-band target smoothing before sharpening: prevent the direct target from becoming both high-entropy wrong-noise (v65/v66) or over-sharp base/majority lock-in (v64), using internal target entropy/effective_K as a constraint on the target distribution itself rather than as a post-hoc reward scale.
+
+### v67 design: band-limited process sharpening
+
+v67 follows the entropy/effective-K direction above and does not continue anti-base tuning. The design is based on the internal failure contrast:
+
+- v64 had better correctness alignment but by step 50 became too sharp and locked to base/majority: `direct_target_effective_K=2.185`, `direct_majority_target_mass=0.845`, `direct_base_agreement=1.0`.
+- v65/v66 broke base/majority lock-in but made the target too diffuse or wrong-basin aligned: v66 averaged `direct_target_effective_K=8.64818`, `sps_correct_weight_mass=0.12196`, and `sps_pick_accuracy=0.0275`.
+
+v67 keeps v64's process-tilted target and removes base contrast. After the answer-level softmax is built, it constrains the target effective K into a middle band using only internal support:
+
+- If the target is too sharp (`effective_K < min_K`), mix it with a support distribution from frozen base/ref plus process cluster tilt.
+- If the target is too diffuse (`effective_K > max_K`), contract it by multiplying with that same support distribution.
+- The target remains a soft distribution; no majority pseudo-label or hard majority reward is used.
+
+Initial v67 settings:
+
+- `ttrl.sps_reward_mode=band_limited_process_sharpened_prob`.
+- `ttrl.sps_direct_process_tilt_strength=0.6`.
+- `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+- `ttrl.sps_direct_base_contrast_strength=0.0`.
+- `ttrl.sps_direct_target_effective_k_min=3.0`.
+- `ttrl.sps_direct_target_effective_k_max=6.0`.
+- `ttrl.sps_direct_target_effective_k_strength=0.45`.
+
+This is not a post-hoc accuracy tweak: the band is chosen from the observed internal metric gap between v64's over-sharp lock-in and v66's high-K wrong-basin diffusion. The key diagnostics are `direct_effective_K_before_band`, `direct_effective_K_band_alpha`, `direct_effective_K_band_direction`, `sps_correct_weight_mass`, `sps_pick_accuracy`, and strict `mean@4`.
+
+Implementation:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added optional target effective-K banding to `apply_direct_sharpened_ttrl_reward(...)`.
+  - Added diagnostics for pre-band effective K, band alpha, and band direction.
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added `band_limited_process_sharpened_prob` mode with `mode_id=11.0`.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off effective-K band config.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4.sh`.
+
+Static checks passed before launch:
+
+- `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4.sh`
+- `git -C /opt/tiger/TTRL diff --check -- ...` for docs, trainer files, config, and runner.
+
+### v67 result: effective-K banding did not escape the base/majority basin
+
+v67 finished on 8x B200 worker `987816` with runner exit status `0`. Strict validation was unchanged: Qwen2.5-Math-7B, 50 training steps, `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `trainer.val_before_train=False`, and no validation-time best-of, majority selection, n=32 selection, or ground-truth selection.
+
+Final strict validation:
+
+- `val-core/MATH-TTT/acc/mean@4=0.7183098591549296`.
+- Diagnostics only:
+  - `val-core/MATH-TTT/acc/best@4/mean=0.8322897384305835`.
+  - `val-core/MATH-TTT/acc/maj@4/mean=0.7306358148893359`.
+  - `val-aux/MATH-TTT/format_score/mean@4=0.9673038229376257`.
+  - `val-aux/MATH-TTT/response_clip/mean@4=0.012575452716297788`.
+  - `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.08232297792129399`.
+
+Comparison under the same strict 50-step `mean@4` protocol:
+
+| Method | strict mean@4 | Notes |
+| --- | ---: | --- |
+| MajVote baseline | `0.7349094567404426` | Original/simple majority-vote TTRL baseline |
+| v48 best SPS | `0.7454728370221329` | Current best local SPS anchor |
+| v62 process-quality | `0.7339034205231388` | Dense process-quality signal |
+| v63 direct sharpened probability | `0.7258551307847082` | Pure probability-basin sharpening |
+| v64 process-tilted sharpened probability | `0.7328973843058351` | Process tilt, still base/majority-locked |
+| v65 global base contrast | `0.46981891348088534` | Broke base lock-in but destroyed correctness |
+| v66 gated base contrast | `0.3148893360160966` | Still moved away from correctness |
+| v67 band-limited process sharpening | `0.7183098591549296` | Effective-K banding, lower than v63/v64 |
+
+Internal metrics from the persisted TaskRunner log:
+
+- 50-step average:
+  - `direct_target_effective_K=3.33450`.
+  - `direct_effective_K_before_band=3.84630`.
+  - `direct_effective_K_band_alpha=0.20260`.
+  - `direct_effective_K_band_direction=0.57500`.
+  - `direct_target_confidence=0.71872`.
+  - `direct_majority_target_mass=0.71216`.
+  - `direct_base_agreement=0.96750`.
+  - `sps_pick_accuracy=0.33250`.
+  - `sps_correct_weight_mass=0.34080`.
+  - `pass@32=1.0`.
+  - `response_length/clip_ratio=0.05670`.
+- Non-validation steps 1-49:
+  - `direct_target_effective_K=3.36278`.
+  - `direct_effective_K_before_band=3.88386`.
+  - `direct_majority_target_mass=0.70988`.
+  - `direct_base_agreement=0.96684`.
+  - `sps_pick_accuracy=0.33673`.
+  - `sps_correct_weight_mass=0.33939`.
+- Last train-only steps 41-49:
+  - `direct_target_effective_K=3.84133`.
+  - `direct_effective_K_before_band=4.49711`.
+  - `direct_majority_target_mass=0.72678`.
+  - `direct_base_agreement=0.98611`.
+  - `sps_pick_accuracy=0.29167`.
+  - `sps_correct_weight_mass=0.35400`.
+- Step 50 shows the remaining lock-in directly:
+  - `direct_target_effective_K=1.949`.
+  - `direct_effective_K_before_band=2.006`.
+  - `direct_majority_target_mass=0.824`.
+  - `direct_majority_agreement=1.000`.
+  - `direct_base_top_confidence=0.803`.
+  - `direct_base_agreement=1.000`.
+  - `direct_low_budget_parseable_rate=1.000`.
+  - `direct_low_budget_clip_rate=0.000`.
+  - `sps_correct_weight_mass=0.410`.
+  - `sps_pick_accuracy=0.125`.
+
+Throughput and health:
+
+- Runner preflight recorded healthy `/proc`, 8 B200 GPUs, driver `580.105.08`, cleared compat for driver >=580, `cuInit=0`, GEMM OK, and cu12.9 CUDA/cuBLAS/cuDNN/NCCL/NVJitLink loaded from `/opt/tiger/modelchef/.venv`.
+- Non-validation steps 1-49 averaged `27.047s/step`.
+- Whole-machine non-validation throughput was `9222.636 tokens/s`.
+- Steps 41-50 including final validation averaged `49.299s/step`.
+- Steps 41-49 train-only averaged `26.585s/step`, `8801.405 tokens/s`.
+- Final validation cost was `timing_s/testing=232.157s`.
+- The runner's first throughput parser wrote `NO_STEP_ROWS`; this was corrected by reparsing the persisted TaskRunner log.
+- Proc/GPU health after exit remained OK:
+  - `PROC_SELF_OK_FINAL`.
+  - `PROC_MEMINFO_OK_FINAL`.
+  - `PROC_COUNT_FINAL 98`.
+  - A transient GPU4 Ray/vLLM process was visible at runner final snapshot, but it exited automatically by the post-check; all 8 GPUs were back to `0 MiB`.
+
+Result artifacts:
+
+- `/opt/tiger/TTRL/verl/sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4.log`
+- `/opt/tiger/TTRL/verl/sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4_ray_taskrunner.log`
+- `/opt/tiger/TTRL/verl/sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4_metrics.txt`
+- `/opt/tiger/TTRL/verl/sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4_throughput_summary.txt`
+- `/opt/tiger/TTRL/verl/sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4_proc_health.txt`
+
+Interpretation:
+
+- v67 is a negative result and does not meet the active target: `0.71831 < 0.75`.
+- It is also below the MajVote baseline, v48, v62, v63, and v64, so no local algorithm improvement commit should be made.
+- The effective-K mechanism did fire and moved the average target shape: average `direct_effective_K_before_band=3.84630` became `direct_target_effective_K=3.33450`, with nonzero band alpha/direction. However, the constraint was soft and did not reliably keep each batch inside the intended `[3, 6]` band; step 50 still had `direct_target_effective_K=1.949`.
+- More importantly, the band did not introduce an independent correctness basin. The target remained mostly base/majority-aligned: average `direct_base_agreement=0.96750`, average `direct_majority_target_mass=0.71216`, and step 50 had both `direct_majority_agreement=1.0` and `direct_base_agreement=1.0`.
+- `pass@32=1.0` again says candidate availability is not the bottleneck. The bottleneck remains target construction: the soft sharpened target has no signal that consistently distinguishes correct candidates from base-supported self-consistent wrong candidates.
+
+Next paradigm direction:
+
+- Do not tune v67 by only changing `target_effective_k_strength`, min-K, max-K, beta, temperature, or reward scale.
+- A stricter effective-K projection could be useful as a diagnostic, but by itself it is unlikely to reach `75%` because v67's failure is not only distribution shape; it is lack of correctness alignment.
+- The next pure distribution-sharpening scheme should add a non-majority correctness proxy before sharpening. A promising direction is local pairwise/listwise process preference sharpening: within high-support answer clusters, compare candidates by parseability, non-clip status, tail-box stability, absence of revision conflict, ref-likelihood margin, and maybe low-temperature/self-reflection agreement, then fit an escort/flow target over those candidates. This should reallocate mass inside plausible support rather than subtract base mass globally or merely clamp entropy.
+
+### v68 design: count-neutral process-preference sharpening
+
+v68 targets the clearest shared failure of v64 and v67: the answer-level target uses raw `logsumexp` over trajectories in an answer cluster, so repeated samples directly raise the answer logit. That is still a soft distribution, but in practice it gives the largest sampled cluster a majority-count advantage. The evidence is:
+
+- v64 step 50: `direct_majority_target_mass=0.845`, `direct_base_agreement=1.0`.
+- v67 average: `direct_majority_target_mass=0.71216`, `direct_base_agreement=0.96750`.
+- v67 step 50: `direct_majority_target_mass=0.824`, `direct_base_agreement=1.0`, even though the run did not use a majority pseudo-label.
+
+v68 keeps the pure direct-distribution path and process tilt, but changes the answer aggregation from raw log-sum-exp to count-neutral log-mean-exp:
+
+`answer_logit(a) = logsumexp_y score(y) - log(count(a))`
+
+where `score(y)` is still the v64 process-tilted flow score:
+
+`score(y) = beta * logp_ref(y) - logp_rollout(y) + process_tilt(y) + cluster_tilt(a)`
+
+This removes the direct cluster-size boost while preserving the listwise preference among answers from model-internal probability and process quality. It is not a hard label, does not use majority as target, and does not use validation-time selection. Majority remains a diagnostic to see whether the target still collapses back to the largest cluster.
+
+Implementation:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added default-off `count_neutral_aggregation`.
+  - When enabled, answer logits use log-mean-exp over trajectories in the answer cluster.
+  - Added diagnostic `sps/direct_count_neutral_aggregation`.
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added `count_neutral_process_sharpened_prob` mode with `mode_id=12.0`.
+  - This mode uses process tilt and count-neutral aggregation; it does not enable base contrast or effective-K banding.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off `sps_direct_count_neutral_aggregation: false`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.sh`.
+
+Initial v68 settings:
+
+- `ttrl.sps_reward_mode=count_neutral_process_sharpened_prob`.
+- `ttrl.sps_direct_count_neutral_aggregation=True`.
+- Keep v64/v67 process tilt: `process_tilt_strength=0.6`, `process_cluster_tilt_strength=0.8`.
+- Disable anti-base contrast: `base_contrast_strength=0.0`.
+- Disable v67 K band for this clean ablation: `target_effective_k_min/max/strength=0`.
+- Strict validation remains Qwen2.5-Math-7B, 50 steps, `val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`.
+
+Expected diagnostic change:
+
+- `direct_majority_target_mass` and `direct_base_agreement` should drop relative to v64/v67 without the v65/v66 correctness collapse.
+- The run is only promising if `sps_correct_weight_mass` stays near or above v64/v67 while `sps_pick_accuracy` and strict `mean@4` improve. If it only lowers majority mass but harms correctness, it joins v65/v66 as a negative anti-majority-style result.
+
+### v68 launch attempt interrupted; result unavailable
+
+v68 code and runner were implemented and passed static checks:
+
+- `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.sh`
+- `git -C /opt/tiger/TTRL diff --check -- ...` for docs, trainer files, config, and runner.
+
+The v68 runner was launched on worker `987816` at `2026-07-07 22:10:38`. Preflight was healthy before training:
+
+- `/proc/self` and `/proc/meminfo` existed.
+- `PROC_COUNT_BEFORE 95`; `PROC_COUNT_AFTER_PREFLIGHT 96`.
+- 8x B200 visible, all initially `0 MiB`.
+- Driver `580.105.08`; compat cleared; `cuInit=0`; GEMM OK.
+- CUDA/cuBLAS/cuDNN/NCCL/NVJitLink loaded from `/opt/tiger/modelchef/.venv` cu12.9 packages.
+- Strict command included Qwen2.5-Math-7B local cache, `trainer.total_training_steps=50`, `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, `ttrl.sps_majority_reward_coef=0.0`, `ttrl.sps_reward_mode=count_neutral_process_sharpened_prob`, and `ttrl.sps_direct_count_neutral_aggregation=True`.
+
+However, this run does not have a usable result. While trying to observe progress, I incorrectly issued a blocking log-scan command in the same foreground terminal as the runner and then sent `Ctrl-C`. That interrupted the v68 runner before any persisted TaskRunner metrics or final validation were captured. Immediately after that, `/proc` in the worker was broken:
+
+- `PROC_COUNT 0`.
+- `ps` reported `Error, do this: mount -t proc proc /proc`.
+- The runner final snapshot recorded `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL 0`.
+- No v68 `*_metrics.txt`, `*_ray_taskrunner.log`, or valid throughput summary was produced; only the partial runner log and proc health file exist:
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.log`
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4_proc_health.txt`
+
+Status:
+
+- v68 is implemented and ready to rerun, but its GPU validation is incomplete and must not be interpreted as success or failure.
+- Per worker rules, do not run further Ray/CUDA recovery on this worker while `/proc` is empty. Use a new healthy worker for the next v68 attempt.
+- For the rerun, keep the runner terminal dedicated to the training process. Use a separate login terminal for observation, and avoid broad `grep -R` over Ray logs while the run is live.
+- Runner note: the throughput parser in the v67/v68 shell runners has been fixed after the v67 `NO_STEP_ROWS` issue. The regex now matches `step:(\d+)` correctly and writes `step_rows=<n>` to the summary.
+- Read-only monitor script added for the next attempt:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/monitor_sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.sh`
+  - It only reads `/tmp/r68/ray/session_latest/logs`, the v68 runner log, and the v68 proc-health file.
+  - It prints `/proc` status, GPU memory/utilization, latest train metrics, validation lines, and runner status.
+  - It must be run only from a separate `mlx worker login` terminal; do not run it in the foreground training terminal.
+
+### Current completion audit for the active 75% pure-sharpening goal
+
+Status: not complete.
+
+Objective success criteria:
+
+- Strict success requires Qwen2.5-Math-7B, exactly 50 training steps, `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, and `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- The method must be pure distribution sharpening: no TTRL majority pseudo-label target, no hard majority reward, and no validation-time best-of/majority/n=32/ground-truth selection.
+- Experiments must be documented with runner, config, metrics, proc health, throughput, key internals, and interpretation in this handoff plus the Chinese summary.
+
+Evidence already satisfied:
+
+- Literature/code scan: recorded under "Literature/code scan distilled into v64" and Chinese "10 类相关工作/代码启发".
+- Baseline anchors: MajVote `0.7349094567404426`, v48 `0.7454728370221329`, v62 `0.7339034205231388`, v63 `0.7258551307847082`.
+- Pure soft-target implementations:
+  - v63 direct sharpened probability.
+  - v64 process-tilted sharpened probability.
+  - v65/v66 contrastive negative results.
+  - v67 band-limited process sharpening.
+  - v68 count-neutral process-preference sharpening implemented but not yet GPU-validated.
+- Strict completed run:
+  - v67 used Qwen2.5-Math-7B, 50 steps, `val_kwargs.n=4`, disabled validation selection, no majority reward, no validation-time scaling.
+  - v67 final strict `mean@4=0.7183098591549296`, below target.
+  - v67 artifacts and proc/throughput summaries are present.
+- Infra evidence:
+  - v67 preflight and final health were recorded.
+  - v68 launch preflight was healthy, then the run was interrupted and `/proc` became empty; this is documented as an invalid/incomplete run.
+- Commit rule:
+  - No improvement commit has been made for v67/v68, correctly following the rule because v67 regressed and v68 has no valid result.
+
+Missing requirement:
+
+- No pure distribution-sharpening run has reached strict `mean@4 >= 0.75` under the required validation protocol.
+- v68 still needs a clean 50-step strict run on a new healthy worker. The current worker from the interrupted attempt must not be reused while `/proc` is empty.
+
+Next action:
+
+- When a new healthy worker is available, rerun:
+  - `bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.sh`
+- Keep the runner terminal dedicated to training; use a separate worker login terminal for observation.
+- After v68 finishes, record final strict metrics, internals, throughput, and proc health. Only commit if strict `mean@4` clearly improves over the current best local pure/SPS anchor.
+
+### v69 design: pairwise process preference on count-neutral targets
+
+Worker status check after the interrupted v68 attempt:
+
+- `mlx worker list` still showed only worker `987816`.
+- A direct login to `987816` printed `/proc`-related errors during environment setup:
+  - `failed to get cur dir: readlink /proc/self/exe: no such file or directory`
+  - `Error, do this: mount -t proc proc /proc`
+- Per the worker rule, this worker is not usable for Ray/CUDA training, and no recovery was attempted.
+
+Because v68 cannot be rerun until a new healthy worker is available, v69 was prepared locally as the next clean ablation.
+
+Motivation:
+
+- v63 showed that pure probability residual sharpening aligns with the model's own basin rather than the correctness basin.
+- v64/v67 process tilt helped but still stayed locked to base/majority clusters.
+- v68 removes the raw cluster-count boost with count-neutral log-mean-exp aggregation, but it only changes aggregation bias. It still needs a stronger non-majority correctness proxy before sharpening.
+
+v69 adds a pairwise/listwise process-preference tilt to the v68 count-neutral target. For each answer cluster, it computes an internal process-quality score from verifier-free trajectory features:
+
+- parseable final answer;
+- non-clipped response;
+- final boxed answer appears in the tail;
+- all boxed answers agree;
+- no revision/conflict text after the final answer.
+
+Then it computes a Bradley-Terry style pairwise win rate against other answer clusters and adds the centered preference to the answer logit:
+
+`answer_logit(a) = logmeanexp_y score(y) + lambda * (pairwise_pref(a) - mean_pref)`
+
+where `score(y)` is still the process-tilted flow score:
+
+`score(y)=beta*logp_ref(y)-logp_rollout(y)+process_tilt(y)+cluster_tilt(a)`
+
+This is still pure distribution sharpening:
+
+- no majority pseudo-label target;
+- no hard majority reward;
+- no validation-time best-of, majority selection, n=32 selection, or ground-truth selection;
+- majority remains only a diagnostic metric.
+
+Implementation:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added `pairwise_process_preference_strength` and `pairwise_process_preference_temperature`.
+  - Added per-run diagnostics:
+    - `sps/direct_pairwise_process_preference_strength`
+    - `sps/direct_pairwise_process_preference_temperature`
+    - `sps/direct_pairwise_process_preference_std`
+    - `sps/direct_pairwise_process_top_preference`
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added `pairwise_process_count_neutral_sharpened_prob` mode with `mode_id=13.0`.
+  - This mode enables process tilt, count-neutral aggregation, and pairwise process preference.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off pairwise preference config.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.sh`
+- Read-only monitor:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/monitor_sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.sh`
+  - Use only from a separate worker login terminal; it prints `/proc`, GPU, train, validation, and pairwise preference metrics without controlling the runner.
+
+Initial v69 settings:
+
+- `ttrl.sps_reward_mode=pairwise_process_count_neutral_sharpened_prob`.
+- `ttrl.sps_direct_count_neutral_aggregation=True`.
+- `ttrl.sps_direct_pairwise_process_preference_strength=0.8`.
+- `ttrl.sps_direct_pairwise_process_preference_temperature=1.0`.
+- Same v64/v68 process tilt: `process_tilt_strength=0.6`, `process_cluster_tilt_strength=0.8`.
+- No base contrast and no effective-K band in the clean ablation.
+- Strict validation remains Qwen2.5-Math-7B, 50 steps, `val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`.
+
+Expected diagnostic:
+
+- Compared with v64/v67, `direct_majority_target_mass` and `direct_base_agreement` should not stay saturated.
+- Compared with v65/v66, `sps_correct_weight_mass` and `sps_pick_accuracy` should not collapse.
+- The key new metric is whether `direct_pairwise_process_top_preference` is positive while strict `mean@4` improves. If pairwise preference only makes the target cleaner but lowers correctness mass, it is a negative result and should not be tuned blindly.
+
+Local CPU-only smoke:
+
+- Command shape:
+  - `PYTHONPATH=/opt/tiger/TTRL/verl /opt/tiger/modelchef/.venv/bin/python3 - <<'PY' ...`
+  - The smoke directly calls `apply_direct_sharpened_ttrl_reward(...)` with four fake rollouts and no GPU/Ray.
+- Test construction:
+  - All model/ref/rollout logprobs are equal, so probability terms cannot prefer one answer.
+  - Two rollouts answer `1` with clean final boxed answers.
+  - Two rollouts answer other values with revision/conflict process text.
+  - Count-neutral aggregation is enabled in both control and v69 cases.
+- Observed output:
+  - Control no-pairwise rewards: `[0.25, 0.25, 0.25, 0.25]`.
+  - v69 pairwise rewards: `[0.297568, 0.297568, 0.202432, 0.202432]`.
+  - `PAIRWISE_TOP_PREF=0.24077486991882324`.
+  - `PAIRWISE_STD=0.24077488481998444`.
+  - `TARGET_CONF_NO_PAIR=0.5`.
+  - `TARGET_CONF_PAIR=0.595136284828186`.
+- Interpretation:
+  - With all probability scores tied, the pairwise process preference alone raises the soft reward mass of the cleaner answer cluster.
+  - This validates the target-construction mechanism locally, but it is not a GPU training result and does not count toward the active `mean@4 >= 0.75` goal.
+
+Current worker status remains blocked:
+
+- `mlx worker list` still shows only `987816`.
+- This is the worker that already showed broken `/proc` on login.
+- No further login, Ray, or CUDA recovery was attempted in this check.
+
+Static strict-config audit:
+
+- Added `/opt/tiger/TTRL/verl/examples/ttrl/verify_pure_sharpening_strict_configs.py`.
+- The checker is conservative and only prevents obvious launch-config leaks. It verifies:
+  - v68/v69 runners use Qwen2.5-Math-7B local weights.
+  - `trainer.total_training_steps=50`.
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - `ttrl.sps_majority_reward_coef=0.0`.
+  - `ttrl.sps_format_reward_coef=0.0`.
+  - no explicit validation `n=32` or answer-selection mode appears in those runners.
+  - Ray dashboard/runtime-env workarounds and `/tmp/ttrl_cache/<exp>` cache roots are present.
+  - v68 count-neutral mode and v69 pairwise count-neutral mode are routed in `ray_trainer.py`.
+  - default-off config entries exist in `ppo_trainer_ttrl.yaml`.
+- Command:
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/verify_pure_sharpening_strict_configs.py`
+- Output:
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`
+- Additional static checks passed:
+  - `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py /opt/tiger/TTRL/verl/examples/ttrl/verify_pure_sharpening_strict_configs.py`
+  - `bash -n` for v68/v69 runners and monitors.
+  - `git -C /opt/tiger/TTRL diff --check -- ...`
+
+This audit does not count as goal completion. The active goal still requires a real 50-step strict GPU run with `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+
+Post-run result audit:
+
+- Added `/opt/tiger/TTRL/verl/examples/ttrl/audit_pure_sharpening_result.py`.
+- Purpose:
+  - After a v68/v69 runner finishes, verify that the run has complete artifacts before considering goal completion.
+  - Extract strict `val-core/MATH-TTT/acc/mean@4`, plus diagnostic `best@4` and `maj@4`.
+  - Re-check strict runner config in the run log.
+  - Require proc-health and throughput artifacts.
+  - Reject runs with `NO_STEP_ROWS`, missing metrics, broken final `/proc`, validation selection, or `n=32` leakage.
+- Command shape:
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_pure_sharpening_result.py v68`
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_pure_sharpening_result.py v69`
+- Expected success output includes:
+  - `STRICT_MEAN@4=<value>`
+  - `TARGET=0.75`
+  - `RESULT=PASS`
+- Negative smoke on the interrupted v68 artifact worked as intended:
+  - The audit rejected the run because `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4_metrics.txt` is missing.
+  - This confirms the interrupted v68 attempt cannot be mistaken for a valid result.
+- Full-run negative smoke on v67 also worked as intended:
+  - The audit parses the final effective CLI overrides instead of naively rejecting earlier base-script defaults.
+  - The metric parser now prefers the high-precision final validation dict, and only falls back to rounded step-line logging if the dict is absent.
+  - The audit now also prints the clean-ablation diagnostics required by the active goal: target confidence/entropy/effective-K, unique answer count, target majority mass/agreement as diagnostics, base agreement, low-budget parseable/clip/top mass, process consistency/support, count-neutral and pairwise preference fields when present, `sps_pick_accuracy`, `sps_correct_weight_mass`, `pass@32`, validation clip/format/logprob, train clip ratio, and throughput.
+  - Output:
+    - `STRICT_MEAN@4=0.7183098591549296`
+    - `BEST@4=0.8322897384305835`
+    - `MAJ@4=0.7306358148893359`
+    - `TARGET_CONFIDENCE=0.824`
+    - `TARGET_ENTROPY=0.776`
+    - `TARGET_EFFECTIVE_K=1.949`
+    - `LOW_BUDGET_TOP_MASS=0.719`
+    - `PROCESS_CONSISTENT_RATE=0.963`
+    - `SPS_CORRECT_WEIGHT_MASS=0.41`
+    - `VAL_RESPONSE_CLIP_MEAN4=0.012575452716297788`
+    - `VAL_FORMAT_SCORE_MEAN4=0.9673038229376257`
+    - `TARGET=0.75`
+    - `RESULT=FAIL`
+  - Exit code was `2`, meaning the run is complete and strict, but below the active target.
+- Static checks passed after adding the post-run audit:
+  - `py_compile` for the audit/config checker and trainer files.
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `git diff --check`.
+
+This post-run audit is also not a proxy for completion. It is only a guard. The actual completion condition remains strict `mean@4 >= 0.75` from a complete 50-step GPU run.
+
+### Active goal completion audit snapshot: 2026-07-07
+
+Objective restated as concrete deliverables:
+
+- Propose and validate a pure distribution-sharpening training algorithm for Qwen2.5-Math-7B on strict Math500/MATH-TTT.
+- The final success criterion is a complete 50-step GPU run with `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, and `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- The method must not use TTRL majority pseudo-labels, hard majority reward, validation-time best-of, validation-time majority vote, n=32 selection, or ground-truth selection. Majority can only be diagnostic.
+
+Prompt-to-artifact checklist:
+
+| Requirement | Current evidence | Audit status |
+| --- | --- | --- |
+| Read and summarize at least 10 related papers/code directions | Literature/code scan and design synthesis are recorded earlier in this handoff and summarized in `TTRL_SPS_CN_SUMMARY.md`; directions include TTRL, verifier-free RL, entropy shaping, self-consistency without vote-as-label, PowerFlow/flow-style sharpening, process-quality targets, contrastive support, and anti-collapse variants. | Covered as design groundwork |
+| Motivate each new idea from prior observations | v48, v58-v62, v63-v67 observations are linked to v68/v69 design: v68 targets count/majority bias in answer aggregation; v69 adds pairwise process preference because count-neutral aggregation alone does not provide a correctness proxy. | Covered for current candidates |
+| Pure distribution-sharpening, no majority target | v68 uses count-neutral log-mean-exp answer aggregation; v69 uses count-neutral target plus Bradley-Terry style process preference. Static checker verifies `ttrl.sps_majority_reward_coef=0.0`, `ttrl.sps_format_reward_coef=0.0`, strict validation, and no explicit n=32/answer-selection leakage in v68/v69 runners. | Covered by static guard, still needs GPU result |
+| Strict validation protocol | `verify_pure_sharpening_strict_configs.py` checks v68/v69 runners for Qwen2.5-Math-7B, 50 steps, `val_kwargs.n=4`, and `validation_answer_selection_enable=False`; output on 2026-07-07 was `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`. | Covered before launch |
+| Clean ablation against anchors | Anchors are documented: MajVote baseline, v48 best SPS, v62 process-quality, v63 direct sharpened probability, v64-v67 pure variants. v67 completed and failed; v68/v69 are ready as clean ablations but not yet GPU-complete. | Partially covered; missing v68/v69 GPU metrics |
+| GPU/infra recipe | v68 runner contains preflight/final proc health, driver/compat, `cuInit`, GEMM, CUDA library path logging, and `/tmp/ttrl_cache/<exp>` cache placement. v69 follows the same pattern. | Covered in runner, not recently executed successfully |
+| Experiment documentation | v67 result, invalid v68 attempt, v69 design, static audit, and post-run audit behavior are recorded in this handoff and the Chinese summary. | Covered so far |
+| Git commit rule | No improvement commit for v67/v68/v69 because v67 regressed, v68 was interrupted, and v69 has no GPU result. | Covered |
+| Completion audit after success | `audit_pure_sharpening_result.py` checks complete artifacts, final proc health, throughput rows, strict config, and high-precision final `mean@4`; it returns `RESULT=PASS` only if `mean@4 >= 0.75`. | Guard exists; no passing run yet |
+
+Current real evidence checked in this snapshot:
+
+- `NO_COLOR=1 TERM=dumb mlx worker list` shows only worker `987816`.
+- Worker `987816` is the previously broken worker whose login produced `/proc/self/exe` missing and `mount -t proc proc /proc`; per rule it must not be used for Ray/CUDA.
+- Static strict config audit passed:
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/verify_pure_sharpening_strict_configs.py`
+  - Output: `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- v67 post-run audit now reads high-precision final validation dict values:
+  - `STRICT_MEAN@4=0.7183098591549296`
+  - `BEST@4=0.8322897384305835`
+  - `MAJ@4=0.7306358148893359`
+  - `RESULT=FAIL`, exit code `2`.
+
+Missing requirement:
+
+- There is still no complete strict 50-step GPU run for v68 or v69 with `mean@4 >= 0.75`.
+- Because the only listed worker is the known broken `987816`, no new GPU experiment was launched in this snapshot.
+
+Next concrete action when a healthy worker is available:
+
+1. Run the preflight in the runner and stop immediately if `/proc` is missing or `cuInit` is not `0`.
+2. Launch v69 first because it is the current stronger clean ablation:
+   - `bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.sh`
+3. Monitor only from a separate worker login terminal:
+   - `bash /opt/tiger/TTRL/verl/examples/ttrl/monitor_sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.sh`
+4. After completion, run:
+   - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_pure_sharpening_result.py v69`
+5. If v69 fails below target, run v68 as the count-neutral ablation and audit it the same way.
+
+Goal status: not complete. Do not call `update_goal` until a real complete strict GPU run passes the post-run audit with `RESULT=PASS`.
+
+### Ablation comparison helper
+
+Added a read-only TSV comparison helper:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/summarize_pure_sharpening_ablation.py`
+
+Purpose:
+
+- Produce a single clean-ablation table for the active goal without hand-copying metrics.
+- Compare the requested anchors: MajVote baseline, current best prior SPS v48, v62 process-quality, v63 direct sharpened probability, v67 band-limited process sharpening, and future v68/v69.
+- Mark missing/incomplete experiments as `MISSING` instead of treating them as failures or successes.
+
+Command:
+
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/summarize_pure_sharpening_ablation.py`
+- Latest saved TSV artifact:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`
+
+Current output highlights:
+
+| label | strict mean@4 | best@4 | maj@4 diag | artifact status |
+| --- | --- | --- | --- | --- |
+| MajVote baseline | `0.73490945674` | `0.838338028169` | `0.746696177062` | complete metrics |
+| v48 best prior SPS | `0.745472837022` | `0.860191146881` | `0.762547283702` | complete metrics |
+| v62 process quality | `0.733903420523` | `0.830414486922` | `0.750251509054` | complete metrics |
+| v63 direct probability | `0.725855130785` | `0.841040241449` | `0.742672032193` | complete metrics |
+| v67 band-limited | `0.718309859155` | `0.832289738431` | `0.730635814889` | complete metrics |
+| v68 count-neutral | `NA` | `NA` | `NA` | missing |
+| v69 pairwise count-neutral | `NA` | `NA` | `NA` | missing |
+
+Important interpretation:
+
+- Current best completed strict 50-step anchor remains v48 at `0.745472837022`, about `0.00453` absolute below the active `0.75` target.
+- v63 and v67 confirm the current pure direct-sharpening attempts underperform v48 and the MajVote baseline; they are not successes.
+- v68/v69 are still missing real GPU metrics. The helper is intentionally conservative and keeps them as `MISSING`.
+- The table also includes target entropy/effective-K, low-budget parseable/clip/top mass, process consistency/support, validation clip/format/logprob, and throughput columns where available. Older SPS anchors do not expose all direct-target metrics, so some fields are `NA`.
+
+Validation:
+
+- `py_compile` passed for the helper and post-run audit.
+- The helper is read-only and does not inspect labels beyond already logged training/validation metrics.
+
+### Goal completion audit helper
+
+Added a final gate helper for use before any future `update_goal` call:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+
+Purpose:
+
+- Restate the concrete target: Qwen2.5-Math-7B, strict 50-step pure sharpening, `mean@4 >= 0.75`.
+- Refresh `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv` by running the summary helper first, so stale TSV contents cannot be used for completion.
+- Run the static strict-config audit.
+- Read the refreshed `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+- Print explicit `CHECKLIST ...=PASS/FAIL evidence=...` lines for objective restatement, summary refresh, strict config audit, ablation rows, pure candidate presence, target metric threshold, and post-run audit.
+- Consider only the current pure-sharpening candidates `v68_count_neutral` and `v69_pairwise_count_neutral`.
+- Refuse completion unless one of those candidates has complete metrics with `strict_mean4 >= 0.75`.
+- If a candidate reaches the TSV threshold, run the stricter post-run audit for `v68` or `v69` and require `RESULT=PASS`.
+
+Command:
+
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+
+Current output:
+
+- `CHECKLIST objective_restatement=PASS ...`
+- `SUMMARY_REFRESH_EXIT=0`
+- `CHECKLIST summary_refresh=PASS ...`
+- `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`
+- `CHECKLIST strict_config_audit=PASS ...`
+- `CHECKLIST ablation_rows_present=PASS evidence=rows=7`
+- `CANDIDATE=v68_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+- `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+- `CHECKLIST pure_candidates_listed=PASS evidence=seen=v68_count_neutral,v69_pairwise_count_neutral`
+- `CHECKLIST target_metric_reached=FAIL evidence=best=NA target=0.75`
+- `MISSING_REQUIREMENT=no complete v68/v69 pure-sharpening run reaches target`
+- `RESULT=FAIL`
+- Exit code: `2`.
+
+Interpretation:
+
+- The goal is still not complete.
+- The helper is intentionally narrower than the ablation table: v48 is the current best prior SPS anchor, but it is not the new pure-sharpening candidate for this goal and is below target anyway.
+- Do not mark the goal complete unless this helper passes after a complete v68/v69 GPU run.
+
+### Runner post-run automation
+
+Updated both v68 and v69 worker runners so the evidence trail is generated automatically after a training attempt finishes:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.sh`
+- `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.sh`
+
+New post-run behavior:
+
+- After metrics/proc/throughput snapshots are written, each runner calls:
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/summarize_pure_sharpening_ablation.py`
+- The TSV is refreshed at:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`
+- Then the runner calls:
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+- Both outputs are appended to the runner log with explicit status lines:
+  - `..._ABLATION_SUMMARY_STATUS <code>`
+  - `..._COMPLETION_AUDIT_STATUS <code>`
+
+Important implementation note:
+
+- The post-run completion audit is a reporting gate only; it does not replace the training process exit code. The runner still exits with the original training `status`, so a non-passing accuracy audit cannot hide whether the training command itself crashed or completed.
+
+Validation:
+
+- `bash -n` passed for both updated runners.
+- `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK` still passes.
+- Current completion audit still fails as expected because v68/v69 are missing complete GPU metrics.
+- `git diff --check` passed.
+
+### Worker readiness guard for the next v69 attempt
+
+Added a no-login, read-only worker readiness helper:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh`
+
+Purpose:
+
+- Run `NO_COLOR=1 TERM=dumb mlx worker list`.
+- Reject known-broken worker IDs before any `mlx worker login` or Ray/CUDA work.
+- Require a listed 8x `NVIDIA-B200` worker with a non-empty `podIP` that is not in `KNOWN_BAD_WORKERS`.
+- If a candidate is available, print the exact login command and v69 runner command.
+
+Default known-bad set:
+
+- `KNOWN_BAD_WORKERS=987816`
+
+Current output:
+
+- `WORKER id=987816 gpu=8 gpu_type=NVIDIA-B200 pod_ip=fdbd:dccd:cde2:2131:0:e665:d5ca:9aea known_bad=1`
+- `READINESS=FAIL`
+- `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`
+- Exit code: `2`.
+
+Interpretation:
+
+- The presence of `987816` in `mlx worker list` is not enough; it is explicitly treated as unusable because it previously showed broken `/proc`.
+- Do not run v69 until this helper prints `READINESS=PASS`.
+
+### Guarded v69 entrypoint
+
+Added a small wrapper that enforces the readiness guard before any v69 run:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/guarded_run_v69_pairwise_pure_sharpening.sh`
+
+Behavior:
+
+- Runs `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh` first.
+- If readiness fails, exits immediately before touching the v69 runner.
+- If readiness passes, default behavior is dry-run: print the next command and exit.
+- To execute the v69 runner from inside the selected healthy worker shell, set:
+  - `RUN_V69_AFTER_READINESS=1 bash /opt/tiger/TTRL/verl/examples/ttrl/guarded_run_v69_pairwise_pure_sharpening.sh`
+
+Current validation:
+
+- `bash -n` passed.
+- Running it on the current devbox exits with code `2` because readiness still only sees known-bad worker `987816`.
+- It did not enter the v69 runner path.
+
+### Unified local guard smoke
+
+Added a single local smoke script for the non-GPU guardrail stack:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+
+What it checks:
+
+- Python syntax for:
+  - `audit_pure_sharpening_result.py`
+  - `check_pure_sharpening_goal_completion.py`
+  - `summarize_pure_sharpening_ablation.py`
+  - `smoke_v69_pairwise_target_cpu.py`
+  - `verify_pure_sharpening_strict_configs.py`
+  - `ttrl_utils.py`
+  - `ray_trainer.py`
+- Bash syntax for:
+  - `check_worker_readiness_for_v69.sh`
+  - `guarded_run_v69_pairwise_pure_sharpening.sh`
+  - v68/v69 worker runners.
+- Strict config audit.
+- v69 pairwise target CPU-only mechanism smoke.
+- Ablation summary refresh.
+- Completion gate current behavior.
+- Worker readiness current behavior.
+
+Current result:
+
+- `SMOKE_EXIT_CODE=0`.
+- v69 CPU-only smoke output:
+  - `NO_PAIR_REWARDS=0.250000,0.250000,0.250000,0.250000`
+  - `PAIR_REWARDS=0.334522,0.334522,0.165478,0.165478`
+  - `TARGET_CONF_NO_PAIR=0.5`
+  - `TARGET_CONF_PAIR=0.6690433025360107`
+  - `PAIRWISE_TOP_PREF=0.4399133324623108`
+  - `V69_PAIRWISE_TARGET_CPU_SMOKE_OK`
+- Completion gate exits `2` and is reported as `SMOKE completion_gate_not_complete`, which is expected until v68/v69 produce complete target-reaching metrics.
+- Worker readiness exits `2` because only known-bad `987816` is listed; this is also expected and does not fail the local guard smoke.
+
+Use this before launching after any local edits:
+
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+
+The CPU-only v69 smoke can also be run directly:
+
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/smoke_v69_pairwise_target_cpu.py`
+
+Interpretation:
+
+- This smoke is not a training result and does not count toward goal completion.
+- It verifies the v69 target-construction mechanism in isolation: with equal model/ref/rollout log probabilities and count-neutral aggregation, the no-pairwise target is uniform, while pairwise process preference shifts soft reward mass toward cleaner final-answer trajectories without using a majority label.
+
+### v68/v69 no-majority-target static audit
+
+Added a narrower static audit for the current pure-sharpening candidates:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/audit_v68_v69_no_majority_target.py`
+
+Purpose:
+
+- A global grep for `majority` is not meaningful because the repo still keeps older TTRL/SPS majority-label modes for reproducibility.
+- This audit instead verifies the actual v68/v69 runner modes and the direct pure-sharpening execution path.
+
+What it checks:
+
+- v68/v69 runners use Qwen2.5-Math-7B, 50 training steps, strict `actor_rollout_ref.rollout.val_kwargs.n=4`, and `trainer.validation_answer_selection_enable=False`.
+- v68/v69 runners set `ttrl.sps_majority_reward_coef=0.0` and `ttrl.sps_format_reward_coef=0.0`.
+- v68 uses `ttrl.sps_reward_mode=count_neutral_process_sharpened_prob`.
+- v69 uses `ttrl.sps_reward_mode=pairwise_process_count_neutral_sharpened_prob`.
+- The `ray_trainer.py` direct branch routes these modes through `apply_direct_sharpened_ttrl_reward(...)` and `select_top_k_per_prompt(...)`.
+- That branch does not call `apply_ttrl_gt`, `apply_sps_weighted_ttrl_gt`, `select_majority_first_per_prompt`, `select_sharpened_cluster_per_prompt`, or majority fallback logic.
+- Inside `apply_direct_sharpened_ttrl_reward(...)`, `majority_gt` is computed only after `answer_logits`, `target_probs`, and `target_prob_by_answer` are constructed.
+- After majority diagnostics are computed, the function does not rebuild `answer_logits` or `target_probs`.
+- No line combines `majority` and `prompt_rewards`, preventing a majority pseudo-label from affecting the terminal reward in this direct path.
+
+Current validation:
+
+- `/opt/tiger/modelchef/.venv/bin/python3 -m py_compile /opt/tiger/TTRL/verl/examples/ttrl/audit_v68_v69_no_majority_target.py`
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_v68_v69_no_majority_target.py`
+- Output:
+  - `V68_V69_NO_MAJORITY_TARGET_AUDIT_OK`
+
+The unified local smoke now includes this audit:
+
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+
+Latest smoke result on `2026-07-07 23:08`:
+
+- `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`
+- `V68_V69_NO_MAJORITY_TARGET_AUDIT_OK`
+- `V69_PAIRWISE_TARGET_CPU_SMOKE_OK`
+- Ablation TSV refreshed.
+- Completion gate still fails as expected:
+  - `CANDIDATE=v68_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+  - `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+  - `MISSING_REQUIREMENT=no complete v68/v69 pure-sharpening run reaches target`
+  - `RESULT=FAIL`
+- Worker readiness still fails because only known-bad worker `987816` is listed:
+  - `READINESS=FAIL`
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`
+
+Interpretation:
+
+- The no-majority-target audit strengthens the evidence that v68/v69 are pure direct-distribution sharpening candidates rather than hidden majority-label variants.
+- It is still only a static guard, not a training result.
+- The active goal remains incomplete until a healthy worker produces a complete strict 50-step v68 or v69 run with `val-core/MATH-TTT/acc/mean@4 >= 0.75` and the post-run completion gate passes.
+
+### Completion gate now requires no-majority-target audit
+
+Updated the completion helper so a future metric-only pass cannot close the goal unless the new no-majority-target audit also passes:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+
+New hard check:
+
+- Runs `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_v68_v69_no_majority_target.py`.
+- Prints:
+  - `NO_MAJORITY_TARGET_AUDIT_EXIT=...`
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=...`
+  - `CHECKLIST no_majority_target_audit=PASS/FAIL evidence=...`
+- Fails the completion gate immediately if the audit does not emit `V68_V69_NO_MAJORITY_TARGET_AUDIT_OK`.
+
+Validation on `2026-07-07 23:11`:
+
+- `py_compile` passed for `check_pure_sharpening_goal_completion.py` and `audit_v68_v69_no_majority_target.py`.
+- `git diff --check` passed for the touched audit files.
+- Direct completion gate output now includes:
+  - `NO_MAJORITY_TARGET_AUDIT_EXIT=0`
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=V68_V69_NO_MAJORITY_TARGET_AUDIT_OK`
+  - `CHECKLIST no_majority_target_audit=PASS evidence=V68_V69_NO_MAJORITY_TARGET_AUDIT_OK`
+  - `RESULT=FAIL`
+- The failure is expected and correct because v68/v69 still have no complete GPU metrics:
+  - `CANDIDATE=v68_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+  - `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+
+Unified local smoke was rerun after this change:
+
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+- Exit code: `0`
+- The smoke now proves the stricter completion gate behavior, while still reporting `SMOKE completion_gate_not_complete` until a real v68/v69 GPU run reaches target.
+
+### Completion gate now requires documentation evidence audit
+
+Added a documentation evidence audit so the completion gate also covers the non-metric requirements from the active goal:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/audit_pure_sharpening_docs.py`
+
+What it verifies:
+
+- The handoff contains the current literature refresh section with at least 10 paper/preprint/code-direction markers.
+- The handoff contains the active goal completion audit snapshot.
+- The handoff records v68/v69 designs and the no-majority completion-gate hard check.
+- The Chinese summary contains the active 75% pure-sharpening goal, 10-category literature/code summary, no-majority-target audit, completion-gate hard check, and current not-complete state.
+- The prior-observation chain needed by the user objective is present in the docs, including v48, v58-v62, v63, and v67 evidence.
+
+Validation on `2026-07-07 23:16`:
+
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_pure_sharpening_docs.py`
+- Output:
+  - `PURE_SHARPENING_DOC_AUDIT_OK papers=13`
+
+Updated completion helper:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+
+New hard check output:
+
+- `DOC_AUDIT_EXIT=0`
+- `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`
+- `CHECKLIST doc_audit=PASS evidence=PURE_SHARPENING_DOC_AUDIT_OK papers=13`
+
+Unified local smoke was rerun:
+
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+- Exit code: `0`
+- Current completion gate still correctly fails because there is still no complete v68/v69 GPU result:
+  - `CANDIDATE=v68_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+  - `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`
+  - `MISSING_REQUIREMENT=no complete v68/v69 pure-sharpening run reaches target`
+
+Interpretation:
+
+- Future completion now requires all three guard categories before a metric pass can close the goal: strict config audit, no-majority-target audit, and documentation evidence audit.
+- This still does not count as goal completion. The remaining missing artifact is a healthy-worker 50-step v69 or v68 GPU run reaching strict `mean@4 >= 0.75`.
+
+### Latest live blocker check
+
+Live checks were repeated after the completion-gate hardening.
+
+Command:
+
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh`
+
+Output summary:
+
+- `mlx worker list` still shows only worker `987816`.
+- `KNOWN_BAD_WORKERS=987816`.
+- `WORKER id=987816 gpu=8 gpu_type=NVIDIA-B200 ... known_bad=1`.
+- `READINESS=FAIL`.
+- `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Exit code: `2`.
+
+Command:
+
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+
+Output summary:
+
+- `CHECKLIST strict_config_audit=PASS`.
+- `CHECKLIST no_majority_target_audit=PASS`.
+- `CHECKLIST doc_audit=PASS`.
+- `CANDIDATE=v68_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`.
+- `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`.
+- `CHECKLIST target_metric_reached=FAIL`.
+- `MISSING_REQUIREMENT=no complete v68/v69 pure-sharpening run reaches target`.
+- `RESULT=FAIL`.
+- Exit code: `2`.
+
+Interpretation:
+
+- Do not launch v69/v68 on worker `987816`.
+- Do not call `update_goal`.
+- The next valid action is to wait for or attach to a healthy non-known-bad 8x B200 worker, then run the guarded v69 path first.
+
+### Readiness guard now enforces exactly one worker
+
+Updated the v69 readiness helper to encode the worker-management rule directly:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh`
+
+New behavior:
+
+- Prints `WORKER_COUNT=<n>`.
+- Fails if no worker is listed.
+- Fails if more than one worker is listed:
+  - `REASON=multiple workers are listed; keep exactly one worker before running v69`
+- Still requires the single listed worker to be 8x `NVIDIA-B200`, have a non-empty `podIP`, and not be in `KNOWN_BAD_WORKERS`.
+
+Validation:
+
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh /opt/tiger/TTRL/verl/examples/ttrl/guarded_run_v69_pairwise_pure_sharpening.sh`
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh`
+  - Current output includes `WORKER_COUNT=1`.
+  - It still fails correctly because the only worker is known-bad `987816`.
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+  - Exit code: `0`.
+  - The smoke preserves the expected non-complete state: completion gate exits `2`; readiness exits `2` because only known-bad `987816` is listed.
+
+Interpretation:
+
+- This is an infra guardrail improvement, not a training result and not a throughput/accuracy improvement.
+- It prevents the next session from accidentally running v69 while two workers are listed, which would violate the one-worker rule.
+
+### Worker readiness fixture smoke
+
+Added a local fixture smoke for the readiness helper:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/smoke_worker_readiness_guard.sh`
+
+Implementation detail:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh` now accepts `WORKER_LIST_FIXTURE=<path>` for local tests.
+- Without `WORKER_LIST_FIXTURE`, it still runs the real read-only command:
+  - `NO_COLOR=1 TERM=dumb mlx worker list`
+
+Fixture cases covered:
+
+- `no_worker`: exits `2`, emits `REASON=no worker is listed`.
+- `known_bad_single`: exits `2`, emits `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- `multiple_workers`: exits `2`, emits `REASON=multiple workers are listed; keep exactly one worker before running v69`.
+- `healthy_single`: exits `0`, emits `READINESS=PASS`, `SELECTED_WORKER=...`, login command, and v69 runner command.
+
+Validation:
+
+- `bash -n /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh /opt/tiger/TTRL/verl/examples/ttrl/smoke_worker_readiness_guard.sh /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_worker_readiness_guard.sh`
+  - Output ended with `WORKER_READINESS_GUARD_SMOKE_OK`.
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh`
+  - Exit code: `0`.
+  - The unified smoke now includes `SMOKE worker_readiness_guard_fixtures`.
+
+Interpretation:
+
+- The next v69 GPU attempt is now guarded by a tested readiness policy: exactly one worker, non-known-bad, 8x B200, non-empty pod IP.
+- The current live worker state still fails because only known-bad `987816` is listed.
+
+### Latest gate refresh after goal resume
+
+Timestamp: `2026-07-07 23:25 CST`.
+
+Commands rerun:
+
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v69.sh`
+- `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`
+
+Readiness result:
+
+- `mlx worker list` still shows exactly one worker, `987816`.
+- `KNOWN_BAD_WORKERS=987816`.
+- The listed worker is 8x `NVIDIA-B200` with non-empty `podIP`, but it is explicitly known-bad from the earlier broken `/proc` episode.
+- Output includes:
+  - `WORKER_COUNT=1`
+  - `WORKER id=987816 gpu=8 gpu_type=NVIDIA-B200 pod_ip=fdbd:dccd:cde2:2131:0:e665:d5ca:9aea known_bad=1`
+  - `READINESS=FAIL`
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`
+- Exit code: `2`.
+
+Completion gate result:
+
+- `CHECKLIST strict_config_audit=PASS`.
+- `CHECKLIST no_majority_target_audit=PASS`.
+- `CHECKLIST doc_audit=PASS`.
+- `CANDIDATE=v68_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`.
+- `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`.
+- `CHECKLIST target_metric_reached=FAIL evidence=best=NA target=0.75`.
+- `MISSING_REQUIREMENT=no complete v68/v69 pure-sharpening run reaches target`.
+- `RESULT=FAIL`.
+- Exit code: `2`.
+
+Interpretation:
+
+- The active pure distribution-sharpening goal is still incomplete.
+- Do not call `update_goal`.
+- Do not launch v68 or v69 on worker `987816`.
+- The next valid GPU action is still: wait for or attach to a healthy, non-known-bad, exactly-one-listed 8x B200 worker; then enter that worker and run:
+  - `RUN_V69_AFTER_READINESS=1 bash /opt/tiger/TTRL/verl/examples/ttrl/guarded_run_v69_pairwise_pure_sharpening.sh`
+
+### v69 healthy-worker GPU result: strong negative
+
+Run timestamp: `2026-07-07 23:39` to `2026-07-08 00:13 CST`.
+
+Worker and infra:
+
+- Worker: `988093`, exactly one listed worker, 8x `NVIDIA-B200`, non-known-bad.
+- Readiness passed before launch:
+  - `WORKER_COUNT=1`
+  - `READINESS=PASS`
+  - `SELECTED_WORKER=988093`
+- Preflight was healthy:
+  - `/proc/self` and `/proc/meminfo` present.
+  - `PROC_COUNT_BEFORE=75`, `PROC_COUNT_AFTER_PREFLIGHT=76`.
+  - 8 GPUs visible and idle before training.
+  - Driver `580.105.08`; compat conf cleared.
+  - `cuInit: 0`.
+  - GEMM smoke passed.
+  - Loaded CUDA libraries came from the intended stack:
+    - `/usr/lib/x86_64-linux-gnu/libcuda.so.580.105.08`
+    - venv cu12.9 `libcublas.so.12`, `libcublasLt.so.12`, `libnccl.so.2`, `libcudnn.so.9`, `libnvJitLink.so.12`, `libcudart.so.12`.
+- Cache and local model copy were under:
+  - `/tmp/ttrl_cache/sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4`
+- Final proc/GPU health stayed good:
+  - `PROC_SELF_OK_FINAL`
+  - `PROC_MEMINFO_OK_FINAL`
+  - `PROC_COUNT_FINAL 80`
+  - all 8 B200 GPUs returned to `0 MiB`.
+
+Runner and artifacts:
+
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.sh`
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4.log`
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4_ray_taskrunner.log`
+- Metrics:
+  - `/opt/tiger/TTRL/verl/sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4_metrics.txt`
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4_proc_health.txt`
+- Throughput:
+  - `/opt/tiger/TTRL/verl/sps_pairwise_process_count_neutral_sharpened_prob_qwen25_math_7b_50step_v69_strict_n4_throughput_summary.txt`
+
+Strict protocol:
+
+- Qwen2.5-Math-7B local copy was used through the final `actor_rollout_ref.model.path=/tmp/ttrl_cache/.../model` override.
+- `trainer.total_training_steps=50`.
+- `actor_rollout_ref.rollout.val_kwargs.n=4`.
+- `trainer.validation_answer_selection_enable=False`.
+- `ttrl.sps_majority_reward_coef=0.0`.
+- `ttrl.sps_format_reward_coef=0.0`.
+- `ttrl.sps_reward_mode=pairwise_process_count_neutral_sharpened_prob`.
+- `ttrl.sps_direct_count_neutral_aggregation=True`.
+- `ttrl.sps_direct_pairwise_process_preference_strength=0.8`.
+- No validation-time best-of, majority selection, n=32 selection, or ground-truth selection was used for the success metric.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.49899396378269617`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.7108913480885312`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.520195171026157`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.971830985915493`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.096579476861167`.
+- Final training step timing included final validation:
+  - `timing_s/testing=233.678`
+  - `timing_s/step=264.014`
+- Non-validation throughput summary:
+  - `step_rows=50`
+  - `non_validation_steps_count=49`
+  - `non_validation_timing_s/step=30.897`
+  - `non_validation_whole_machine_tokens_per_s=9653.870`
+
+Key internal diagnosis:
+
+- At step 50:
+  - `train/sps/direct_target_confidence=0.153`.
+  - `train/sps/direct_target_entropy=2.430`.
+  - `train/sps/direct_target_effective_K=11.667`.
+  - `train/sps/direct_unique_answer_count=30.375`.
+  - `train/sps/direct_majority_target_mass=0.082`.
+  - `train/sps/direct_base_agreement=0.125`.
+  - `train/sps/direct_pairwise_process_top_preference=0.242`.
+  - `train/sps/direct_pairwise_process_preference_std=0.207`.
+  - `train/sps_pick_accuracy=0.000`.
+  - `train/sps_correct_weight_mass=0.040`.
+  - `train/pass@32=1.000`.
+- Interpretation:
+  - The pairwise process preference mechanism did move the target: `pairwise_process_top_preference` stayed positive.
+  - But the resulting target was too diffuse and badly aligned with correctness: effective K stayed high, top confidence stayed low, and correctness mass was very small.
+  - Format was not the bottleneck; `format_score/mean@4` remained high at `0.9718`.
+  - The failure is algorithmic: verifier-free pairwise process preference over count-neutral answer clusters selected internally clean-looking trajectories that were not correctness-aligned.
+
+Completion gate result:
+
+- The runner refreshed `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+- v69 row:
+  - `ARTIFACT_STATUS=COMPLETE_METRICS`
+  - `strict_mean4=0.498993963783`
+  - `best4=0.710891348089`
+  - `maj4_diag=0.520195171026`
+  - `target_conf=0.153`
+  - `target_effective_K=11.667`
+  - `pairwise_top_pref=0.242`
+  - `sps_pick_acc=0`
+  - `sps_correct_weight_mass=0.04`
+- Completion audit output:
+  - `CANDIDATE=v69_pairwise_count_neutral ARTIFACT_STATUS=COMPLETE_METRICS STRICT_MEAN@4=0.498993963783`
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.498993963783 target=0.75`
+  - `MISSING_REQUIREMENT=no complete v68/v69 pure-sharpening run reaches target`
+  - `RESULT=FAIL`
+- Do not call `update_goal`.
+- Do not make an improvement commit for v69.
+
+Next algorithmic implication:
+
+- v69 rules out “count-neutral answer aggregation + pure process-cleanliness pairwise preference” as currently formulated.
+- The next pure-sharpening attempt should not simply strengthen the pairwise coefficient or lower temperature; the internal evidence says the target is not correctness-aligned, not merely under-sharpened.
+- A better next direction is to add an independent correctness-support gate before sharpening, for example requiring agreement between process preference and a support signal such as base/ref-supported answer stability, low-budget first4 stability, or counterfactual/rephrase consistency, while keeping majority only as a diagnostic.
+
+## 2026-07-08: best-strict-50 + SPS=32 inference-time selection
+
+User direction changed for this run: use the best strict 50-step process-consistency recipe, then combine it with v33-style SPS=32 inference-time answer-cluster selection. This experiment intentionally allows inference-time scaling; it is not part of the earlier strict `n=4` no-selection success criterion.
+
+Reference strict recipe:
+
+- Base recipe: v48 process-consistency 50-step strict run.
+- Runner: `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v48_process_consistency_strict_n4.sh`.
+- Reference strict metrics:
+  - `mean@4=0.7454728370221329`.
+  - `best@4=0.8601911468812877`.
+  - `maj@4=0.7625472837022133`.
+
+### v70: combined train + SPS32 validation failed after generation
+
+Runner:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v70_process_consistency_sps32_selection.sh`.
+
+Protocol:
+
+- Same v48 training stack.
+- Final validation used `actor_rollout_ref.rollout.val_kwargs.n=32`.
+- `trainer.validation_answer_selection_enable=True`.
+- `trainer.validation_answer_selection_strategy=majority`.
+- `trainer.validation_answer_selection_repeats=4`.
+
+Outcome:
+
+- Training reached the end and validation generation completed `15904 = 497 * 32` rollouts.
+- No final validation metrics were produced.
+- Failure was `ray.exceptions.ActorUnavailableError ... keepalive watchdog timeout`.
+- No checkpoint was available because the inherited recipe had `trainer.save_freq=-1`.
+
+Interpretation:
+
+- This should not be treated as a model-quality result.
+- The long CPU-only phase after SPS32 generation is expected to be expensive because `process_validation_metrics` runs 1000-bootstrap aggregation over raw `n=32` metrics. However v70 ended with a real Ray actor unavailability error before metrics were finalized.
+
+### v71/v72: first checkpoint-eval attempt exposed corrupt rootfs checkpoint
+
+Runner changes:
+
+- `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v71_process_consistency_train_save_ckpt.sh` now supports `EXP`, `RAY_DIR`, `LOCAL_MODEL`, and `CKPT_DIR` env overrides.
+- `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v72_process_consistency_ckpt_sps32_eval.sh` now supports `EXP`, `RAY_DIR`, `LOCAL_MODEL`, `CKPT_DIR`, and `CKPT_PATH` env overrides.
+
+v71:
+
+- Reran the same process-consistency training with `trainer.test_freq=-1`, `trainer.val_before_train=False`, and `trainer.save_freq=50`.
+- Checkpoint target was initially under `/opt/tiger/TTRL/verl/checkpoints/...`.
+- Rootfs filled during checkpoint save.
+- The resulting actor shard files existed but were corrupt.
+- All 8 `model_world_size_8_rank_*.pt` files failed `torch.load` with:
+  - `PytorchStreamReader failed reading zip archive: failed finding central directory`.
+- The corrupt checkpoint copy was moved to `/tmp/ttrl_ckpts/...` to free rootfs.
+
+v72:
+
+- Eval-only run from the v71 checkpoint failed during checkpoint load with the same corrupt-zip error.
+- No useful validation metrics were produced.
+
+Operational lesson:
+
+- Large TTRL checkpoints must not be saved under the root filesystem in this worker shape. Use `/tmp/ttrl_ckpts/...` for train-save experiments.
+
+### v73: train-save to /tmp produced a valid checkpoint
+
+Command shape:
+
+```bash
+EXP=sps_efficient_ttrl_qwen25_math_7b_50step_v73_process_consistency_train_save_ckpt_tmp \
+RAY_DIR=/tmp/r73trainsave \
+LOCAL_MODEL=/tmp/qwen2_5_math_7b_local_v73_process_consistency_train_save_50step \
+CKPT_DIR=/tmp/ttrl_ckpts/math-qwen25_math_7b-efficient-ttrl-v73-process-consistency-train-save \
+bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v71_process_consistency_train_save_ckpt.sh
+```
+
+Protocol:
+
+- Same algorithm config as v48 process-consistency:
+  - `trainer.total_training_steps=50`.
+  - `trainer.test_freq=-1`.
+  - `trainer.val_before_train=False`.
+  - `trainer.save_freq=50`.
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - `ttrl.sps_answer_sharpen_beta=2.0`.
+  - `ttrl.sps_process_consistency_capacity=True`.
+  - `ttrl.sps_reuse_rollout_log_probs_as_old=True`.
+  - `ttrl.sps_reuse_base_log_probs_as_ref=True`.
+
+Outcome:
+
+- Status `0`.
+- Valid checkpoint:
+  - `/tmp/ttrl_ckpts/math-qwen25_math_7b-efficient-ttrl-v73-process-consistency-train-save/global_step_50/actor`.
+- All 8 actor model shards passed `torch.load(..., map_location='cpu', weights_only=False)` as `OrderedDict`.
+- Each shard size was about `3.81 GB`.
+- Throughput over steps `41-50`:
+  - `timing_s/step=29.091`.
+  - `perf/total_num_tokens=233813.200`.
+  - `whole_machine_tokens_per_s=8037.331`.
+- Final `/proc` health was good.
+
+### v74: eval-only from v73 checkpoint with SPS=32 selection succeeded
+
+Command shape:
+
+```bash
+EXP=sps_efficient_ttrl_qwen25_math_7b_50step_v74_process_consistency_v73ckpt_sps32_eval \
+RAY_DIR=/tmp/r74sps32eval \
+LOCAL_MODEL=/tmp/qwen2_5_math_7b_local_v74_process_consistency_sps32_eval \
+CKPT_DIR=/tmp/ttrl_ckpts/math-qwen25_math_7b-efficient-ttrl-v73-process-consistency-train-save \
+CKPT_PATH=/tmp/ttrl_ckpts/math-qwen25_math_7b-efficient-ttrl-v73-process-consistency-train-save/global_step_50 \
+bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v72_process_consistency_ckpt_sps32_eval.sh
+```
+
+Eval protocol:
+
+- `trainer.val_only=True`.
+- `trainer.val_before_train=True`.
+- `trainer.resume_mode=resume_path`.
+- `trainer.resume_from_path=$CKPT_PATH`.
+- `actor_rollout_ref.rollout.val_kwargs.n=32`.
+- `trainer.validation_answer_selection_enable=True`.
+- `trainer.validation_answer_selection_repeats=4`.
+- `trainer.validation_answer_selection_strategy=majority`.
+- `trainer.save_freq=-1`.
+
+Artifacts:
+
+- Log: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v74_process_consistency_v73ckpt_sps32_eval.log`.
+- Metrics: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v74_process_consistency_v73ckpt_sps32_eval_metrics.txt`.
+- Proc health: `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_50step_v74_process_consistency_v73ckpt_sps32_eval_proc_health.txt`.
+
+Final selected/collapsed metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.8490945674044266`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.8490945674044266`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.8490945674044266`.
+- `val-aux/MATH-TTT/format_score/mean@4=1.0`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.0`.
+- `val-aux/MATH-TTT/response_len/mean@4=617.7203219315895`.
+
+Raw SPS32 diagnostics before collapse:
+
+- `val-raw/MATH-TTT/acc/mean@32=0.7316398390342053`.
+- `val-raw/MATH-TTT/acc/best@32/mean=0.9318893360160966`.
+- `val-raw/MATH-TTT/acc/maj@32/mean=0.825030181086519`.
+- `val-raw/MATH-TTT/format_score/mean@32=0.9679325955734407`.
+- `val-raw/MATH-TTT/response_clip/mean@32=0.013958752515090543`.
+
+Final health:
+
+- Status `0`.
+- `/proc/self` and `/proc/meminfo` remained healthy.
+- `PROC_COUNT_FINAL=97`.
+- All 8 B200 GPUs returned to `0 MiB`.
+
+Conclusion:
+
+- The v48/v73 process-consistency checkpoint plus SPS=32 answer-cluster selection reaches `84.91%` selected `mean@4`.
+- This is a large gain over the v48 strict no-selection result (`74.55%`) and close to the `85%` target, but it is still below target by about `0.09pp`.
+- Because it depends on inference-time scaling (`n=32` selection), do not mix it with the strict `n=4` no-selection goal.
+- Because it does not clear `85%`, do not record it as a target-reaching algorithm improvement commit.
+
+## 2026-07-08 v48 Qwen2.5-Math-7B 30-step checkpoint for pure vLLM SPS matrix
+
+User request:
+
+- Use Qwen2.5-Math-7B.
+- Train for 30 steps with the previous best non-major-vote route, identified as v48 `process_consistency_strict_n4`.
+- Save checkpoint under `/tmp`.
+- Run the current pure vLLM SPS temperature/K matrix on that checkpoint.
+
+Training script:
+
+```bash
+/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_30step_v48_process_consistency_strict_n4_save_tmp.sh
+```
+
+Important script details:
+
+- First attempt used `RAY_DIR=/tmp/r48process30save` and failed at 0/30 with `OSError: AF_UNIX path too long`.
+- The script was fixed to use short paths:
+  - `RAY_DIR=/tmp/r48p30`.
+  - `TMP_RUNTIME_DIR=/tmp/r48p30t`.
+- Algorithm settings preserved the v48 route:
+  - `ttrl.sps_rollout_selection=first`.
+  - `ttrl.sps_selection_require_majority=True`.
+  - `ttrl.sps_process_consistency_capacity=True`.
+  - `ttrl.sps_low_budget_k=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - `ttrl.sps_reuse_rollout_log_probs_as_old=True`.
+  - `ttrl.sps_reuse_base_log_probs_as_ref=True`.
+- Training config:
+  - `trainer.total_training_steps=30`.
+  - `trainer.test_freq=-1`.
+  - `trainer.val_before_train=False`.
+  - `trainer.save_freq=30`.
+  - `trainer.default_local_dir=/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step`.
+
+Training result:
+
+- First completed worker: `988456`, 8x B200, status `0`.
+- Final evaluated worker: `989057`, 8x B200, status `0`; this worker reran the same 30-step training because the first worker's `/proc` broke before SPS evaluation and its worker-local `/tmp` checkpoint could not be reliably transferred.
+- Raw FSDP checkpoint:
+  - `/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/actor`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_30step_v48_process_consistency_strict_n4_save_tmp_metrics.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_30step_v48_process_consistency_strict_n4_save_tmp_throughput_summary.txt`.
+- Final 10 training steps (`21-30`):
+  - first `988456` run: `timing_s/step=28.740`, `perf/total_num_tokens=236975.700`, `whole_machine_tokens_per_s=8245.386`.
+  - final `989057` run used for SPS: `timing_s/step=28.300`, `perf/total_num_tokens=238340.900`, `whole_machine_tokens_per_s=8421.940`.
+- Step 30 metrics:
+  - `train/label_accuracy=0.875`.
+  - first `988456` run `train/ground_truth_reward=0.668`; final `989057` run `train/ground_truth_reward=0.629`.
+  - `train/pass@32=1.000`.
+  - first `988456` run `train/majority_ratio=0.678`; final `989057` run `train/majority_ratio=0.650`.
+  - final `989057` run `timing_s/step=47.634`, including `timing_s/save_checkpoint=20.183`.
+
+HF merge:
+
+```bash
+cd /opt/tiger/TTRL/verl
+/opt/tiger/modelchef/.venv/bin/python scripts/legacy_model_merger.py merge \
+  --backend fsdp \
+  --local_dir /tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/actor \
+  --target_dir /tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/hf \
+  --hf_model_path /opt/tiger/qwen2.5_math_7b
+```
+
+Notes:
+
+- The first merge without `--hf_model_path` failed because checkpoint `config.architectures` was `None`.
+- The second merge succeeded with the base Qwen2.5-Math config.
+- Merged HF checkpoint:
+  - `/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/hf`.
+- Verified files:
+  - four `model-0000x-of-00004.safetensors` shards.
+  - `model.safetensors.index.json`.
+  - `config.json` with `architectures=["Qwen2ForCausalLM"]`.
+  - `tokenizer.json`.
+
+Infra note:
+
+- The first completed worker `988456` broke procfs after Ray/training teardown:
+  - `PROC_SELF_BAD_FINAL`.
+  - `PROC_MEMINFO_BAD_FINAL`.
+  - `PROC_COUNT_FINAL 0`.
+  - Later CUDA import reported `Error 304: OS call failed or operation not supported on this OS`.
+- Attempts to recover or move the worker-local `/tmp` HF checkpoint were not reliable:
+  - `sudo mount -t proc proc /proc` failed with permission denied.
+  - `mlx worker` has no copy/scp subcommand.
+  - direct HTTP/SSH transfer paths were blocked or unauthenticated.
+  - master `/tmp`, worker `/tmp`, and `/opt/tiger/toutiao/log` are not shared in a useful way.
+- Resolution: rerun the same 30-step training on healthy worker `989057`, merge the worker-local FSDP checkpoint to HF in the same worker, and run the pure vLLM SPS matrix before teardown.
+
+Pure vLLM SPS matrix on final `989057` 30-step checkpoint:
+
+- Workdir: `/opt/tiger/reasoning-with-sampling/llm_experiments`.
+- Launcher: `run_math_vllm_dp.sh`.
+- Model path:
+  - `/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/hf`.
+- Runtime: 8x B200, `NUM_PROBLEMS=500`, `N_SEEDS=1`, `SKIP_MCMC=1`, `SPS_SELECT=sample`, `MAX_NEW=3072`.
+- Temperatures: `0.10, 0.25, 0.50, 0.80`.
+- Candidate counts: `K=4,8,16,32`.
+- Result TSV:
+  - `/opt/tiger/reasoning-with-sampling/llm_experiments/results_sps_qwen25_v48_30step_temp_k_matrix_8gpu_20260708_190810.tsv`.
+
+SPS accuracy matrix:
+
+| tau / K | 4 | 8 | 16 | 32 |
+|---:|---:|---:|---:|---:|
+| 0.10 | 72.2% | 74.8% | 74.6% | 73.6% |
+| 0.25 | 72.8% | 74.4% | 75.8% | 74.8% |
+| 0.50 | 72.6% | 76.6% | 75.4% | 74.8% |
+| 0.80 | 70.8% | 70.0% | 67.8% | 70.6% |
+
+Full metrics:
+
+| tau | K | Base acc | Temp acc | SPS acc | rows |
+|---:|---:|---:|---:|---:|---:|
+| 0.10 | 4 | 49.8% | 71.4% | 72.2% | 500 |
+| 0.10 | 8 | 49.2% | 72.4% | 74.8% | 500 |
+| 0.10 | 16 | 48.6% | 69.4% | 74.6% | 500 |
+| 0.10 | 32 | 48.2% | 70.4% | 73.6% | 500 |
+| 0.25 | 4 | 49.2% | 69.0% | 72.8% | 500 |
+| 0.25 | 8 | 48.2% | 67.4% | 74.4% | 500 |
+| 0.25 | 16 | 49.4% | 69.2% | 75.8% | 500 |
+| 0.25 | 32 | 49.4% | 68.0% | 74.8% | 500 |
+| 0.50 | 4 | 47.2% | 64.0% | 72.6% | 500 |
+| 0.50 | 8 | 51.4% | 63.6% | 76.6% | 500 |
+| 0.50 | 16 | 49.4% | 65.6% | 75.4% | 500 |
+| 0.50 | 32 | 51.0% | 66.4% | 74.8% | 500 |
+| 0.80 | 4 | 50.0% | 60.0% | 70.8% | 500 |
+| 0.80 | 8 | 50.4% | 58.8% | 70.0% | 500 |
+| 0.80 | 16 | 49.2% | 61.4% | 67.8% | 500 |
+| 0.80 | 32 | 47.6% | 57.4% | 70.6% | 500 |
+
+Conclusion:
+
+- Best cell: `tau=0.50,K=8`, `SPS acc=76.6%`.
+- Previous Qwen2.5-Math base SPS best from the same 4x4 matrix was `76.0%`, so the 30-step v48 checkpoint is only `+0.6pp` better.
+- The trained checkpoint also moves the best cost-quality point to lower K (`K=8` instead of base `K=16/32`), which is a small train-inference co-design signal, but not a large algorithmic improvement.
