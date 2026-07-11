@@ -93,6 +93,191 @@ ttrl:
   sps_process_consistency_capacity: false
   sps_process_tail_fraction: 0.5
   sps_process_disagreement_penalty: 0.35
+  sps_process_sample_weight: false
+  sps_process_sample_positive: 1.25
+  sps_process_sample_inconsistent: 0.75
+  sps_process_sample_negative: 0.35
+  sps_process_sample_invalid: 0.25
+  sps_low_budget_negative_reward: false
+  sps_low_budget_negative_value: 0.35
+  sps_low_budget_negative_min_support: 0.65
+  sps_low_budget_negative_process_min: 0.70
+  sps_low_budget_negative_base_min: 0.65
+  sps_low_budget_soft_reward: false
+  sps_low_budget_soft_value: 0.25
+  sps_low_budget_rescue_reward: false
+  sps_low_budget_rescue_value: 0.15
+  sps_low_budget_rescue_min_base: 0.08
+  sps_low_budget_rescue_min_process: 0.50
+  sps_low_budget_rescue_min_cluster_mass: 0.03125
+  sps_low_budget_rescue_min_support: 0.15
+  sps_low_budget_local_reward: false
+  sps_low_budget_local_value: 0.12
+  sps_low_budget_local_min_mass: 0.50
+  sps_low_budget_local_min_base: 0.08
+  sps_low_budget_local_min_process: 0.50
+  sps_low_budget_local_min_support: 0.15
+  sps_independent_support_reward: false
+  sps_independent_support_value: 0.18
+  sps_independent_support_min_base: 0.12
+  sps_independent_support_min_process: 0.65
+  sps_independent_support_min_cluster_mass: 0.0625
+  sps_independent_support_min_support: 0.20
+  sps_independent_support_entropy_gate: 1.15
+  sps_independent_support_allow_majority: true
+  sps_independent_support_majority_margin_max: 1.0
+  sps_independent_support_competition_min: 0.0
+  sps_process_answer_reward: false
+  sps_process_answer_value: 0.16
+  sps_process_answer_min_base: 0.10
+  sps_process_answer_min_process: 0.60
+  sps_process_answer_min_support: 0.20
+  sps_process_answer_majority_scale: 0.50
+  sps_contrastive_alt_reward: false
+  sps_contrastive_alt_value: 0.14
+  sps_contrastive_alt_majority_penalty: 0.06
+  sps_contrastive_alt_min_base: 0.08
+  sps_contrastive_alt_min_process: 0.60
+  sps_contrastive_alt_min_support: 0.18
+  sps_contrastive_alt_sharp_min: 0.92
+  sps_contrastive_alt_effective_k_max: 1.35
+  sps_contrastive_alt_low_budget_mass_min: 0.70
+  sps_contrastive_alt_majority_support_min: 0.70
+  sps_entropy_band_capacity: false
+  sps_entropy_band_min_weight: 0.45
+  sps_entropy_band_low_k: 1.25
+  sps_entropy_band_high_k: 4.0
+  sps_entropy_band_sharp_min: 0.92
+  sps_entropy_band_low_budget_mass_min: 0.70
+  sps_entropy_band_support_min: 0.70
+  sps_low_budget_rebalance_reward: false
+  sps_low_budget_rebalance_alt_value: 0.10
+  sps_low_budget_rebalance_majority_penalty: 0.04
+  sps_low_budget_rebalance_sharp_min: 0.92
+  sps_low_budget_rebalance_effective_k_max: 1.35
+  sps_low_budget_rebalance_mass_min: 0.70
+  sps_low_budget_rebalance_support_min: 0.70
+  sps_low_budget_rebalance_min_base: 0.06
+  sps_low_budget_rebalance_min_process: 0.55
+  sps_low_budget_rebalance_min_support: 0.12
+  sps_process_quality_reward: false
+  sps_process_quality_positive: 0.08
+  sps_process_quality_negative: 0.10
+  sps_process_quality_sharp_min: 0.92
+  sps_process_quality_effective_k_max: 1.35
+  sps_process_quality_mass_min: 0.70
+  sps_process_quality_majority_scale: 0.25
+  sps_process_quality_nonmajority_scale: 1.0
+  sps_process_quality_bad_majority_scale: 1.0
+  sps_process_quality_bad_nonmajority_scale: 0.5
+  sps_anti_collapse_capacity: false
+  sps_anti_collapse_min_weight: 0.45
+  sps_anti_collapse_sharp_min: 0.95
+  sps_anti_collapse_effective_k_max: 1.25
+  sps_anti_collapse_low_budget_mass_min: 0.75
+  sps_anti_collapse_margin_gap_min: 0.15
+  sps_support_conflict_capacity: false
+  sps_support_conflict_min_weight: 0.15
+  sps_support_conflict_sharp_min: 0.90
+  sps_support_conflict_effective_k_max: 2.0
+  sps_support_conflict_base_min: 0.55
+  sps_support_conflict_low_budget_min: 0.50
+  sps_support_conflict_process_min: 0.70
+  # Direct sharpened-probability TTRL. Set sps_reward_mode to
+  # "direct_sharpened_prob" to bypass majority pseudo-label training and
+  # fit a PowerFlow-style target distribution over answer clusters:
+  # softmax_a logsumexp_{y extracts a}(beta * logp_ref(y|x) - logp_rollout(y|x)).
+  sps_direct_beta: 4.0
+  sps_direct_target_temperature: 1.0
+  sps_direct_reward_scale: 1.0
+  # "answer_mass" / "mass_div_count" spreads each answer cluster's target mass
+  # across its sampled trajectories. "answer_prob" gives every trajectory in a
+  # cluster the same answer probability. "trajectory_prob" normalizes directly
+  # over parseable trajectories.
+  sps_direct_per_sample_mode: answer_mass
+  sps_direct_reward_floor: 0.0
+  # For "process_tilted_sharpened_prob", tilt the direct target with
+  # verifier-free trajectory quality and answer-cluster process stability
+  # before answer-level softmax. These are default-off for v63 compatibility.
+  sps_direct_process_tilt_strength: 0.0
+  sps_direct_process_cluster_tilt_strength: 0.0
+  # For "contrastive_process_sharpened_prob", subtract answer support already
+  # explained by the frozen base/ref distribution before answer-level softmax.
+  # Default 0.0 keeps v63/v64 behavior unchanged.
+  sps_direct_base_contrast_strength: 0.0
+  # For "gated_contrastive_process_sharpened_prob", gate the base contrast by
+  # comparing frozen base/ref cluster support against process-stability support.
+  # This avoids globally suppressing correct base-supported clusters.
+  sps_direct_base_contrast_gate_strength: 0.0
+  sps_direct_base_contrast_process_margin: 0.0
+  # For "band_limited_process_sharpened_prob", constrain the soft target's
+  # answer-level effective K before emitting rewards. This prevents v64-style
+  # single-basin lock-in and v65/v66-style high-entropy wrong-basin diffusion
+  # without using majority pseudo labels.
+  sps_direct_target_effective_k_min: 0.0
+  sps_direct_target_effective_k_max: 0.0
+  sps_direct_target_effective_k_strength: 0.0
+  # For "count_neutral_process_sharpened_prob", remove raw cluster-count
+  # advantage from answer aggregation by using log-mean-exp over trajectories
+  # in each answer cluster. This prevents the target from becoming majority
+  # pseudo-label imitation while keeping a soft distribution.
+  sps_direct_count_neutral_aggregation: false
+  # For "pairwise_process_count_neutral_sharpened_prob", add a Bradley-Terry
+  # style pairwise process-preference tilt to the count-neutral answer target.
+  # This is default-off and uses only verifier-free trajectory stability
+  # features such as parseability, non-clipping, final-box stability, and
+  # absence of revision/conflict after the final answer.
+  sps_direct_pairwise_process_preference_strength: 0.0
+  sps_direct_pairwise_process_preference_temperature: 1.0
+  # For "support_gated_process_sharpened_prob", tilt the direct soft target by
+  # a continuous support distribution from frozen base/ref probability,
+  # first-low-budget answer stability, and process-clean support. This is a
+  # soft distribution gate, not a majority pseudo-label or hard reward.
+  sps_direct_support_gate_strength: 0.0
+  sps_direct_support_gate_temperature: 1.0
+  sps_direct_support_gate_floor: 0.05
+  sps_direct_support_gate_base_weight: 1.0
+  sps_direct_support_gate_low_budget_weight: 1.0
+  sps_direct_support_gate_process_weight: 1.0
+  # For "support_mixture_process_sharpened_prob", conservatively mix an
+  # over-sharp direct target back toward the same base/low-budget/process
+  # support distribution. This is default-off and is a soft target constraint,
+  # not a hard label or majority-selection rule.
+  sps_direct_support_mixture_strength: 0.0
+  sps_direct_support_mixture_confidence_threshold: 0.85
+  sps_direct_support_mixture_effective_k_threshold: 2.0
+  sps_direct_support_mixture_overlap_threshold: 0.85
+  # For "support_calibrated_process_sharpened_prob", preserve the direct
+  # target top answer but cap its confidence when it is much sharper than the
+  # independent base/low-budget/process support distribution.  Excess top mass
+  # is softly redistributed by support, so this is not answer selection.
+  sps_direct_support_confidence_cap_strength: 0.0
+  sps_direct_support_confidence_cap_margin: 0.20
+  sps_direct_support_confidence_cap_min: 0.55
+  # For "support_residual_process_sharpened_prob", add a default-off residual
+  # target-logit tilt log p_support(a) - log p_base(a). This keeps the target
+  # soft while pushing against base-only wrong basins when first-low-budget and
+  # process support provide independent evidence.
+  sps_direct_support_residual_strength: 0.0
+  # For "split_support_process_sharpened_prob", construct two verifier-free
+  # support views from first-low-budget samples and held-out process-clean
+  # samples, then tilt target logits by their geometric-mean distribution.
+  sps_direct_split_support_strength: 0.0
+  sps_direct_split_support_floor: 0.05
+  # For "capacity_braked_process_sharpened_prob", detect stable
+  # overconfidence by target confidence/effective-K plus target-support
+  # overlap, then softly mix toward a softened support distribution. This is
+  # default-off and only controls answer capacity; it does not select an answer.
+  sps_direct_capacity_brake_strength: 0.0
+  sps_direct_capacity_brake_min_effective_k: 0.0
+  sps_direct_capacity_brake_confidence_threshold: 1.0
+  sps_direct_capacity_brake_overlap_threshold: 1.0
+  # For "basin_contrast_process_sharpened_prob", cap the target top-vs-second
+  # answer margin by base/first-low-budget/process support margins. This keeps
+  # sharpening proportional to independent basin evidence and remains a soft
+  # distribution rule, not answer selection.
+  sps_direct_basin_contrast_strength: 0.0
+  sps_direct_basin_contrast_margin: 0.0
 
   # Source for the base/internal logprob used by SPS confidence weighting.
   # "ref" keeps the historical behavior and uses the reference-policy worker.

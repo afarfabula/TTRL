@@ -1,0 +1,13 @@
+task_log=/tmp/r67/ray/session_latest/logs/worker-5fbff8eadfc18c2c51a4534430e67cfe93e33b91ed107003a0d692ca-ffffffff-148970.out
+reparsed_from=/opt/tiger/TTRL/verl/sps_band_limited_process_sharpened_prob_qwen25_math_7b_50step_v67_strict_n4_ray_taskrunner.log
+step_rows=50
+train_steps_1_49_count=49
+train_steps_1_49_timing_s/step=27.047
+train_steps_1_49_whole_machine_tokens_per_s=9222.636
+steps_41_50_including_final_validation_count=10
+steps_41_50_including_final_validation_timing_s/step=49.299
+steps_41_50_including_final_validation_whole_machine_tokens_per_s=4618.216
+steps_41_49_train_only_count=9
+steps_41_49_train_only_timing_s/step=26.585
+steps_41_49_train_only_whole_machine_tokens_per_s=8801.405
+final_validation_testing_s=232.157

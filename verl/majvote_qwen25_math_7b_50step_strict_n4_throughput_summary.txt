@@ -1,0 +1,5 @@
+task_log=/tmp/rmvq25/ray/session_latest/logs/worker-2e1f256d99b9dd1abbb8072fbe69d568ee7f1b35bff3e358b4f7618c-ffffffff-76263.out
+steps=41-50
+timing_s/step=46.567
+perf/total_num_tokens=240917.400
+whole_machine_tokens_per_s=5173.587

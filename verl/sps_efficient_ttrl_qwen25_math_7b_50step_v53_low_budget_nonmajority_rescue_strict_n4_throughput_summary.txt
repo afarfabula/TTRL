@@ -1,0 +1,5 @@
+task_log=/tmp/r53/ray/session_latest/logs/worker-b18382911530ae9c2fd3fad3230ad951cdd5d4539dda7760a732bda3-ffffffff-37759.out
+steps=41-50
+timing_s/step=50.118
+perf/total_num_tokens=226902.100
+whole_machine_tokens_per_s=4527.348

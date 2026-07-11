@@ -1,0 +1,74 @@
+WORKER_V13B_START 2026-06-28 07:07:32
+HOST trial-301412257-trialrun-301412257-worker-0
+dr-xr-xr-x 2994 root root 0 Jun 28 07:07 /proc
+-r--r--r--    1 root root 0 Jun 28 07:07 /proc/meminfo
+lrwxrwxrwx    1 root root 0 Jun 28 07:07 /proc/self -> 145
+GPU 0: NVIDIA B200 (UUID: GPU-85c72874-975a-3986-0950-cae26d5e1aa4)
+GPU 1: NVIDIA B200 (UUID: GPU-2ddf45ca-45ed-a900-2604-13e24e1b16e1)
+GPU 2: NVIDIA B200 (UUID: GPU-4c05fc0c-de0d-cb3e-da3c-fd04e3c82cfa)
+GPU 3: NVIDIA B200 (UUID: GPU-f12939cb-15f4-50f7-81b5-f9f9cbd52623)
+GPU 4: NVIDIA B200 (UUID: GPU-627edc84-e894-6201-a97f-7f3c10a6e42e)
+GPU 5: NVIDIA B200 (UUID: GPU-eabe49c2-869b-d655-2559-24dd57cb29c9)
+GPU 6: NVIDIA B200 (UUID: GPU-30f2b85e-42e7-de57-2730-a525eb8dfca1)
+GPU 7: NVIDIA B200 (UUID: GPU-a48712f4-46fb-c0c1-2ef8-276665b121c0)
++ export PYTHONPATH=/opt/tiger/TTRL/verl:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk::/opt/tiger/mlx_notebook_pysdk/mlx-pysdk::/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/modelchef:/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/modelchef
++ PYTHONPATH=/opt/tiger/TTRL/verl:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk:/mlx/workspace:/tmp/mlx/workspace:/opt/tiger:/opt/tiger/lite_sdk::/opt/tiger/mlx_notebook_pysdk/mlx-pysdk::/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/modelchef:/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/mlx_notebook_pysdk/mlx-pysdk:/opt/tiger/modelchef
++ export VLLM_USE_V1=1
++ VLLM_USE_V1=1
++ unset VLLM_ATTENTION_BACKEND
++ export TOKENIZERS_PARALLELISM=false
++ TOKENIZERS_PARALLELISM=false
++ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
++ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
++ export RAY_TMPDIR=/tmp/ray_v13b_fsdp1
++ RAY_TMPDIR=/tmp/ray_v13b_fsdp1
++ export MY_HOST_IP=127.0.0.1
++ MY_HOST_IP=127.0.0.1
++ unset MY_HOST_IPV6
++ export MASTER_ADDR=127.0.0.1
++ MASTER_ADDR=127.0.0.1
++ export MASTER_PORT=29579
++ MASTER_PORT=29579
++ GLOO_SOCKET_IFNAME=eth0
++ NCCL_SOCKET_IFNAME=eth0
++ TP_SOCKET_IFNAME=eth0
++ export GLOO_SOCKET_IFNAME=eth0
++ GLOO_SOCKET_IFNAME=eth0
++ export NCCL_SOCKET_IFNAME=eth0
++ NCCL_SOCKET_IFNAME=eth0
++ '[' 0 = 1 ']'
++ export NCCL_SOCKET_FAMILY=AF_INET6
++ NCCL_SOCKET_FAMILY=AF_INET6
++ export TP_SOCKET_IFNAME=eth0
++ TP_SOCKET_IFNAME=eth0
++ export NCCL_IB_DISABLE=1
++ NCCL_IB_DISABLE=1
++ export NCCL_DEBUG=WARN
++ NCCL_DEBUG=WARN
++ export RAY_DEDUP_LOGS=1
++ RAY_DEDUP_LOGS=1
++ PY=/opt/tiger/modelchef/.venv/bin/python
++ TASK=MATH-TTT
++ DATA_DIR=/opt/tiger/TTRL/verl/data/MATH-TTT
++ MODEL=/mnt/hdfs/models/qwen3_4b
++ K=3
++ MAX_PROMPT=512
++ MAX_RESP=3072
++ N_VOTES=64
++ N_SAMPLES=32
++ TRAIN_BATCH=8
++ TOTAL_STEPS=50
++ ROLLOUT_TEMP=1.0
++ SPS_WEIGHT_TEMP_BASE=0.4
++ SPS_WEIGHT_FLOOR=0.35
++ SPS_CLIP_PENALTY=0.25
++ cd /opt/tiger/TTRL/verl
++ /opt/tiger/modelchef/.venv/bin/python -m verl.trainer.main_ppo --config-name=ppo_trainer_ttrl.yaml 'data.train_files=[/opt/tiger/TTRL/verl/data/MATH-TTT/train.parquet]' 'data.val_files=[/opt/tiger/TTRL/verl/data/MATH-TTT/test.parquet]' data.max_prompt_length=512 data.max_response_length=3072 data.train_batch_size=8 data.filter_overlong_prompts=True data.truncation=error '+data.suffix_prompt="\nPlease reason step by step, and put your final answer within \boxed{}."' actor_rollout_ref.model.path=/mnt/hdfs/models/qwen3_4b actor_rollout_ref.model.enable_gradient_checkpointing=True actor_rollout_ref.model.use_remove_padding=True actor_rollout_ref.actor.ppo_mini_batch_size=1 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 actor_rollout_ref.actor.use_kl_loss=True actor_rollout_ref.actor.optim.lr=5e-7 actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 actor_rollout_ref.actor.optim.warmup_style=constant actor_rollout_ref.actor.fsdp_config.param_offload=False actor_rollout_ref.actor.fsdp_config.optimizer_offload=False actor_rollout_ref.actor.ppo_max_token_len_per_gpu=3584 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 actor_rollout_ref.ref.fsdp_config.param_offload=True actor_rollout_ref.rollout.name=vllm actor_rollout_ref.rollout.temperature=1.0 actor_rollout_ref.rollout.calculate_log_probs=True actor_rollout_ref.rollout.enforce_eager=False actor_rollout_ref.rollout.free_cache_engine=True actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 actor_rollout_ref.rollout.tensor_model_parallel_size=1 actor_rollout_ref.rollout.gpu_memory_utilization=0.8 actor_rollout_ref.rollout.n=32 actor_rollout_ref.rollout.val_kwargs.do_sample=True actor_rollout_ref.rollout.val_kwargs.n=4 actor_rollout_ref.rollout.val_kwargs.top_p=0.95 actor_rollout_ref.rollout.val_kwargs.temperature=0.6 actor_rollout_ref.rollout.max_model_len=3584 actor_rollout_ref.rollout.max_num_batched_tokens=3584 '~actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache' algorithm.kl_ctrl.kl_coef=0.0 algorithm.adv_estimator=grpo custom_reward_function.path=./verl/utils/reward_score/ttrl_math/__init__.py custom_reward_function.name=reward_func ttrl.enable=True ttrl.sps_enable=True ttrl.sps_proposal_temperature=1.0 ttrl.sps_weight_temperature_base=0.4 ttrl.sps_reward_mode=answer_rule_conf_weight ttrl.sps_length_normalize=True ttrl.sps_weight_temperature=1.0 ttrl.sps_weight_floor=0.35 ttrl.sps_clip_penalty=0.25 ttrl.n_votes_per_prompt=64 ttrl.n_samples_per_prompt=32 'trainer.logger=[console]' trainer.project_name=TTRL-SPS trainer.experiment_name=math-qwen3_4b-sps-rule-conf-weight-50step-8gpu trainer.n_gpus_per_node=8 trainer.nnodes=1 trainer.save_freq=-1 trainer.test_freq=50 trainer.val_before_train=False trainer.total_epochs=1 trainer.total_training_steps=50 ttrl.sps_weight_floor=0.15 ttrl.sps_clip_penalty=0.5 actor_rollout_ref.actor.fsdp_config.fsdp_size=1 trainer.experiment_name=math-qwen3_4b-sps-rule-conf-weight-floor015-clip05-fsdp1-v13b-50step-8gpu
+/opt/tiger/TTRL/verl/verl/__init__.py:18: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+[2026-06-28 07:08:10,799 I 156 156] gcs_rpc_client.h:671: successful connect gcs: 127.0.0.1:56269
+[2026-06-28 07:08:11,948 I 156 156] gcs_rpc_client.h:671: successful connect gcs: 127.0.0.1:56269
+[2026-06-28 07:08:17,546 I 156 156] gcs_rpc_client.h:671: successful connect gcs: 127.0.0.1:56269
+[2026-06-28 07:08:18,753 I 156 156] gcs_rpc_client.h:671: successful connect gcs: 127.0.0.1:56269
+2026-06-28 07:08:18,766	INFO worker.py:1948 -- Started a local Ray instance. View the dashboard at [1m[32mhttp://127.0.0.1:8265 [39m[22m
+[2026-06-28 07:08:18,767 I 156 156] gcs_rpc_client.h:671: successful connect gcs: 127.0.0.1:56269

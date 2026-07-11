@@ -1,0 +1,30 @@
+EXP=sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4
+RAY_TASK_LOG=/opt/tiger/TTRL/verl/sps_gated_contrastive_process_sharpened_prob_qwen25_math_7b_50step_v66_strict_n4_ray_taskrunner.log
+STEP_ROWS=50
+train/sps/direct_target_confidence AVG=0.32026 LAST=0.197 MIN=0.153 MAX=0.597
+train/sps/direct_target_entropy AVG=2.01404 LAST=2.458 MIN=1.163 MAX=2.796
+train/sps/direct_target_effective_K AVG=8.64818 LAST=11.662 MIN=4.168 MAX=16.887
+train/sps/direct_majority_target_mass AVG=0.23094 LAST=0.096 MIN=0.078 MAX=0.586
+train/sps/direct_majority_agreement AVG=0.275 LAST=0 MIN=0 MAX=0.625
+train/sps/direct_base_top_confidence AVG=0.47912 LAST=0.342 MIN=0.284 MAX=0.641
+train/sps/direct_base_agreement AVG=0.2925 LAST=0.125 MIN=0 MAX=0.75
+train/sps/direct_process_consistent_rate AVG=0.68696 LAST=0.686 MIN=0.539 MAX=0.789
+train/sps/direct_process_top_support AVG=0.96306 LAST=0.959 MIN=0.895 MAX=1
+train/sps/direct_base_contrast_penalty_mean AVG=0.16088 LAST=0.171 MIN=0.118 MAX=0.195
+train/sps/direct_base_contrast_penalty_std AVG=0.53564 LAST=0.524 MIN=0.389 MAX=0.663
+train/sps/direct_base_contrast_gate_mean AVG=0.24428 LAST=0.238 MIN=0.19 MAX=0.305
+train/sps/direct_base_contrast_gate_std AVG=0.26956 LAST=0.289 MIN=0.186 MAX=0.316
+train/sps/direct_parseable_rate AVG=0.94334 LAST=0.963 MIN=0.875 MAX=0.984
+train/sps/direct_clip_rate AVG=0.07528 LAST=0.045 MIN=0.041 MAX=0.125
+train/pass@32 AVG=1 LAST=1 MIN=1 MAX=1
+train/sps_pick_accuracy AVG=0.0275 LAST=0 MIN=0 MAX=0.125
+train/sps_correct_weight_mass AVG=0.12196 LAST=0.073 MIN=0.046 MAX=0.29
+response_length/clip_ratio AVG=0.07276 LAST=0.039 MIN=0.039 MAX=0.133
+timing_s/step AVG=34.67322 LAST=257.075 MIN=22.728 MAX=257.075
+timing_s/testing AVG=229.194 LAST=229.194 MIN=229.194 MAX=229.194
+perf/throughput AVG=1158.16704 LAST=102.473 MIN=102.473 MAX=1549.25
+val-core/MATH-TTT/acc/mean@4=0.3148893360160966
+val-core/MATH-TTT/acc/best@4/mean=0.5113420523138833
+val-core/MATH-TTT/acc/maj@4/mean=0.3196338028169014
+val-aux/MATH-TTT/format_score/mean@4=0.9793762575452716
+val-aux/MATH-TTT/response_clip/mean@4=0.02967806841046278

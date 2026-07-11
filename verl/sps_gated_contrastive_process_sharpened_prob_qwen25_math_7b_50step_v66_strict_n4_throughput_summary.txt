@@ -1,0 +1,5 @@
+non_validation_steps_count=49 avg_step_s=30.134408 avg_total_tokens_per_step=275596.102041 tokens_per_s=9145.562128
+steps_41_50_count=10 avg_step_s=51.508100
+final_timing_s/testing=229.194000
+final_timing_s/step=257.075000
+final_perf/throughput=102.473000

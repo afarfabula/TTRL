@@ -306,6 +306,9 @@ actor_rollout_ref:
       # before the current forward computation.
       forward_prefetch: False
 
+      # Whether FSDP broadcasts module states during wrapper initialization.
+      sync_module_states: True
+
     # profiler configs
     profiler:
 
@@ -338,6 +341,9 @@ actor_rollout_ref:
       # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
       # before the current forward computation.
       forward_prefetch: False
+
+      # Whether FSDP broadcasts module states during wrapper initialization.
+      sync_module_states: True
 
       # the wrap policy for FSDP model
       wrap_policy:

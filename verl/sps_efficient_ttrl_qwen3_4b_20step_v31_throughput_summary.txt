@@ -1,0 +1,5 @@
+task_log=/tmp/r31_qwen3_4b_efficient_ttrl_20step/ray/session_latest/logs/worker-11d6e3feee8838b315a9939fc56e9778b122d07d76e52c45af4d3a46-01000000-151800.out
+steps=11-20
+timing_s/step=53.960
+perf/total_num_tokens=663211.700
+whole_machine_tokens_per_s=12290.757

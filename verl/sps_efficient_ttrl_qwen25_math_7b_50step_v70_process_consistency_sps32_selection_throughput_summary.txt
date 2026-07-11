@@ -1,0 +1,5 @@
+task_log=/tmp/r70sps32/ray/session_latest/logs/worker-8a4cb15fe03a322b52fde6756ca1a5edc22f58980fded09629c7e0ee-ffffffff-38692.out
+steps=40-49
+timing_s/step=26.902
+perf/total_num_tokens=234535.600
+whole_machine_tokens_per_s=8718.018

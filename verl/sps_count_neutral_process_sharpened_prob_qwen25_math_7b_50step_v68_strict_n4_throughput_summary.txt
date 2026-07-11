@@ -1,0 +1,7 @@
+task_log=/tmp/r68/ray/session_latest/logs/worker-6254e5c0dcc317f31605fa92eaede1ab51909a6c6b0110ba076bd70f-ffffffff-149265.out
+step_rows=50
+non_validation_steps_count=49
+non_validation_timing_s/step=30.295
+non_validation_whole_machine_tokens_per_s=9888.019
+steps_41_50_timing_s/step=56.528
+steps_41_50_whole_machine_tokens_per_s=5757.661

@@ -17,7 +17,12 @@ from typing import List
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
+
+# vllm v1 moved LoRAModel from `vllm.lora.models` to `vllm.lora.lora_model`.
+try:
+    from vllm.lora.models import LoRAModel
+except ImportError:  # vllm v1
+    from vllm.lora.lora_model import LoRAModel
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager

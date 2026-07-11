@@ -47,8 +47,21 @@ from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.worker.worker_base import WorkerWrapperBase
+
+# vllm>=0.9 removed `vllm.model_executor.sampling_metadata`; it is only used as a
+# type annotation below, so degrade gracefully when unavailable.
+try:
+    from vllm.model_executor.sampling_metadata import SamplingMetadata
+except ImportError:  # vllm v1
+    SamplingMetadata = Any
+
+# vllm v1 moved WorkerWrapperBase from `vllm.worker.worker_base` to
+# `vllm.v1.worker.worker_base`.
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ImportError:  # vllm v1
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
 
 from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger

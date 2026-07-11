@@ -1,0 +1,5 @@
+task_log=/tmp/r52anti/ray/session_latest/logs/worker-42a39e69dc8757d1710e3a3fc5fbeb521f106faa663732423beac9f6-ffffffff-224224.out
+steps=41-50
+timing_s/step=49.962
+perf/total_num_tokens=230291.400
+whole_machine_tokens_per_s=4609.359

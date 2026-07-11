@@ -11470,3 +11470,2352 @@ Conclusion:
 - Best cell: `tau=0.50,K=8`, `SPS acc=76.6%`.
 - Previous Qwen2.5-Math base SPS best from the same 4x4 matrix was `76.0%`, so the 30-step v48 checkpoint is only `+0.6pp` better.
 - The trained checkpoint also moves the best cost-quality point to lower K (`K=8` instead of base `K=16/32`), which is a small train-inference co-design signal, but not a large algorithmic improvement.
+
+TTRL validation answer-cluster selection on the same 30-step checkpoint:
+
+- User requested the same TTRL validation answer-cluster selection protocol, because previous v33/v74 ITS results should not be conflated with the pure vLLM SPS logprob matrix above.
+- Worker: existing 8x B200 worker `989057`.
+- Command shape:
+
+```bash
+EXP=sps_efficient_ttrl_qwen25_math_7b_30step_v48_ckpt_sps32_answer_selection_eval \
+RAY_DIR=/tmp/r30v48sps32eval \
+LOCAL_MODEL=/tmp/qwen2_5_math_7b_local_v30_v48_sps32_eval \
+CKPT_DIR=/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step \
+CKPT_PATH=/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30 \
+bash /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_efficient_ttrl_qwen25_math_7b_50step_v72_process_consistency_ckpt_sps32_eval.sh
+```
+
+- Eval protocol:
+  - `trainer.val_only=True`.
+  - `trainer.resume_from_path=/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30`.
+  - `actor_rollout_ref.rollout.val_kwargs.n=32`.
+  - `trainer.validation_answer_selection_enable=True`.
+  - `trainer.validation_answer_selection_strategy=majority`.
+  - `trainer.validation_answer_selection_repeats=4`.
+- Artifacts:
+  - `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_30step_v48_ckpt_sps32_answer_selection_eval.log`.
+  - `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_30step_v48_ckpt_sps32_answer_selection_eval_metrics.txt`.
+  - `/opt/tiger/TTRL/verl/sps_efficient_ttrl_qwen25_math_7b_30step_v48_ckpt_sps32_answer_selection_eval_proc_health.txt`.
+
+Final selected/collapsed metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.8269617706237424`, i.e. `82.70%`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.8269617706237424`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.8269617706237424`.
+- `val-aux/MATH-TTT/format_score/mean@4=1.0`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.0`.
+- `val-aux/MATH-TTT/response_len/mean@4=624.1971830985915`.
+
+Raw SPS32 diagnostics before collapse:
+
+- `val-raw/MATH-TTT/acc/mean@32=0.7203219315895373`.
+- `val-raw/MATH-TTT/acc/best@32/mean=0.9308853118712274`.
+- `val-raw/MATH-TTT/acc/maj@32/mean=0.8207806841046278`.
+- `val-raw/MATH-TTT/format_score/mean@32=0.9691272635814889`.
+- `val-raw/MATH-TTT/response_clip/mean@32=0.019806338028169015`.
+
+Final health:
+
+- Status `0`.
+- `/proc/self` and `/proc/meminfo` remained healthy.
+- `PROC_COUNT_AFTER 85`.
+- All 8 B200 GPUs returned to `0 MiB`.
+
+Interpretation:
+
+- The 30-step checkpoint plus TTRL answer-cluster ITS reaches `82.70%`, which is close to the earlier Qwen2.5-Math v33 20-step ITS result (`83.10%`) but below the 50-step v73/v74 process-consistency checkpoint plus SPS32 ITS result (`84.91%`).
+- This confirms the pure vLLM SPS matrix result (`76.6%`) was not measuring the strongest historical ITS protocol.
+- However, the 30-step checkpoint does not improve over v33 or v74 under TTRL answer-cluster selection; more training or the exact v73 50-step checkpoint remains better for this ITS route.
+
+## 2026-07-08 v68 complete GPU result: count-neutral pure sharpening is a strong negative
+
+Goal context:
+
+- This is the active pure distribution-sharpening goal, not the inference-time scaling branch.
+- Completion target: Qwen2.5-Math-7B, 50 training steps, strict validation `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, no validation-time best-of / majority selection / `n=32` selection / ground-truth selection, and `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- v69 had already completed as a negative result; v68 was the remaining missing clean ablation row.
+
+Run:
+
+- Worker: `989057`, 8x B200.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.sh`.
+- Reward mode:
+  - `ttrl.sps_reward_mode=count_neutral_process_sharpened_prob`.
+  - `ttrl.sps_direct_count_neutral_aggregation=True`.
+  - `ttrl.sps_majority_reward_coef=0.0`.
+  - `ttrl.sps_format_reward_coef=0.0`.
+  - No pairwise process preference: `direct_pairwise_process_preference_strength=0.0`.
+- Strict validation:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+- Cache/model local copy:
+  - `/tmp/ttrl_cache/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4`.
+
+Artifacts:
+
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4.log`.
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4_ray_taskrunner.log`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4_metrics.txt`.
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4_proc_health.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_count_neutral_process_sharpened_prob_qwen25_math_7b_50step_v68_strict_n4_throughput_summary.txt`.
+- Refreshed ablation table:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+
+Infra and health:
+
+- Initial rootfs free space was only `3.4G`, recorded but not used as a gate per current instruction.
+- CUDA compat preflight on driver `580.105.08` used `clear_compat`; `cuInit: 0`.
+- GEMM smoke passed.
+- Loaded CUDA libraries came from the modelchef venv cu12.9 stack:
+  - cuBLAS, cuDNN, NCCL, CUDA runtime, NVJitLink.
+- Run status `0`.
+- Final procfs health:
+  - `PROC_SELF_OK_FINAL`.
+  - `PROC_MEMINFO_OK_FINAL`.
+  - `PROC_COUNT_FINAL 101`.
+- Final GPU state:
+  - all 8 B200 GPUs returned to `0 MiB`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation steps: `49`.
+- Non-validation average step time: `30.295s`.
+- Non-validation whole-machine throughput: `9888.019 token/s`.
+- Steps 41-50 average step time: `56.528s`.
+- Steps 41-50 whole-machine throughput: `5757.661 token/s`.
+- Final validation was included in step 50:
+  - `timing_s/testing=235.455s`.
+  - `timing_s/step=276.334s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.31086519114688127`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.5281066398390342`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.32613883299798796`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.971327967806841`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.10613682092555332`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.103`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.151`.
+- `direct_target_entropy=2.639`.
+- `direct_target_effective_K=12.798`.
+- `direct_unique_answer_count=36.125`.
+- `direct_majority_target_mass=0.038`.
+- `direct_base_agreement=0.125`.
+- `direct_low_budget_parseable_rate=0.938`.
+- `direct_low_budget_clip_rate=0.094`.
+- `direct_low_budget_top_mass=0.000`.
+- `direct_process_consistent_rate=0.512`.
+- `direct_process_top_support=1.000`.
+- `train/sps_pick_accuracy=0.000`.
+- `train/sps_correct_weight_mass=0.050`.
+- `train/pass@32=1.000`.
+
+Completion audit:
+
+- The runner refreshed `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+- Current pure candidates:
+  - `v68_count_neutral`: `COMPLETE_METRICS`, `strict_mean4=0.310865191147`.
+  - `v69_pairwise_count_neutral`: `COMPLETE_METRICS`, `strict_mean4=0.498993963783`.
+- Completion gate output:
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=V68_V69_NO_MAJORITY_TARGET_AUDIT_OK`.
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+  - `BEST_PURE_CANDIDATE=v69_pairwise_count_neutral`.
+  - `BEST_PURE_MEAN@4=0.498993963783`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.498993963783 target=0.75`.
+  - `RESULT=FAIL`.
+
+Interpretation:
+
+- v68 is a stronger negative result than v69.
+- Count-neutral aggregation successfully removes answer-count / majority-count bias, but it removes too much correctness-correlated support as well.
+- The final target is very diffuse: `effective_K=12.798`, `entropy=2.639`, `target_confidence=0.151`, and `unique_answer_count=36.125`.
+- The target has almost no overlap with correctness proxies: `sps_pick_accuracy=0`, `sps_correct_weight_mass=0.050`, `base_agreement=0.125`, `low_budget_top_mass=0`.
+- Format is not the bottleneck: `format_score/mean@4=97.13%`.
+- This confirms the core failure mode of pure direct sharpening so far: removing majority-count bias and sharpening only process-clean / probability-derived targets does not automatically align to the correctness basin.
+
+Conclusion:
+
+- The active pure distribution-sharpening goal remains incomplete.
+- Do not call `update_goal`.
+- Do not make an improvement commit for v68; it is a negative ablation.
+- v68/v69 together rule out the current count-neutral direct-target family:
+  - v68 without pairwise preference collapses to `31.09%`.
+  - v69 with pairwise process preference improves to `49.90%`, but still far below target and below all useful baselines.
+- Next algorithm direction should not be more temperature/beta tuning of this target. It needs an independent correctness-support gate before sharpening, for example:
+  - base/ref-supported answer stability;
+  - first4 low-budget answer stability;
+  - rephrase/counterfactual consistency;
+  - process preference only when it agrees with a non-count support signal.
+- Majority can remain only as a diagnostic under this goal, not as the target constructor or hard reward.
+
+## 2026-07-08 v48 30-step checkpoint + chunked pure-vLLM SPS prefix selection
+
+User request:
+
+- Start from the existing 30-step RL checkpoint rather than the base model.
+- Test a multi-stage inference-time scaling variant in the stable pure-vLLM path:
+  first sample 8 short 64-token continuations, score/select the best prefix, then continue with another 8-way chunk rollout.
+- Motivation: prove whether an RL-improved checkpoint can still benefit from inference-time scaling, and whether progressive prefix selection is better than one-shot full-answer SPS.
+
+Checkpoint used:
+
+- Worker-local HF checkpoint:
+  - `/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/hf`.
+- This is the merged HF checkpoint from the v48/process-consistency 30-step Qwen2.5-Math-7B run.
+- Note: `/tmp/qwen25_math_7b_v48_30step_hf` exists only on the master side in the current session; using it inside worker `989057` failed because worker `/tmp` is separate.
+
+Implementation path:
+
+- Existing code already contained chunked SPS support:
+  - `/opt/tiger/reasoning-with-sampling/llm_experiments/power_samp_batch_vllm.py`, `batched_chunked_sps`.
+  - `/opt/tiger/reasoning-with-sampling/llm_experiments/power_samp_math_dp_worker.py`, `--chunked_sps`.
+  - `/opt/tiger/reasoning-with-sampling/llm_experiments/run_math_vllm_dp.sh`, `CHUNKED_SPS=1`.
+- No new algorithm code was required for this first test.
+
+Smoke test:
+
+```bash
+cd /opt/tiger/reasoning-with-sampling/llm_experiments
+MODEL=qwen25_v48_30step_chunked_smoke \
+MODEL_PATH=/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/hf \
+MODEL_KIND=qwen_math \
+TEMP=0.50 \
+NUM_PROBLEMS=40 \
+N_SEEDS=1 \
+SKIP_MCMC=1 \
+SPS_CANDIDATES=0 \
+CHUNKED_SPS=1 \
+CHUNKED_CANDIDATES=8 \
+CHUNKED_TOKENS=64 \
+CHUNKED_SELECT=max \
+MAX_NEW=3072 \
+GPU_MEM=0.82 \
+NUM_WORKERS=8 \
+SAVE=/tmp/chunked_sps_v48_smoke_40 \
+LOGDIR=/tmp/chunked_sps_v48_smoke_40_logs \
+bash ./run_math_vllm_dp.sh
+/opt/tiger/modelchef/.venv/bin/python eval_math.py /tmp/chunked_sps_v48_smoke_40/qwen25_v48_30step_chunked_smoke
+```
+
+Smoke result on 40 problems:
+
+- Base accuracy: `37.5%`.
+- Low-temperature accuracy: `60.0%`.
+- Chunked SPS accuracy: `62.5%`.
+- This only validated the chain; it is too small to judge final quality.
+
+Full Math500 run:
+
+```bash
+cd /opt/tiger/reasoning-with-sampling/llm_experiments
+MODEL=qwen25_v48_30step_chunked_tau050_k8_c64 \
+MODEL_PATH=/tmp/ttrl_ckpts/qwen25_math_7b_v48_process_consistency_strict_n4_30step/global_step_30/hf \
+MODEL_KIND=qwen_math \
+TEMP=0.50 \
+NUM_PROBLEMS=500 \
+N_SEEDS=1 \
+SKIP_MCMC=1 \
+SPS_CANDIDATES=0 \
+CHUNKED_SPS=1 \
+CHUNKED_CANDIDATES=8 \
+CHUNKED_TOKENS=64 \
+CHUNKED_SELECT=max \
+MAX_NEW=3072 \
+GPU_MEM=0.82 \
+NUM_WORKERS=8 \
+SAVE=/tmp/chunked_sps_v48_full_500_tau050_k8_c64_max \
+LOGDIR=/tmp/chunked_sps_v48_full_500_tau050_k8_c64_max_logs \
+bash ./run_math_vllm_dp.sh
+/opt/tiger/modelchef/.venv/bin/python eval_math.py /tmp/chunked_sps_v48_full_500_tau050_k8_c64_max/qwen25_v48_30step_chunked_tau050_k8_c64
+```
+
+Full result:
+
+- Files evaluated: `8`.
+- Total questions: `500`.
+- Base accuracy: `0.498`.
+- Low-temperature accuracy: `0.644`.
+- Chunked SPS accuracy: `0.746`.
+- MCMC and one-shot SPS columns are zero because this run used `SKIP_MCMC=1` and `SPS_CANDIDATES=0`.
+
+Throughput / runtime:
+
+- Longest worker wall time: `135.5s`.
+- Per-worker chunked SPS time range: `49.1s` to `108.1s`.
+- Per-worker chunked SPS LLM token-event throughput range: about `7444` to `11951 token-events/s`.
+- Example slowest worker `w0`:
+  - `problems=63`.
+  - `baselines done in 27.3s`, `tokens=94316`.
+  - `chunked_sps done time=108.1s`, `chunk_steps=48`, `selected_tokens=50131`.
+  - `llm_token_events=804768`, `llm_tok_s=7443.9`.
+  - total `135.5s`.
+
+Infra health after the run:
+
+- `/proc/meminfo` and `/proc/self/status` readable.
+- All 8 B200 GPUs returned to `0 MiB`.
+
+Comparison:
+
+- Previous pure-vLLM one-shot SPS matrix on the same 30-step v48 HF checkpoint:
+  - best cell `tau=0.50,K=8`, `SPS acc=76.6%`.
+- This chunked prefix-selection variant:
+  - `tau=0.50,K=8,chunk=64,select=max`, `Chunked SPS acc=74.6%`.
+- Therefore progressive prefix selection is `-2.0pp` below the best one-shot full-answer SPS cell on the same checkpoint.
+
+Interpretation:
+
+- The idea is operationally valid: RL checkpoint + inference-time sharpening still works in the pure-vLLM stack, and the stable vLLM chain completed quickly without damaging `/proc`.
+- But this first chunked-prefix version is a negative algorithmic result.
+- Likely failure mode: early 64-token prefixes are too weak a correctness signal for MATH; selecting greedily at the prefix level can lock onto locally high base/proposal likelihood chunks before the answer basin is identifiable.
+- It is not an improvement and should not be committed as a positive result.
+- If continuing this direction, test less myopic variants rather than parameter-only tuning:
+  - select top-m prefixes instead of a single prefix per chunk;
+  - delay selection until a math answer / sub-answer marker appears;
+  - combine chunk scoring with final-answer one-shot SPS rather than replacing it;
+  - use process/answer consistency only after candidate answers become parseable.
+
+## 2026-07-08 v75 strict pure-sharpening result: support gate did not beat v48
+
+Goal context:
+
+- This is the active pure distribution-sharpening goal, not the inference-time scaling branch.
+- Completion target: Qwen2.5-Math-7B, 50 training steps, strict validation `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, no validation-time best-of / majority selection / `n=32` selection / ground-truth selection, and `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- v75 was designed after v68/v69 showed that count-neutral aggregation removes too much correctness-correlated support. It keeps direct sharpened probability, but adds a continuous support gate from base/ref probability, first4 low-budget answer stability, and process-clean support.
+
+Run:
+
+- Worker: `989057`, 8x B200.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4.sh`.
+- Reward mode:
+  - `ttrl.sps_reward_mode=support_gated_process_sharpened_prob`.
+  - `ttrl.sps_direct_beta=4.0`.
+  - `ttrl.sps_direct_process_tilt_strength=0.6`.
+  - `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+  - `ttrl.sps_direct_support_gate_strength=1.0`.
+  - `ttrl.sps_direct_support_gate_floor=0.05`.
+  - `ttrl.sps_direct_support_gate_base_weight=1.0`.
+  - `ttrl.sps_direct_support_gate_low_budget_weight=1.0`.
+  - `ttrl.sps_direct_support_gate_process_weight=1.0`.
+  - `ttrl.sps_majority_reward_coef=0.0`.
+  - `ttrl.sps_format_reward_coef=0.0`.
+- Strict validation:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+- Cache/model local copy:
+  - `/tmp/ttrl_cache/sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4`.
+
+Artifacts:
+
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4.log`.
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4_ray_taskrunner.log`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4_metrics.txt`.
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4_proc_health.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_support_gated_process_sharpened_prob_qwen25_math_7b_50step_v75_strict_n4_throughput_summary.txt`.
+- Refreshed ablation table:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+
+Infra and health:
+
+- CUDA preflight passed on driver `580.105.08`.
+- `cuInit: 0`.
+- GEMM smoke passed.
+- Loaded CUDA libraries came from the modelchef venv cu12.9 stack.
+- Run status `0`.
+- Final procfs health:
+  - `PROC_SELF_OK_FINAL`.
+  - `PROC_MEMINFO_OK_FINAL`.
+  - `PROC_COUNT_FINAL 106`.
+- Final GPU state:
+  - all 8 B200 GPUs returned to `0 MiB`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation steps: `49`.
+- Non-validation average step time: `27.614s`.
+- Non-validation whole-machine throughput: `8964.364 token/s`.
+- Steps 41-50 average step time: `48.622s`.
+- Steps 41-50 whole-machine throughput: `4755.938 token/s`.
+- Final validation was included in step 50:
+  - `timing_s/testing=227.043s`.
+  - `timing_s/step=248.904s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.7409456740442656`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.8467605633802817`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.7570764587525151`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.9647887323943662`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.015593561368209255`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.083`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.902`.
+- `direct_target_entropy=0.439`.
+- `direct_target_effective_K=1.401`.
+- `direct_unique_answer_count=11.375`.
+- `direct_majority_target_mass=0.902`.
+- `direct_base_agreement=1.000`.
+- `direct_low_budget_parseable_rate=1.000`.
+- `direct_low_budget_clip_rate=0.000`.
+- `direct_low_budget_top_mass=0.875`.
+- `direct_process_consistent_rate=0.951`.
+- `direct_process_top_support=0.998`.
+- `direct_support_gate_top_confidence=0.540`.
+- `direct_support_gate_target_overlap=0.626`.
+- `direct_support_gate_target_agreement=1.000`.
+- `direct_support_gate_low_budget_entropy=0.766`.
+- `direct_support_gate_process_entropy=1.631`.
+- `train/sps_pick_accuracy=1.000`.
+- `train/sps_correct_weight_mass=0.444`.
+- `train/pass@32=1.000`.
+
+Completion audit:
+
+- The runner refreshed `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+- Current pure candidates:
+  - `v68_count_neutral`: `strict_mean4=0.310865191147`.
+  - `v69_pairwise_count_neutral`: `strict_mean4=0.498993963783`.
+  - `v75_support_gated`: `strict_mean4=0.740945674044`.
+- Completion gate output:
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+  - `BEST_PURE_CANDIDATE=v75_support_gated`.
+  - `BEST_PURE_MEAN@4=0.740945674044`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`.
+  - `RESULT=FAIL`.
+
+Interpretation:
+
+- v75 recovers most of the damage from v68/v69, but it still does not beat v48 and does not reach the `0.75` target.
+- The support gate is not too weak. By step 50 the direct target is already very sharp: `effective_K=1.401`, `target_confidence=0.902`, and `majority_target_mass=0.902`.
+- The gate agrees with the target (`support_gate_target_agreement=1.000`) while overlap is only moderate (`0.626`), which suggests it has become a confirmation signal for the already-collapsed answer basin rather than an independent correctness selector.
+- `best@4=84.68%` and `maj@4=75.71%` show candidates still exist, but strict `mean@4=74.09%` means the model has not moved enough correct probability mass into ordinary low-budget samples.
+
+Conclusion:
+
+- The active pure distribution-sharpening goal remains incomplete.
+- Do not call `update_goal`.
+- Do not make an improvement commit for v75; it is below v48 and below target.
+- Next algorithm direction should avoid more beta/temperature tuning. The next clean idea is to make support a conservative target-mixture constraint rather than a multiplicative confirmation gate: when the direct target is over-sharp, mix it back toward the base/first4/process support distribution so the target cannot collapse to a single potentially wrong basin before independent support is decisive.
+
+## 2026-07-09 v76 strict pure-sharpening result: support mixture weakened the target but reduced mean@4
+
+Goal context:
+
+- This is the active strict pure distribution-sharpening goal, not the inference-time scaling branch.
+- Completion target remains Qwen2.5-Math-7B, 50 training steps, validation `actor_rollout_ref.rollout.val_kwargs.n=4`, `trainer.validation_answer_selection_enable=False`, no validation-time best-of / majority selection / `n=32` selection / ground-truth selection, and `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- v76 was designed from the v75 failure mode: v75's multiplicative support gate confirmed an already sharp target, so v76 made support a conservative target-mixture constraint. When the direct target was over-sharp and weakly overlapped with base/first4/process support, it mixed the target distribution back toward that soft support distribution.
+
+Run:
+
+- Worker: `989057`, 8x B200.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4.sh`.
+- Reward mode:
+  - `ttrl.sps_reward_mode=support_mixture_process_sharpened_prob`.
+  - `ttrl.sps_direct_beta=4.0`.
+  - `ttrl.sps_direct_target_temperature=1.0`.
+  - `ttrl.sps_direct_process_tilt_strength=0.6`.
+  - `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+  - `ttrl.sps_direct_support_gate_strength=1.0`.
+  - `ttrl.sps_direct_support_gate_floor=0.05`.
+  - `ttrl.sps_direct_support_mixture_strength=0.6`.
+  - `ttrl.sps_direct_support_mixture_confidence_threshold=0.85`.
+  - `ttrl.sps_direct_support_mixture_effective_k_threshold=2.0`.
+  - `ttrl.sps_direct_support_mixture_overlap_threshold=0.85`.
+  - `ttrl.sps_majority_reward_coef=0.0`.
+  - `ttrl.sps_format_reward_coef=0.0`.
+- Strict validation:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+- Cache/model local copy:
+  - `/tmp/ttrl_cache/sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4`.
+
+Artifacts:
+
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4.log`.
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4_ray_taskrunner.log`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4_metrics.txt`.
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4_proc_health.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_support_mixture_process_sharpened_prob_qwen25_math_7b_50step_v76_strict_n4_throughput_summary.txt`.
+- Refreshed ablation table:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+
+Infra and health:
+
+- CUDA preflight passed on driver `580.105.08`.
+- `cuInit: 0`.
+- GEMM smoke passed.
+- Loaded CUDA libraries came from the modelchef venv cu12.9 stack.
+- Run status `0`.
+- Final procfs health:
+  - `PROC_SELF_OK_FINAL`.
+  - `PROC_MEMINFO_OK_FINAL`.
+  - `PROC_COUNT_FINAL 115`.
+- Final GPU state:
+  - all 8 B200 GPUs returned to `0 MiB`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation steps: `49`.
+- Non-validation average step time: `26.414s`.
+- Non-validation whole-machine throughput: `9388.111 token/s`.
+- Steps 41-50 average step time: `48.331s`.
+- Steps 41-50 whole-machine throughput: `4638.908 token/s`.
+- Final validation was included in step 50:
+  - `timing_s/testing=227.758s`.
+  - `timing_s/step=250.032s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.7308853118712274`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.8388893360160966`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.7473158953722334`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.9668008048289738`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.01358148893360161`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.084`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.873`.
+- `direct_target_entropy=0.571`.
+- `direct_target_effective_K=1.452`.
+- `direct_unique_answer_count=9.250`.
+- `direct_majority_target_mass=0.873`.
+- `direct_base_agreement=1.000`.
+- `direct_low_budget_parseable_rate=0.969`.
+- `direct_low_budget_clip_rate=0.031`.
+- `direct_low_budget_top_mass=0.750`.
+- `direct_process_consistent_rate=0.967`.
+- `direct_process_top_support=0.994`.
+- `direct_support_gate_top_confidence=0.575`.
+- `direct_support_gate_target_overlap=0.691`.
+- `direct_support_gate_target_agreement=0.875`.
+- `direct_support_gate_low_budget_entropy=0.748`.
+- `direct_support_gate_process_entropy=1.454`.
+- `direct_support_mixture_alpha=0.069`.
+- `direct_support_mixture_pre_confidence=0.902`.
+- `direct_support_mixture_pre_effective_K=1.380`.
+- `direct_support_mixture_pre_overlap=0.662`.
+- `train/sps_pick_accuracy=0.625`.
+- `train/sps_correct_weight_mass=0.445`.
+- `train/pass@32=1.000`.
+
+Completion audit:
+
+- The runner refreshed `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+- Current pure candidates:
+  - `v68_count_neutral`: `strict_mean4=0.310865191147`.
+  - `v69_pairwise_count_neutral`: `strict_mean4=0.498993963783`.
+  - `v75_support_gated`: `strict_mean4=0.740945674044`.
+  - `v76_support_mixture`: `strict_mean4=0.730885311871`.
+- Completion gate output:
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+  - `BEST_PURE_CANDIDATE=v75_support_gated`.
+  - `BEST_PURE_MEAN@4=0.740945674044`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`.
+  - `RESULT=FAIL`.
+
+Interpretation:
+
+- v76 did what it was supposed to do mechanically: the support mixture reduced the step-50 target sharpness from the pre-mixture state (`pre_confidence=0.902`, `pre_effective_K=1.380`) to the post-mixture state (`target_confidence=0.873`, `target_effective_K=1.452`).
+- But this conservative softening reduced strict validation quality: `mean@4=73.09%`, below v75 `74.09%`, v48 `74.55%`, and the target `75%`.
+- The failure is informative: the problem is not only over-collapse. By step 50, v76 still has high process support and base agreement, but `sps_pick_accuracy=0.625` and `best@4=83.89%` are worse than v75/v48. Pulling the target toward generic support can dilute useful correct-candidate mass without adding an independent correctness signal.
+- This is not a reason to tune `support_mixture_strength` after seeing the accuracy. The internal evidence says the target got less sharp, but the correctness proxy did not improve.
+
+Conclusion:
+
+- The active pure distribution-sharpening goal remains incomplete.
+- Do not call `update_goal`.
+- Do not make an improvement commit for v76; it is a negative ablation.
+- Current best strict pure-sharpening candidate remains v75 among pure candidates (`74.09%`), while the best strict historical SPS anchor remains v48 (`74.55%`).
+- Next direction should add a more independent correctness-support signal before mixing or sharpening, rather than further softening a target that still follows the same answer basin. Good candidates are delayed answer-stability after partial reasoning, top-m rather than top-1 support competition, or a target-correctness proxy that distinguishes process-consistent wrong basins from process-consistent correct basins.
+
+## 2026-07-09 v77 strict pure-sharpening result: support-calibrated confidence cap over-softened the target
+
+Goal context:
+
+- This is still the strict pure distribution-sharpening goal:
+  - Qwen2.5-Math-7B.
+  - 50 training steps.
+  - Validation `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - No validation-time best-of, majority selection, `n=32` selection, ground-truth selection, or inference-time scaling.
+  - Success metric is only `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- v77 was motivated by the v75/v76 internal evidence:
+  - v75/v76 direct targets were much sharper than the independent support distribution.
+  - v76 showed that generic support mixing softened the target but did not improve correctness.
+  - v77 therefore tried a narrower rule: preserve the direct target's top answer, but cap its top mass using the independent support distribution's top confidence plus a margin. Excess probability mass was redistributed by support over the remaining answers.
+
+Run:
+
+- Worker: `989057`, 8x B200.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4.sh`.
+- Reward mode:
+  - `ttrl.sps_reward_mode=support_calibrated_process_sharpened_prob`.
+  - `ttrl.sps_direct_beta=4.0`.
+  - `ttrl.sps_direct_target_temperature=1.0`.
+  - `ttrl.sps_direct_process_tilt_strength=0.6`.
+  - `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+  - `ttrl.sps_direct_support_gate_strength=0.0`.
+  - `ttrl.sps_direct_support_mixture_strength=0.0`.
+  - `ttrl.sps_direct_support_confidence_cap_strength=1.0`.
+  - `ttrl.sps_direct_support_confidence_cap_margin=0.20`.
+  - `ttrl.sps_direct_support_confidence_cap_min=0.55`.
+  - `ttrl.sps_majority_reward_coef=0.0`.
+  - `ttrl.sps_format_reward_coef=0.0`.
+- Strict validation:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+- Cache/model local copy:
+  - `/tmp/ttrl_cache/sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4`.
+
+Artifacts:
+
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4.log`.
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4_ray_taskrunner.log`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4_metrics.txt`.
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4_proc_health.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_support_calibrated_process_sharpened_prob_qwen25_math_7b_50step_v77_strict_n4_throughput_summary.txt`.
+- Refreshed ablation table:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+
+Infra notes:
+
+- The first v77 attempt failed before any training step due to a local variable typo in the new cap branch:
+  - `NameError: name 'confidence_cap_strength_f' is not defined`.
+  - Fixed to use `support_confidence_cap_strength_f`.
+  - Re-ran `py_compile`, strict config audit, and no-majority-target audit successfully before relaunch.
+- The clean rerun completed with status `0`.
+- CUDA preflight passed on driver `580.105.08`.
+- `cuInit: 0`.
+- GEMM smoke passed.
+- Loaded CUDA libraries came from the modelchef venv cu12.9 stack.
+- Final procfs health:
+  - `PROC_SELF_OK_FINAL`.
+  - `PROC_MEMINFO_OK_FINAL`.
+  - `PROC_COUNT_FINAL 116`.
+- Final GPU state:
+  - all 8 B200 GPUs returned to `0 MiB`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation steps: `49`.
+- Non-validation average step time: `28.034s`.
+- Non-validation whole-machine throughput: `9797.941 token/s`.
+- Steps 41-50 average step time: `52.859s`.
+- Steps 41-50 whole-machine throughput: `5358.177 token/s`.
+- Final validation was included in step 50:
+  - `timing_s/testing=241.848s`.
+  - `timing_s/step=268.988s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.630784708249497`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.8100301810865189`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.6590704225352112`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.9678068410462777`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.04275653923541248`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.087`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.491`.
+- `direct_target_entropy=2.074`.
+- `direct_target_effective_K=4.099`.
+- `direct_unique_answer_count=24.375`.
+- `direct_majority_target_mass=0.491`.
+- `direct_base_agreement=1.000`.
+- `direct_low_budget_parseable_rate=0.969`.
+- `direct_low_budget_clip_rate=0.031`.
+- `direct_low_budget_top_mass=0.594`.
+- `direct_process_consistent_rate=0.725`.
+- `direct_process_top_support=0.924`.
+- `direct_support_gate_strength_mean=0.000`.
+- `direct_support_gate_top_confidence=0.215`.
+- `direct_support_gate_target_overlap=0.652`.
+- `direct_support_gate_target_agreement=1.000`.
+- `direct_support_mixture_alpha=0.000`.
+- `direct_support_mixture_pre_confidence=0.723`.
+- `direct_support_mixture_pre_effective_K=2.820`.
+- `direct_support_mixture_pre_overlap=0.427`.
+- `direct_support_confidence_cap_alpha=0.750`.
+- `direct_support_confidence_cap_value=0.550`.
+- `direct_support_confidence_cap_pre_confidence=0.723`.
+- `train/sps_pick_accuracy=0.000`.
+- `train/sps_correct_weight_mass=0.225`.
+- `train/pass@32=1.000`.
+
+Completion audit:
+
+- The runner refreshed `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+- Current pure candidates:
+  - `v68_count_neutral`: `strict_mean4=0.310865191147`.
+  - `v69_pairwise_count_neutral`: `strict_mean4=0.498993963783`.
+  - `v75_support_gated`: `strict_mean4=0.740945674044`.
+  - `v76_support_mixture`: `strict_mean4=0.730885311871`.
+  - `v77_support_calibrated`: `strict_mean4=0.630784708249`.
+- Completion gate output:
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+  - `BEST_PURE_CANDIDATE=v75_support_gated`.
+  - `BEST_PURE_MEAN@4=0.740945674044`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`.
+  - `RESULT=FAIL`.
+
+Interpretation:
+
+- v77 cleanly isolates the confidence-cap idea: support gate and support mixture were disabled, while the support distribution was still computed for calibration diagnostics.
+- The cap was too destructive. It reduced step-50 target confidence from `pre_confidence=0.723` to `target_confidence=0.491` and increased target effective K to `4.099`.
+- This over-softening destroyed the useful first-choice signal:
+  - `sps_pick_accuracy=0.000`.
+  - `sps_correct_weight_mass=0.225`.
+  - strict `mean@4=63.08%`, far below v75/v76/v48.
+- The negative result is informative: the independent support top confidence is too low (`support_gate_top_confidence=0.215`) to be used as a direct cap on the target distribution. It acts like a broad uncertainty prior rather than a correctness selector.
+- The previous conclusion is strengthened: simply softening or capping a target that follows the same basin is not enough. The next useful direction needs an independent correctness-support proxy, not a stronger entropy/cap constraint.
+
+Conclusion:
+
+- The active pure distribution-sharpening goal remains incomplete.
+- Do not call `update_goal`.
+- Do not make an improvement commit for v77; it is a negative ablation.
+- Current best strict pure-sharpening candidate remains v75 (`74.09%`), and the best strict historical SPS anchor remains v48 (`74.55%`).
+- Avoid further cap/mix strength tuning based only on accuracy. The internal evidence says support-confidence capping over-diffuses the target. Next candidates should add correctness discrimination before sharpening, for example delayed answer stability after partial reasoning, top-m support competition, or process features that distinguish consistent wrong basins from consistent correct basins.
+
+## 2026-07-09 v78 strict pure sharpening: support residual tilt
+
+Goal context:
+
+- Active goal remains Qwen2.5-Math-7B strict 50-step pure distribution sharpening.
+- Success metric is only `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- Validation config remains strict:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`.
+  - `trainer.validation_answer_selection_enable=False`.
+  - No validation-time selection, best-of, majority vote, or inference-time scaling.
+- Majority vote is diagnostic only and is not used to build the target.
+
+Design:
+
+- v77 showed that directly capping by support confidence over-softens the target:
+  - support top confidence was too low to act as a correctness selector.
+- v78 keeps v75's support-gated process-sharpened target, but adds a new default-off residual target-logit tilt:
+  - `log p_support(answer) - log p_base(answer)`.
+- Interpretation:
+  - `p_base` is the frozen base/ref answer distribution.
+  - `p_support` combines frozen base/ref support, first-low-budget answer stability, and process-clean support.
+  - Positive residual means first4/process evidence is stronger than base-only inertia.
+  - Negative residual means the support evidence does not justify extra sharpening beyond base support.
+- This remains pure soft-distribution training:
+  - no hard pseudo-label;
+  - no majority target;
+  - no validation-time scaling.
+
+Code changes:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added default-off `support_residual_strength`.
+  - Computes centered support residual:
+    - `support_residual = log(support_probs) - log(base_probs)`;
+    - `support_residual -= mean(support_residual)`;
+    - `answer_logits += support_residual_strength * support_residual`.
+  - Added diagnostics:
+    - `sps/direct_support_residual_strength_mean`;
+    - `sps/direct_support_residual_mean`;
+    - `sps/direct_support_residual_std`;
+    - `sps/direct_support_residual_top_value`.
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added reward mode `support_residual_process_sharpened_prob`.
+  - Added pass-through for `ttrl.sps_direct_support_residual_strength`.
+  - Mode id is `17.0`.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off `sps_direct_support_residual_strength: 0.0`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4.sh`.
+- Audit/summary scripts updated to include v78:
+  - `verify_pure_sharpening_strict_configs.py`;
+  - `audit_v68_v69_no_majority_target.py`;
+  - `summarize_pure_sharpening_ablation.py`;
+  - `check_pure_sharpening_goal_completion.py`;
+  - `audit_pure_sharpening_result.py`.
+
+Runner config highlights:
+
+- `ttrl.sps_reward_mode=support_residual_process_sharpened_prob`.
+- `ttrl.sps_direct_beta=4.0`.
+- `ttrl.sps_direct_target_temperature=1.0`.
+- `ttrl.sps_direct_process_tilt_strength=0.6`.
+- `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+- `ttrl.sps_direct_support_gate_strength=1.0`.
+- `ttrl.sps_direct_support_gate_base_weight=1.0`.
+- `ttrl.sps_direct_support_gate_low_budget_weight=1.0`.
+- `ttrl.sps_direct_support_gate_process_weight=1.0`.
+- `ttrl.sps_direct_support_residual_strength=0.5`.
+- `ttrl.sps_majority_reward_coef=0.0`.
+- `ttrl.sps_format_reward_coef=0.0`.
+- `actor_rollout_ref.rollout.val_kwargs.n=4`.
+- `trainer.validation_answer_selection_enable=False`.
+- `trainer.total_training_steps=50`.
+- `trainer.test_freq=50`.
+- `trainer.val_before_train=False`.
+
+Static validation before launch:
+
+- `py_compile` passed for:
+  - `ttrl_utils.py`;
+  - `ray_trainer.py`;
+  - updated audit/summary scripts.
+- `bash -n` passed for the v78 runner.
+- Strict config audit:
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- No-majority-target audit:
+  - `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+
+Worker/infra:
+
+- Worker: `989057`, 8x NVIDIA B200.
+- Driver: `580.105.08`.
+- Pre-run health:
+  - `/proc/self` OK.
+  - `/proc/meminfo` OK.
+  - `PROC_COUNT_BEFORE 113`.
+  - 8 GPUs visible and initially idle.
+  - `cuInit: 0`.
+  - GEMM smoke passed.
+  - Loaded CUDA/cuBLAS/cuDNN/NCCL/NVJitLink from modelchef venv cu12.9 stack.
+- Root disk was low but recorded only:
+  - `/` available about `3.3G`.
+  - `/tmp` available about `2.9T`.
+- Cache/model copy was under:
+  - `/tmp/ttrl_cache/sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4`.
+- Clean run status:
+  - script status `0`.
+  - `PROC_SELF_OK_FINAL`.
+  - `PROC_MEMINFO_OK_FINAL`.
+  - `PROC_COUNT_FINAL 115`.
+  - final all 8 GPUs returned to `0 MiB`.
+
+Artifacts:
+
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4.log`.
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4_ray_taskrunner.log`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4_metrics.txt`.
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4_proc_health.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_support_residual_process_sharpened_prob_qwen25_math_7b_50step_v78_strict_n4_throughput_summary.txt`.
+- Refreshed summary:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation steps: `49`.
+- Non-validation average step time: `27.869s`.
+- Non-validation whole-machine throughput: `8881.843 token/s`.
+- Steps 41-50 average step time: `48.363s`.
+- Steps 41-50 whole-machine throughput: `4663.868 token/s`.
+- Final validation included in step 50:
+  - `timing_s/testing=228.563s`.
+  - `timing_s/step=250.582s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.737424547284`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.835068410463`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.748680080483`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.968309859155`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.011569416499`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.085`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.850`.
+- `direct_target_entropy=0.621`.
+- `direct_target_effective_K=3.772`.
+- `direct_unique_answer_count=10.375`.
+- `direct_majority_target_mass=0.850`.
+- `direct_base_agreement=1.000`.
+- `direct_low_budget_parseable_rate=1.000`.
+- `direct_low_budget_clip_rate=0.031`.
+- `direct_low_budget_top_mass=0.781`.
+- `direct_process_consistent_rate=0.969`.
+- `direct_process_top_support=0.996`.
+- `direct_support_gate_strength_mean=1.000`.
+- `direct_support_gate_top_confidence=0.593`.
+- `direct_support_gate_target_overlap=0.725`.
+- `direct_support_gate_target_agreement=1.000`.
+- `direct_support_mixture_alpha=0.000`.
+- `direct_support_confidence_cap_alpha=0.000`.
+- `direct_support_confidence_cap_value=0.813`.
+- `direct_support_confidence_cap_pre_confidence=0.850`.
+- `direct_support_residual_strength_mean=0.500`.
+- `direct_support_residual_mean=0.000`.
+- `direct_support_residual_std=0.277`.
+- `direct_support_residual_top_value=-0.680`.
+- `train/sps_pick_accuracy=0.000`.
+- `train/sps_correct_weight_mass=0.428`.
+- `train/pass@32=1.000`.
+
+Completion audit:
+
+- Current pure candidates:
+  - `v68_count_neutral`: `strict_mean4=0.310865191147`.
+  - `v69_pairwise_count_neutral`: `strict_mean4=0.498993963783`.
+  - `v75_support_gated`: `strict_mean4=0.740945674044`.
+  - `v76_support_mixture`: `strict_mean4=0.730885311871`.
+  - `v77_support_calibrated`: `strict_mean4=0.630784708249`.
+  - `v78_support_residual`: `strict_mean4=0.737424547284`.
+- Completion gate output:
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+  - `BEST_PURE_CANDIDATE=v75_support_gated`.
+  - `BEST_PURE_MEAN@4=0.740945674044`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`.
+  - `RESULT=FAIL`.
+
+Interpretation:
+
+- v78 is a negative ablation relative to v75.
+- The residual mechanism did not improve strict mean@4:
+  - v78 `73.74%`;
+  - v75 `74.09%`;
+  - v48 historical SPS anchor `74.55%`.
+- The key diagnostic is `direct_support_residual_top_value=-0.680` at step 50:
+  - the residual term was usually subtracting from the already selected top target, not adding correctness-discriminating support.
+  - This means the combined support distribution did not identify a better basin; it mostly acted as a regularizer against the target top.
+- `target_confidence=0.850` and `effective_K=3.772` show v78 is less collapsed than v75 but still sharp enough.
+- `sps_correct_weight_mass=0.428` is close to v75/v76, but `sps_pick_accuracy=0.000` at step 50 indicates the top target still did not reliably select the correct answer on the final train batch.
+- The result supports the current failure model:
+  - base/ref + first4 + process support is not an independent correctness oracle;
+  - when it disagrees with the direct target, it does not reliably point to a correct alternative;
+  - stronger residual tuning would be post-hoc and is not justified by these internal metrics.
+
+Conclusion:
+
+- The active pure distribution-sharpening goal remains incomplete.
+- Do not call `update_goal`.
+- Do not make an improvement commit for v78; it is a negative ablation.
+- Current best strict pure-sharpening candidate remains v75 (`74.09%`), below target `75%`.
+- Next useful direction should not be another support strength/cap/mix sweep. It needs a more independent correctness-support proxy, for example:
+  - delayed answer stability after partial reasoning checkpoints;
+  - local equation/identity consistency around the derived final answer;
+  - top-m basin competition using process features that specifically penalize consistent wrong derivations;
+  - or a training-free probe that predicts whether the top basin's final answer is self-correcting under continuation, before using it as a target tilt.
+
+## 2026-07-09 v79 Split-View Support Process Sharpening Result
+
+Context:
+
+- Active goal remains Qwen2.5-Math-7B strict 50-step pure distribution sharpening.
+- Success metric remains only `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- Validation remains strict:
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`;
+  - `trainer.validation_answer_selection_enable=False`;
+  - no validation-time best-of, majority vote, answer selection, or inference-time scaling.
+- v79 was motivated by the v78 failure signal:
+  - v78 `support_residual_top_value=-0.680` showed the combined support residual often suppressed the current target instead of finding a better correctness basin.
+  - Therefore v79 did not tune residual strength. It tried to create a more independent support signal by requiring agreement between two internal views.
+
+Design:
+
+- New reward mode: `split_support_process_sharpened_prob`.
+- Mode id: `18.0`.
+- Two support views are computed inside `apply_direct_sharpened_ttrl_reward`:
+  - first-low-budget view from the first `low_k=4` parseable, non-clipped rollouts;
+  - held-out view from later rollouts, weighted by process cleanliness (`1.0` if process-consistent, `0.25` otherwise).
+- The support distribution is the geometric mean:
+  - `p_split(answer) = sqrt(p_first4(answer) * p_heldout_process(answer))`.
+- The direct target logits receive a soft tilt:
+  - `answer_logits += split_support_strength * log(p_split(answer))`.
+- This is still pure soft-distribution training:
+  - no hard pseudo-label;
+  - no majority target;
+  - no hard majority reward;
+  - majority is diagnostic only.
+
+Code/config changes:
+
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`
+  - Added default-off `split_support_strength=0.0` and `split_support_floor=0.05`.
+  - Added split support computation and diagnostics:
+    - `sps/direct_split_support_strength_mean`;
+    - `sps/direct_split_support_top_confidence`;
+    - `sps/direct_split_support_target_overlap`;
+    - `sps/direct_split_support_target_agreement`;
+    - `sps/direct_split_support_view_overlap`.
+- `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`
+  - Added mode `split_support_process_sharpened_prob`.
+  - Added pass-through for `ttrl.sps_direct_split_support_strength` and `ttrl.sps_direct_split_support_floor`.
+- `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - Added default-off config:
+    - `sps_direct_split_support_strength: 0.0`;
+    - `sps_direct_split_support_floor: 0.05`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4.sh`.
+- Audit/summary scripts updated to include v79:
+  - `verify_pure_sharpening_strict_configs.py`;
+  - `audit_v68_v69_no_majority_target.py`;
+  - `summarize_pure_sharpening_ablation.py`;
+  - `check_pure_sharpening_goal_completion.py`;
+  - `audit_pure_sharpening_result.py`.
+
+Runner config highlights:
+
+- `ttrl.sps_reward_mode=split_support_process_sharpened_prob`.
+- `ttrl.sps_direct_beta=4.0`.
+- `ttrl.sps_direct_target_temperature=1.0`.
+- `ttrl.sps_direct_process_tilt_strength=0.6`.
+- `ttrl.sps_direct_process_cluster_tilt_strength=0.8`.
+- `ttrl.sps_direct_support_gate_strength=0.0`.
+- `ttrl.sps_direct_support_residual_strength=0.0`.
+- `ttrl.sps_direct_split_support_strength=0.7`.
+- `ttrl.sps_direct_split_support_floor=0.05`.
+- `ttrl.sps_majority_reward_coef=0.0`.
+- `ttrl.sps_format_reward_coef=0.0`.
+- `actor_rollout_ref.rollout.val_kwargs.n=4`.
+- `trainer.validation_answer_selection_enable=False`.
+- `trainer.total_training_steps=50`.
+- `trainer.test_freq=50`.
+- `trainer.val_before_train=False`.
+
+Static validation:
+
+- `py_compile` passed for:
+  - `ttrl_utils.py`;
+  - `ray_trainer.py`;
+  - updated audit/summary scripts.
+- `bash -n` passed for the v79 runner.
+- Strict config audit:
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- No-majority-target audit:
+  - `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+
+Worker/infra:
+
+- Worker: `989057`, 8x NVIDIA B200.
+- Driver: `580.105.08`.
+- Pre-run health:
+  - `/proc/self` OK.
+  - `/proc/meminfo` OK.
+  - `PROC_COUNT_BEFORE 113`.
+  - 8 GPUs visible and initially idle.
+  - `cuInit: 0`.
+  - GEMM smoke passed.
+  - Loaded CUDA/cuBLAS/cuDNN/NCCL/NVJitLink from modelchef venv cu12.9 stack.
+- Root disk was low but recorded only:
+  - `/` available about `3.3G`.
+  - `/tmp` available about `2.8T`.
+- Cache/model copy was under:
+  - `/tmp/ttrl_cache/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4`.
+- First v79 launch was manually interrupted during startup at 2026-07-09 01:55 after no main stdout; later Ray logs showed it had passed model loading and vLLM CUDA graph capture, so this was an overly early interrupt rather than a CUDA/Ray failure.
+  - Preserved log: `/opt/tiger/TTRL/verl/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4_aborted_init_20260709_0155.log`.
+- Second v79 launch completed.
+- Final health:
+  - `PROC_SELF_OK_AFTER`.
+  - `PROC_MEMINFO_OK_AFTER`.
+  - `PROC_COUNT_AFTER 119`.
+  - Post-run manual check showed 8 GPUs released to `0 MiB` and `/proc` still healthy.
+
+Artifacts:
+
+- Main log:
+  - `/opt/tiger/TTRL/verl/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4.log`.
+- Ray task log snapshot:
+  - `/opt/tiger/TTRL/verl/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4_ray_taskrunner.log`.
+- Metrics snapshot:
+  - `/opt/tiger/TTRL/verl/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4_metrics.txt`.
+- Proc health:
+  - `/opt/tiger/TTRL/verl/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4_proc_health.txt`.
+- Throughput summary:
+  - `/opt/tiger/TTRL/verl/sps_split_support_process_sharpened_prob_qwen25_math_7b_50step_v79_strict_n4_throughput_summary.txt`.
+- Refreshed summary:
+  - `/opt/tiger/TTRL/verl/pure_sharpening_ablation_summary.tsv`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation steps: `49`.
+- Non-validation average step time: `27.248s`.
+- Non-validation whole-machine throughput: `9089.487 token/s`.
+- Steps 41-50 average step time: `48.351s`.
+- Steps 41-50 whole-machine throughput: `4665.085 token/s`.
+- Final validation included in step 50:
+  - `timing_s/testing=227.986s`;
+  - `timing_s/step=249.894s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.715291750503`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.824211267606`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.733199195171`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.962776659960`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.019617706237`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.086`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.938`.
+- `direct_target_entropy=0.328`.
+- `direct_target_effective_K=1.230`.
+- `direct_unique_answer_count=11`.
+- `direct_majority_target_mass=0.938`.
+- `direct_base_agreement=1.000`.
+- `direct_low_budget_parseable_rate=1.000`.
+- `direct_low_budget_clip_rate=0.031`.
+- `direct_low_budget_top_mass=0.906`.
+- `direct_process_consistent_rate=0.957`.
+- `direct_process_top_support=0.988`.
+- `direct_split_support_strength_mean=0.700`.
+- `direct_split_support_top_confidence=0.855`.
+- `direct_split_support_target_overlap=0.912`.
+- `direct_split_support_target_agreement=1.000`.
+- `direct_split_support_view_overlap=0.888`.
+- `train/sps_pick_accuracy=1.000`.
+- `train/sps_correct_weight_mass=0.485`.
+- `train/pass@32=1.000`.
+
+Completion audit after v79:
+
+- `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+- `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+- Current pure candidates:
+  - `v68_count_neutral`: `strict_mean4=0.310865191147`.
+  - `v69_pairwise_count_neutral`: `strict_mean4=0.498993963783`.
+  - `v75_support_gated`: `strict_mean4=0.740945674044`.
+  - `v76_support_mixture`: `strict_mean4=0.730885311871`.
+  - `v77_support_calibrated`: `strict_mean4=0.630784708249`.
+  - `v78_support_residual`: `strict_mean4=0.737424547284`.
+  - `v79_split_support`: `strict_mean4=0.715291750503`.
+- Completion gate output:
+  - `BEST_PURE_CANDIDATE=v75_support_gated`.
+  - `BEST_PURE_MEAN@4=0.740945674044`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`.
+  - `RESULT=FAIL`.
+
+Interpretation:
+
+- v79 is a clear negative ablation:
+  - v79 `71.53%`;
+  - v75 `74.09%`;
+  - v48 historical SPS anchor `74.55%`.
+- The split-view support signal was strong internally:
+  - split support top confidence `0.855`;
+  - target overlap `0.912`;
+  - target agreement `1.000`;
+  - view overlap `0.888`.
+- But those signals mostly confirmed the existing high-confidence basin:
+  - final target confidence increased to `0.938`;
+  - target effective K collapsed to `1.230`;
+  - mean@4 dropped sharply.
+- This shows that first4/held-out process agreement is not a sufficiently independent correctness oracle. It mostly sharpens stable basins, including stable wrong basins.
+- The improvement in final-batch diagnostics (`sps_pick_accuracy=1.000`, `correct_weight_mass=0.485`) did not translate to Math500 strict mean@4, so those train-batch internal metrics are not enough to justify more strength tuning.
+
+Conclusion:
+
+- The active pure distribution-sharpening goal remains incomplete.
+- Do not call `update_goal`.
+- Do not make an improvement commit for v79; it is a negative ablation.
+- Current best strict pure-sharpening candidate remains v75 (`74.09%`), below target `75%`.
+- The next algorithmic step should avoid more support-strength/mix/cap tuning. The next proxy must explicitly distinguish stable-correct from stable-wrong basins, for example:
+  - continuation self-correction probe before using a basin as target support;
+  - local algebra/equation consistency checks near the final answer;
+  - basin-level contradiction/revision features;
+  - or a two-stage target where support agreement only sharpens if an independent consistency check passes.
+
+## v80 strict pure sharpening: stability-overconfidence capacity brake
+
+Timestamp: 2026-07-09 02:37 CST.
+
+Motivation:
+
+- v79 showed that split first4/held-out support can be very self-consistent while still hurting strict Math500 mean@4.
+- The failure mode was over-sharpening a stable basin:
+  - v79 target confidence `0.938`;
+  - v79 target effective K `1.230`;
+  - split support target overlap `0.912`;
+  - split support view overlap `0.888`;
+  - strict mean@4 dropped to `0.715291750503`.
+- v75 remains the best current pure candidate at `0.740945674044`, with less collapsed target capacity:
+  - target confidence `0.902`;
+  - target effective K `1.401`;
+  - support target overlap `0.626`.
+- Therefore v80 does not continue tuning split-support strength. It starts from the v75 support-gated route and adds a capacity brake that activates only when the soft target is both overconfident and highly aligned with the independent support distribution.
+
+Algorithm:
+
+- New reward mode: `capacity_braked_process_sharpened_prob`.
+- New mode id: `19.0`.
+- Base route:
+  - process tilt strength `0.6`;
+  - process cluster tilt strength `0.8`;
+  - support gate strength `1.0`;
+  - support gate base/low-budget/process weights all `1.0`.
+- New default-off knobs:
+  - `sps_direct_capacity_brake_strength`;
+  - `sps_direct_capacity_brake_min_effective_k`;
+  - `sps_direct_capacity_brake_confidence_threshold`;
+  - `sps_direct_capacity_brake_overlap_threshold`.
+- v80 runner settings:
+  - `sps_direct_capacity_brake_strength=0.7`;
+  - `sps_direct_capacity_brake_min_effective_k=1.6`;
+  - `sps_direct_capacity_brake_confidence_threshold=0.88`;
+  - `sps_direct_capacity_brake_overlap_threshold=0.82`.
+- Trigger logic:
+  - compute target confidence, effective K, and target/support overlap after existing support gate and cap stages;
+  - only activate if confidence is above threshold and/or effective K is below min, and target/support overlap is high;
+  - mix target probabilities toward a softened support distribution, using `sqrt(p_support)` renormalized;
+  - this controls capacity while preserving a soft distribution over answer clusters.
+
+No-majority / no-selection status:
+
+- Majority vote remains diagnostic only.
+- v80 does not use TTRL majority pseudo-labels, hard majority rewards, validation-time selection, best-of, `n=32`, or inference-time scaling.
+- Strict validation remains:
+  - Qwen2.5-Math-7B;
+  - 50 training steps;
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`;
+  - `trainer.validation_answer_selection_enable=False`;
+  - success metric `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+
+Code/artifacts before launch:
+
+- Core implementation:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`.
+- Trainer wiring:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`.
+- Config defaults:
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_capacity_braked_process_sharpened_prob_qwen25_math_7b_50step_v80_strict_n4.sh`.
+- Summary/audit scripts updated:
+  - `verify_pure_sharpening_strict_configs.py`;
+  - `audit_v68_v69_no_majority_target.py`;
+  - `summarize_pure_sharpening_ablation.py`;
+  - `check_pure_sharpening_goal_completion.py`;
+  - `audit_pure_sharpening_result.py`.
+
+Static validation before launch:
+
+- `python3 -m py_compile` passed for changed trainer/util/audit scripts.
+- `bash -n` passed for the v80 runner.
+- `verify_pure_sharpening_strict_configs.py` output:
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- `audit_v68_v69_no_majority_target.py` output:
+  - `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+- `summarize_pure_sharpening_ablation.py` includes v80 as `MISSING`, as expected before launch.
+
+Expected diagnostics to inspect after launch:
+
+- `train/sps/direct_capacity_brake_alpha`;
+- `train/sps/direct_capacity_brake_pre_confidence`;
+- `train/sps/direct_capacity_brake_pre_effective_K`;
+- `train/sps/direct_capacity_brake_pre_overlap`;
+- `train/sps/direct_capacity_brake_post_effective_K`;
+- strict `val-core/MATH-TTT/acc/mean@4`.
+
+Run result:
+
+- Worker: `989057`, 8x B200.
+- Launch completed with script status `0`.
+- Main artifact paths:
+  - `/opt/tiger/TTRL/verl/sps_capacity_braked_process_sharpened_prob_qwen25_math_7b_50step_v80_strict_n4.log`;
+  - `/opt/tiger/TTRL/verl/sps_capacity_braked_process_sharpened_prob_qwen25_math_7b_50step_v80_strict_n4_ray_taskrunner.log`;
+  - `/opt/tiger/TTRL/verl/sps_capacity_braked_process_sharpened_prob_qwen25_math_7b_50step_v80_strict_n4_metrics.txt`;
+  - `/opt/tiger/TTRL/verl/sps_capacity_braked_process_sharpened_prob_qwen25_math_7b_50step_v80_strict_n4_proc_health.txt`;
+  - `/opt/tiger/TTRL/verl/sps_capacity_braked_process_sharpened_prob_qwen25_math_7b_50step_v80_strict_n4_throughput_summary.txt`.
+
+Throughput:
+
+- `step_rows=50`.
+- Non-validation average step time: `26.702s`.
+- Non-validation whole-machine throughput: `9198.624 token/s`.
+- Steps 41-50 average step time, including final validation: `48.361s`.
+- Steps 41-50 whole-machine throughput: `4594.457 token/s`.
+- Final step included validation:
+  - `timing_s/testing=228.265s`;
+  - `timing_s/step=250.440s`.
+
+Final strict metrics:
+
+- `val-core/MATH-TTT/acc/mean@4=0.7293762575452716`.
+- `val-core/MATH-TTT/acc/best@4/mean=0.8386217303822937`.
+- `val-core/MATH-TTT/acc/maj@4/mean=0.7465372233400402`.
+- `val-aux/MATH-TTT/format_score/mean@4=0.9678068410462777`.
+- `val-aux/MATH-TTT/response_clip/mean@4=0.014084507042253521`.
+- `val-aux/MATH-TTT/response_avg_logprob/mean@4=-0.082`.
+
+Key step-50 internal signals:
+
+- `direct_target_confidence=0.879`.
+- `direct_target_entropy=0.548`.
+- `direct_target_effective_K=1.573`.
+- `direct_majority_target_mass=0.879`.
+- `direct_base_top_confidence=0.817`.
+- `direct_base_agreement=1.000`.
+- `direct_low_budget_top_mass=0.781`.
+- `direct_process_consistent_rate=0.947`.
+- `direct_process_top_support=0.986`.
+- `direct_support_gate_top_confidence=0.601`.
+- `direct_support_gate_target_overlap=0.695`.
+- `direct_support_gate_target_agreement=1.000`.
+- `direct_capacity_brake_alpha=0.151`.
+- `direct_capacity_brake_pre_confidence=0.911`.
+- `direct_capacity_brake_pre_effective_K=1.503`.
+- `direct_capacity_brake_pre_overlap=0.687`.
+- `direct_capacity_brake_post_effective_K=1.573`.
+- `train/sps_pick_accuracy=0.750`.
+- `train/sps_correct_weight_mass=0.450`.
+- `train/pass@32=1.000`.
+
+Completion audit after v80:
+
+- `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+- `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`.
+- Current pure candidate results:
+  - `v68_count_neutral`: `0.310865191147`.
+  - `v69_pairwise_count_neutral`: `0.498993963783`.
+  - `v75_support_gated`: `0.740945674044`.
+  - `v76_support_mixture`: `0.730885311871`.
+  - `v77_support_calibrated`: `0.630784708249`.
+  - `v78_support_residual`: `0.737424547284`.
+  - `v79_split_support`: `0.715291750503`.
+  - `v80_capacity_braked`: `0.729376257545`.
+- Completion gate output:
+  - `BEST_PURE_CANDIDATE=v75_support_gated`.
+  - `BEST_PURE_MEAN@4=0.740945674044`.
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`.
+  - `RESULT=FAIL`.
+
+Infra note:
+
+- Preflight before v80 was healthy:
+  - `/proc/self` and `/proc/meminfo` existed;
+  - `PROC_COUNT_BEFORE 113`;
+  - 8 GPUs visible;
+  - `cuInit: 0`;
+  - GEMM smoke passed;
+  - venv cu12.9 CUDA libraries were used for cuBLAS/cuDNN/NCCL/NVJitLink.
+- After training finished, `/proc` was broken inside the worker namespace:
+  - `PROC_SELF_BAD_AFTER`;
+  - `PROC_MEMINFO_BAD_AFTER`;
+  - `PROC_COUNT_AFTER 0`;
+  - final trap also recorded `PROC_SELF_BAD_FINAL`, `PROC_MEMINFO_BAD_FINAL`, `PROC_COUNT_FINAL 0`.
+- There were brpc warnings immediately before result snapshot:
+  - `Fail to open /proc/self/stat`;
+  - `Fail to open /proc/self/fd`;
+  - `Fail to open /proc/self/statm`;
+  - `Fail to open /proc/loadavg`;
+  - `Fail to open /proc/self/io`.
+- Do not continue using worker `989057` for further Ray/CUDA experiments unless it is restarted or replaced. The script exited `0`, but the runtime namespace is corrupted.
+
+Interpretation:
+
+- v80 is a negative ablation:
+  - v80 `72.94%`;
+  - v75 `74.09%`;
+  - v48 `74.55%`.
+- The brake did activate at the end and mildly increased capacity:
+  - pre effective K `1.503`;
+  - post effective K `1.573`;
+  - alpha `0.151`.
+- But target/support overlap at the brake point was only `0.687`, lower than the intended high-overlap stable-basin trigger. The effective-K signal alone let the brake fire in cases where support was not a sufficiently independent correctness signal.
+- This suggests capacity control alone is insufficient. It can reduce collapse but does not distinguish correct vs wrong basins, and it may weaken useful sharpening without adding correctness evidence.
+- No improvement commit should be made for v80. It is below v75 and below the `0.75` target.
+- The active goal remains incomplete; do not call `update_goal`.
+
+Next algorithmic direction:
+
+- Stop tuning capacity thresholds/strengths on the same support signal.
+- Need a genuinely independent verifier-free correctness proxy before sharpening or braking, for example:
+  - continuation self-correction probe from the top basin;
+  - local equation/algebra consistency around the final answer;
+  - contradiction/revision checks that compare multiple final-answer candidates;
+  - basin competition that can demote stable-but-low-evidence answers rather than only controlling entropy.
+
+## 2026-07-09 v81 prepared: basin-contrast margin calibration
+
+Timestamp: 2026-07-09 04:10 CST.
+
+Goal status:
+
+- Active goal remains incomplete. Completion audit after v80 still reports best pure candidate `v75_support_gated` with `mean@4=0.740945674044 < 0.75`.
+- v81 is prepared but not launched yet. Worker `989057` must not be reused because `/proc` was corrupted after v80.
+
+Motivation from existing evidence:
+
+- v48/v75 show that answer-cluster sharpening plus capacity/support can move strict low-budget samples close to the 75% target.
+- v76/v80 show that simply softening or braking overconfident targets can reduce collapse but does not add correctness evidence.
+- v79 shows that split-view support can be very stable and still wrong; stability alone is not enough.
+- Therefore v81 does not tune support strength or capacity thresholds. It adds a basin-contrast rule: the top answer is allowed to become much sharper than the runner-up only when independent internal support margins also distinguish the same top basin.
+
+Algorithm:
+
+- New reward mode: `basin_contrast_process_sharpened_prob`.
+- New mode id: `20.0`.
+- Base route starts from v75:
+  - process tilt strength `0.6`;
+  - process cluster tilt strength `0.8`;
+  - support gate strength `1.0`;
+  - support gate base/low-budget/process weights all `1.0`.
+- New default-off config keys:
+  - `ttrl.sps_direct_basin_contrast_strength`;
+  - `ttrl.sps_direct_basin_contrast_margin`.
+- v81 runner settings:
+  - `ttrl.sps_direct_basin_contrast_strength=0.8`;
+  - `ttrl.sps_direct_basin_contrast_margin=0.12`.
+- Mechanism:
+  - construct the usual soft direct target distribution over answer clusters;
+  - find the current top and second answer basins;
+  - compute target top-vs-second probability margin;
+  - compute corresponding margins from frozen base/ref probability, first-low-budget answer support, process-clean support, and the combined support distribution;
+  - if target margin exceeds the internally supported margin plus slack, softly cap only the excess top mass and redistribute it by support over non-top answers.
+- This is not answer selection. It does not choose a pseudo-label, does not use the TTRL majority target, and does not use ground truth. Majority remains diagnostic only.
+
+Code/artifacts prepared:
+
+- Core implementation:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py`.
+- Trainer wiring:
+  - `/opt/tiger/TTRL/verl/verl/trainer/ppo/ray_trainer.py`.
+- Config defaults:
+  - `/opt/tiger/TTRL/verl/verl/trainer/config/ppo_trainer_ttrl.yaml`.
+- Runner:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_basin_contrast_process_sharpened_prob_qwen25_math_7b_50step_v81_strict_n4.sh`.
+- Audit/summary scripts updated:
+  - `verify_pure_sharpening_strict_configs.py`;
+  - `audit_v68_v69_no_majority_target.py`;
+  - `summarize_pure_sharpening_ablation.py`;
+  - `audit_pure_sharpening_result.py`;
+  - `check_pure_sharpening_goal_completion.py`.
+
+Static validation:
+
+- `python3 -m py_compile` passed for:
+  - `ttrl_utils.py`;
+  - `ray_trainer.py`;
+  - updated audit/summary scripts.
+- `bash -n` passed for the v81 runner.
+- Strict config audit output:
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+- No-majority-target audit output:
+  - `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+- `summarize_pure_sharpening_ablation.py` now lists `v81_basin_contrast` as `MISSING`, as expected before launch.
+
+Expected diagnostics after launch:
+
+- strict `val-core/MATH-TTT/acc/mean@4`;
+- `train/sps/direct_basin_contrast_alpha`;
+- `train/sps/direct_basin_contrast_target_margin`;
+- `train/sps/direct_basin_contrast_support_margin`;
+- `train/sps/direct_basin_contrast_base_margin`;
+- `train/sps/direct_basin_contrast_low_budget_margin`;
+- `train/sps/direct_basin_contrast_process_margin`;
+- `train/sps/direct_basin_contrast_post_effective_K`;
+- usual target entropy/effective K, support overlap, first4/top support, format/clip/logprob, throughput, and proc health.
+
+Strict validation contract for v81:
+
+- Qwen2.5-Math-7B from `/opt/tiger/qwen2.5_math_7b`.
+- `trainer.total_training_steps=50`.
+- `actor_rollout_ref.rollout.val_kwargs.n=4`.
+- `trainer.validation_answer_selection_enable=False`.
+- No validation-time best-of, majority selection, `n=32` selection, ground-truth selection, or inference-time scaling.
+
+Next action:
+
+- Wait for or log into a healthy worker, run the v81 runner directly in worker environment, and stop immediately if `/proc` is missing before launch.
+- If v81 reaches `mean@4 >= 0.75`, run the post-run audit and minimal leakage check before any completion claim.
+- If v81 is negative, document the result and do not make an improvement commit.
+
+Worker check after v81 preparation:
+
+- Timestamp: 2026-07-09 03:23 worker-local time.
+- `NO_COLOR=1 TERM=dumb mlx worker list` still showed only worker `989057`.
+- `NO_COLOR=1 TERM=dumb mlx worker login 989057` succeeded in opening a shell, but startup printed proc-related errors:
+  - `failed to get cur dir: readlink /proc/self/exe: no such file or directory`;
+  - `bash: /dev/fd/63: No such file or directory`;
+  - `Error, do this: mount -t proc proc /proc`.
+- Direct worker health probe inside `989057`:
+  - `PROC_SELF_BAD`;
+  - `PROC_MEMINFO_BAD`;
+  - `PROC_COUNT 0`.
+- Decision: do not run v81, Ray, CUDA preflight, or any training command on worker `989057`. A healthy replacement worker is required before the next GPU experiment.
+
+Offline v81 smoke update:
+
+- Timestamp: 2026-07-09 03:35 worker-local time.
+- Refactored the basin-contrast formula into `_apply_basin_contrast_calibration(...)` in `ttrl_utils.py`.
+- Added CPU-only smoke:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_basin_contrast_cpu.py`.
+- The smoke verifies:
+  - weak internal support activates a soft top-mass cap;
+  - strong internal support leaves the target unchanged;
+  - `strength=0` is an exact no-op;
+  - probabilities remain normalized and non-negative;
+  - the operation calibrates the distribution without replacing the top basin as a hard label.
+- Validation commands:
+  - `python3 -m py_compile /opt/tiger/TTRL/verl/verl/trainer/ppo/ttrl_utils.py /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_basin_contrast_cpu.py /opt/tiger/TTRL/verl/examples/ttrl/verify_pure_sharpening_strict_configs.py`.
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_basin_contrast_cpu.py`
+    - output: `V81_BASIN_CONTRAST_CPU_SMOKE_OK`.
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/verify_pure_sharpening_strict_configs.py`
+    - output: `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`.
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/audit_v68_v69_no_majority_target.py`
+    - output: `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`.
+- This is not a result run. v81 still needs a healthy worker for the 50-step strict validation.
+
+V81 local guard update:
+
+- Timestamp: 2026-07-09 03:31 worker-local time.
+- Added v81 readiness guard:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`.
+  - Default known-bad workers: `987816 989057`.
+  - Requires exactly one 8x `NVIDIA-B200` worker that is not known-bad.
+- Added v81 local guard wrapper:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh`.
+- `bash /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh` completed the offline checks:
+  - py_compile passed for v81 trainer/util/audit scripts;
+  - runner and readiness guard `bash -n` passed;
+  - `V81_BASIN_CONTRAST_CPU_SMOKE_OK`;
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`;
+  - `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`;
+  - ablation summary contains `v81_basin_contrast` as `MISSING`;
+  - completion gate exits `2`, as expected because no pure candidate has reached `0.75`.
+- Current worker readiness from the same local guard:
+  - listed worker: `989057`;
+  - `KNOWN_BAD_WORKERS=987816,989057`;
+  - `WORKER id=989057 ... known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Decision remains unchanged: do not run v81 until a healthy replacement worker is available.
+
+V81 launch artifact check:
+
+- Timestamp: 2026-07-09 03:36 worker-local time.
+- Re-checked the v81 runner text for the strict/infra launch contract:
+  - `SRC_MODEL=/opt/tiger/qwen2.5_math_7b`;
+  - `CACHE_ROOT=/tmp/ttrl_cache/${EXP}`;
+  - `check_cuda_compat_preflight.sh`;
+  - `ttrl_record_cuda_preflight "$LOG" 1`;
+  - `ttrl.sps_reward_mode=basin_contrast_process_sharpened_prob`;
+  - `ttrl.sps_direct_basin_contrast_strength=0.8`;
+  - `ttrl.sps_direct_basin_contrast_margin=0.12`;
+  - `ttrl.sps_majority_reward_coef=0.0`;
+  - `ttrl.sps_format_reward_coef=0.0`;
+  - `actor_rollout_ref.rollout.val_kwargs.n=4`;
+  - `trainer.validation_answer_selection_enable=False`;
+  - `trainer.total_training_steps=50`;
+  - `trainer.test_freq=50`;
+  - `trainer.val_before_train=False`;
+  - `+ray_init.no_runtime_env=True`;
+  - `+ray_init.include_dashboard=False`;
+  - `+ray_init.node_ip_address=127.0.0.1`;
+  - post-run `summarize_pure_sharpening_ablation.py`;
+  - post-run `check_pure_sharpening_goal_completion.py`.
+- All checked snippets were present. The runner is ready to launch once worker readiness passes.
+
+General local guard update:
+
+- Timestamp: 2026-07-09 03:39 worker-local time.
+- Updated `/opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh` so the general guard now includes v81 artifacts:
+  - py_compile includes `smoke_v81_basin_contrast_cpu.py`;
+  - bash syntax includes `check_worker_readiness_for_v81.sh`, `smoke_v81_local_guards.sh`, and the v81 runner;
+  - runtime smoke includes `smoke_v81_basin_contrast_cpu.py`;
+  - worker readiness now calls `check_worker_readiness_for_v81.sh`, so known-bad `989057` is not accidentally accepted by the old v69-only guard.
+- Validation:
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh` passed.
+  - `rg -n "v81|basin|check_worker_readiness_for_v81|smoke_v81" .../smoke_pure_sharpening_local_guards.sh` shows the expected v81 entries.
+  - `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_basin_contrast_cpu.py` output `V81_BASIN_CONTRAST_CPU_SMOKE_OK`.
+
+2026-07-09 active-goal audit and worker readiness:
+
+- Objective audit restatement:
+  - Qwen2.5-Math-7B;
+  - 50 training steps;
+  - strict validation `actor_rollout_ref.rollout.val_kwargs.n=4`;
+  - `trainer.validation_answer_selection_enable=False`;
+  - no validation-time best-of / majority selection / `n=32` selection / ground-truth selection;
+  - success metric only `val-core/MATH-TTT/acc/mean@4 >= 0.75`.
+- Current completion gate:
+  - command: `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`;
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`;
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`;
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`;
+  - `CANDIDATE=v75_support_gated ARTIFACT_STATUS=COMPLETE_METRICS STRICT_MEAN@4=0.740945674044`;
+  - `CANDIDATE=v80_capacity_braked ARTIFACT_STATUS=COMPLETE_METRICS STRICT_MEAN@4=0.729376257545`;
+  - `CANDIDATE=v81_basin_contrast ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`;
+  - `BEST_PURE_CANDIDATE=v75_support_gated`;
+  - `BEST_PURE_MEAN@4=0.740945674044`;
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`;
+  - `MISSING_REQUIREMENT=no complete pure-sharpening run reaches target`;
+  - `RESULT=FAIL`.
+- Current worker readiness:
+  - command: `NO_COLOR=1 TERM=dumb bash /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - listed worker: `989057`, `8x NVIDIA-B200`;
+  - `KNOWN_BAD_WORKERS=987816,989057`;
+  - `WORKER id=989057 ... known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Decision:
+  - Do not call `update_goal`.
+  - Do not run v81, Ray, CUDA preflight, or training on worker `989057`.
+  - Next concrete action remains: wait for a healthy non-known-bad 8x B200 worker, then login and run the v81 strict 50-step runner.
+
+2026-07-09 repeated readiness check:
+
+- Command:
+  - `NO_COLOR=1 TERM=dumb bash /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`.
+- Output summary:
+  - only listed worker remains `989057`, `8x NVIDIA-B200`;
+  - `KNOWN_BAD_WORKERS=987816,989057`;
+  - `WORKER id=989057 ... known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No login, CUDA preflight, Ray startup, or training was attempted.
+- Goal status remains incomplete because v81 has no GPU result and best completed pure candidate is still below `0.75`.
+
+2026-07-09 v81 executable-bit fix and repeated audit:
+
+- Found that the newly created v81 shell entrypoints were not executable when invoked directly through `timeout`:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh`;
+  - `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_basin_contrast_process_sharpened_prob_qwen25_math_7b_50step_v81_strict_n4.sh`.
+- Fixed with:
+  - `chmod +x /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh /opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_basin_contrast_process_sharpened_prob_qwen25_math_7b_50step_v81_strict_n4.sh`.
+- Re-ran completion audit:
+  - command: `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`;
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`;
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`;
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`;
+  - `BEST_PURE_CANDIDATE=v75_support_gated`;
+  - `BEST_PURE_MEAN@4=0.740945674044`;
+  - `CANDIDATE=v81_basin_contrast ARTIFACT_STATUS=MISSING STRICT_MEAN@4=NA`;
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`;
+  - `RESULT=FAIL`.
+- Re-ran v81 readiness guard directly after the executable-bit fix:
+  - command: `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`;
+  - `KNOWN_BAD_WORKERS=987816,989057`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Decision:
+  - no `update_goal`;
+  - no git commit, because this is a reproducibility/entrypoint fix and not a strict mean@4 improvement or confirmed infra root-cause fix;
+  - next action remains to run v81 only after a healthy non-known-bad 8x B200 worker appears.
+
+2026-07-09 05:06 local v81 guard refresh:
+
+- Command:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh`.
+- Result:
+  - `SMOKE_V81_LOCAL_GUARDS_BEGIN 2026-07-09 05:06:13`;
+  - py_compile passed;
+  - bash syntax checks passed;
+  - `V81_BASIN_CONTRAST_CPU_SMOKE_OK`;
+  - `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`;
+  - `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`;
+  - ablation summary refresh still shows `v81_basin_contrast` as `MISSING`;
+  - completion gate still exits `2`, with `BEST_PURE_CANDIDATE=v75_support_gated`, `BEST_PURE_MEAN@4=0.740945674044`, and `RESULT=FAIL`;
+  - worker readiness still exits `2`, with only known-bad worker `989057` listed and `READINESS=FAIL`;
+  - `SMOKE_V81_LOCAL_GUARDS_DONE 2026-07-09 05:06:27`.
+- Interpretation:
+  - local v81 code/config/audit state is still coherent;
+  - the objective is not complete because no completed pure-sharpening run reaches `mean@4 >= 0.75`;
+  - the only current execution blocker is absence of a healthy non-known-bad 8x B200 worker.
+
+2026-07-09 later worker-list API blocker:
+
+- Repeated v81 readiness refreshes after the 05:06 local guard no longer consistently list the known-bad worker.
+- Latest readiness command:
+  - `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`.
+- Latest output shape:
+  - `[MlxClient] ListWorkder, [HttpGet]URL:/api/v1/workspaces/57226/workers/detail/ status code:500`;
+  - `failed to list gpu worker`;
+  - `KNOWN_BAD_WORKERS=987816,989057`;
+  - `WORKER_COUNT=0`;
+  - `READINESS=FAIL`;
+  - `REASON=no worker is listed`.
+- Interpretation:
+  - The execution blocker has shifted from "only known-bad worker `989057` is listed" to "the worker list API itself is returning 500, so no worker can be safely selected".
+  - Do not try to bypass the readiness guard by logging into an old worker id while the API is failing.
+  - Do not run v81, Ray, CUDA preflight, or training until the worker list API recovers and a healthy non-known-bad 8x B200 worker is visible.
+- Goal status remains incomplete:
+  - v81 still has no strict 50-step GPU result;
+  - best completed pure candidate is still `v75_support_gated` with `mean@4=0.740945674044 < 0.75`;
+  - no `update_goal`, no git commit.
+
+Additional worker-control-plane check:
+
+- Read `/home/tiger/.trae/skills/merlin-devbox/references/worker.md` for the safe worker-management path.
+- Ran the only additional safe read-only check:
+  - `NO_COLOR=1 TERM=dumb timeout 30s mlx worker quota`.
+- Result:
+  - command timed out with exit `124`;
+  - no output was returned within 30 seconds.
+- Interpretation:
+  - this supports that the worker control plane is currently unhealthy, not just that no suitable worker is available;
+  - still no launch, kill, login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 readiness guard diagnostic refinement:
+
+- Updated `/opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh` to distinguish a worker-control-plane/list failure from a genuinely empty worker list.
+- Change:
+  - capture `mlx worker list` stdout+stderr and exit status instead of letting `set -e` terminate early;
+  - detect `status code:500` / `failed to list gpu worker`;
+  - print `WORKER_LIST_EXIT=<code>` and `WORKER_LIST_STATUS=ERROR|OK`;
+  - when list fails, return `READINESS=FAIL` with `REASON=worker list command failed; worker control plane is unhealthy`.
+- Validation:
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh` passed.
+  - Actual readiness run still failed because the platform API is still returning 500, but now with the clearer output:
+    - `WORKER_LIST_EXIT=0`;
+    - `WORKER_LIST_STATUS=ERROR`;
+    - `WORKER_COUNT=0`;
+    - `READINESS=FAIL`;
+    - `REASON=worker list command failed; worker control plane is unhealthy`.
+- This is a diagnostic/readiness guard improvement only:
+  - no worker login;
+  - no launch/kill;
+  - no CUDA preflight;
+  - no Ray startup;
+  - no training.
+- Goal status remains incomplete; no `update_goal`.
+
+2026-07-09 v81 readiness smoke coverage:
+
+- Added `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_worker_readiness_guard.sh`.
+- The smoke uses local `WORKER_LIST_FIXTURE` inputs and covers:
+  - worker list API 500 / control-plane unhealthy;
+  - no worker listed;
+  - single known-bad worker `989057`;
+  - multiple healthy-looking workers, which must fail because only one worker is allowed;
+  - single healthy non-known-bad 8x B200 worker, which passes and prints the next login/runner commands.
+- Wired the new smoke into `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh`.
+- Validation:
+  - `chmod +x /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_worker_readiness_guard.sh`;
+  - `bash -n` passed for the v81 smoke scripts;
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_worker_readiness_guard.sh` output `V81_WORKER_READINESS_GUARD_SMOKE_OK`;
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_local_guards.sh` completed successfully.
+- Latest full local guard status:
+  - v81 CPU smoke passed;
+  - v81 worker readiness smoke passed all fixture cases;
+  - strict config audit passed;
+  - no-majority target audit passed;
+  - completion gate still correctly fails because no pure candidate reaches `mean@4 >= 0.75`;
+  - actual current readiness can list worker `989057` again, but fails because `989057` is known-bad.
+- Current actual readiness output summary:
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - `WORKER id=989057 ... known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Goal status remains incomplete:
+  - v81 has no strict 50-step GPU result;
+  - best completed pure candidate is still `v75_support_gated` with `mean@4=0.740945674044 < 0.75`;
+  - no `update_goal`, no git commit.
+
+2026-07-09 general pure-sharpening guard coverage update:
+
+- Updated `/opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh` so the general local guard also covers the v81 readiness fixture smoke.
+- Change:
+  - added `smoke_v81_worker_readiness_guard.sh` to the `bash -n` syntax check list;
+  - added a runtime step `SMOKE v81_worker_readiness_guard_fixtures`.
+- Validation:
+  - `bash -n /opt/tiger/TTRL/verl/examples/ttrl/smoke_pure_sharpening_local_guards.sh /opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_worker_readiness_guard.sh` passed;
+  - `/opt/tiger/TTRL/verl/examples/ttrl/smoke_v81_worker_readiness_guard.sh` still outputs `V81_WORKER_READINESS_GUARD_SMOKE_OK`.
+- This is diagnostic coverage only. It does not change the training algorithm or produce a GPU result.
+
+2026-07-09 06:02 CST readiness and completion audit refresh:
+
+- Re-ran the v81 readiness guard with `NO_COLOR=1 TERM=dumb /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`.
+- Current worker list is reachable again, but still only contains the known-bad worker:
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - `WORKER id=989057 gpu=8 gpu_type=NVIDIA-B200 ... known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Per the worker-safety rule, no login, CUDA preflight, Ray startup, or training was attempted against `989057`.
+- Re-ran `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`.
+- Completion audit still fails:
+  - strict config audit passed;
+  - no-majority target audit passed;
+  - paper/doc audit passed with `papers=13`;
+  - `v81_basin_contrast` remains `MISSING`;
+  - best completed pure candidate remains `v75_support_gated`;
+  - `BEST_PURE_MEAN@4=0.740945674044`;
+  - target `mean@4 >= 0.75` is not reached.
+- Goal status remains incomplete. Do not call `update_goal`; do not make a git commit for this negative/blocked status.
+
+2026-07-09 resource-side blocker refresh:
+
+- Ran read-only worker/resource checks; no launch, kill, login, CUDA preflight, Ray startup, or training was attempted.
+- v81 readiness remains blocked:
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker is `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- `NO_COLOR=1 TERM=dumb timeout 30s mlx worker quota` now returns successfully, so the control plane is responsive again.
+- Quota output shows other GPU classes such as H100/V100/T4 and public Arnold H20/L20, but no healthy ready-to-use `8x NVIDIA-B200` worker matching the current strict v81 runner/readiness contract.
+- Re-ran the completion gate:
+  - `STRICT_CONFIG_AUDIT_OUTPUT=STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`;
+  - `NO_MAJORITY_TARGET_AUDIT_OUTPUT=PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`;
+  - `DOC_AUDIT_OUTPUT=PURE_SHARPENING_DOC_AUDIT_OK papers=13`;
+  - `v81_basin_contrast` remains `MISSING`;
+  - `BEST_PURE_CANDIDATE=v75_support_gated`;
+  - `BEST_PURE_MEAN@4=0.740945674044`;
+  - `RESULT=FAIL`.
+- Current blocker is resource availability, not local v81 code/config/audit readiness.
+- Goal remains incomplete; do not call `update_goal` and do not make a git commit for this blocked status.
+
+2026-07-09 06:38 CST active-goal continuation readiness refresh:
+
+- Re-checked the active goal with the system goal tracker. Status is still active, and the concrete success gate remains strict `val-core/MATH-TTT/acc/mean@4 >= 0.75` for Qwen2.5-Math-7B, 50 training steps, validation `n=4`, no validation answer selection, and no inference-time scaling/selection.
+- Re-ran the v81 worker readiness guard:
+  - command: `NO_COLOR=1 TERM=dumb /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker is `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Per the worker-safety contract, no login, CUDA preflight, Ray startup, or v81 training was attempted against `989057`.
+- Because no GPU result changed and no infra fix was confirmed, no git commit should be made for this blocked refresh.
+- Goal remains incomplete. Next action is unchanged: wait for a healthy non-known-bad single `8x NVIDIA-B200` worker, then run `/opt/tiger/TTRL/verl/examples/ttrl/worker_run_sps_basin_contrast_process_sharpened_prob_qwen25_math_7b_50step_v81_strict_n4.sh` after the worker-side health checks pass.
+
+2026-07-09 06:40 CST readiness retry:
+
+- Re-checked goal status: the thread goal is still active, with the same strict Qwen2.5-Math-7B 50-step pure-sharpening success gate.
+- Re-ran `NO_COLOR=1 TERM=dumb /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`.
+- Result is unchanged:
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker is `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No login, CUDA preflight, Ray startup, or training was attempted. The blocker remains resource availability.
+
+2026-07-09 06:41 CST readiness retry:
+
+- Active goal was checked again and remains active.
+- Re-ran the v81 readiness guard. The worker state is still unchanged:
+  - worker list succeeds;
+  - the only listed worker is known-bad `989057` (`8x NVIDIA-B200`);
+  - readiness fails with `no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login or training was attempted.
+
+2026-07-09 07:23 CST active-goal continuation audit:
+
+- Re-ran the v81 worker readiness guard with a bounded command:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Per the worker-safety contract, no login, CUDA preflight, Ray startup, or v81 training was attempted against `989057`.
+- Re-ran `/opt/tiger/modelchef/.venv/bin/python3 /opt/tiger/TTRL/verl/examples/ttrl/check_pure_sharpening_goal_completion.py`.
+- Completion gate still fails:
+  - objective restatement passed: Qwen2.5-Math-7B, 50 steps, validation `n=4`, no validation selection, target `mean@4 >= 0.75`;
+  - summary refresh passed;
+  - strict config audit passed with `STRICT_PURE_SHARPENING_CONFIG_AUDIT_OK`;
+  - no-majority target audit passed with `PURE_SHARPENING_NO_MAJORITY_TARGET_AUDIT_OK`;
+  - doc audit passed with `PURE_SHARPENING_DOC_AUDIT_OK papers=13`;
+  - ablation rows present: `rows=14`;
+  - `v81_basin_contrast` remains `MISSING`;
+  - best completed pure candidate remains `v75_support_gated`;
+  - `BEST_PURE_MEAN@4=0.740945674044`;
+  - `CHECKLIST target_metric_reached=FAIL evidence=best=0.740945674044 target=0.75`;
+  - `RESULT=FAIL`.
+- Current blocker is still the lack of a healthy non-known-bad single `8x NVIDIA-B200` worker for the locked v81 runner contract. No `update_goal` call and no git commit should be made for this blocked/negative status.
+
+2026-07-09 07:25 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:26 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:27 CST read-only resource refresh:
+
+- Re-ran bounded v81 readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Re-ran read-only quota:
+  - command: `NO_COLOR=1 TERM=dumb timeout 30s mlx worker quota`;
+  - quota/control plane returned successfully;
+  - Public Workspace shows H100/V100/T4/A10/A100 classes, but no healthy ready-to-use B200 replacement;
+  - Public Arnold shows H20/L20 resources, but these do not satisfy the locked v81 single `8x NVIDIA-B200` runner/readiness contract.
+- No launch, kill, worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:28 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:29 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:30 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:32 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:33 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:34 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:35 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:36 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:38 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:39 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:40 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:41 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:43 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:44 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:45 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:47 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:48 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:49 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:51 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:52 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:54 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:55 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:57 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 07:58 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:00 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:02 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:03 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:05 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:07 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:08 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:10 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:14 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:16 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:17 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:18 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:19 CST readiness retry:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.
+
+2026-07-09 08:29 CST readiness and quota refresh:
+
+- Re-ran bounded readiness:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s /opt/tiger/TTRL/verl/examples/ttrl/check_worker_readiness_for_v81.sh`;
+  - `WORKER_LIST_STATUS=OK`;
+  - `WORKER_COUNT=1`;
+  - only listed worker remains `989057`, `8x NVIDIA-B200`, `known_bad=1`;
+  - `READINESS=FAIL`;
+  - `REASON=no healthy non-known-bad 8x NVIDIA-B200 worker is listed`.
+- Ran a read-only quota refresh:
+  - command: `NO_COLOR=1 TERM=dumb timeout 20s mlx worker quota`;
+  - Public Workspace has H100/V100/T4/A10/A100 resources;
+  - Public Arnold has H20/L20 resources;
+  - no ready B200 candidate is shown by quota.
+- No worker login, CUDA preflight, Ray startup, or training was attempted.

@@ -1,0 +1,5 @@
+task_log=/tmp/r73trainsave/ray/session_latest/logs/worker-411e0aeda7d72dc8b812543b670b161e15885c8858ee6c02955419e1-ffffffff-151914.out
+steps=41-50
+timing_s/step=29.091
+perf/total_num_tokens=233813.200
+whole_machine_tokens_per_s=8037.331

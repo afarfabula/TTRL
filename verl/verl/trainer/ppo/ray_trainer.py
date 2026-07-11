@@ -1283,6 +1283,20 @@ class RayPPOTrainer:
                                     "answer_conf_filter",
                                     "answer_conf_weight",
                                     "answer_rule_conf_weight",
+                                    "direct_sharpened_prob",
+                                    "process_tilted_sharpened_prob",
+                                    "contrastive_process_sharpened_prob",
+                                    "gated_contrastive_process_sharpened_prob",
+                                    "band_limited_process_sharpened_prob",
+                                    "count_neutral_process_sharpened_prob",
+                                    "pairwise_process_count_neutral_sharpened_prob",
+                                    "support_gated_process_sharpened_prob",
+                                    "support_mixture_process_sharpened_prob",
+                                    "support_calibrated_process_sharpened_prob",
+                                    "support_residual_process_sharpened_prob",
+                                    "split_support_process_sharpened_prob",
+                                    "capacity_braked_process_sharpened_prob",
+                                    "basin_contrast_process_sharpened_prob",
                                 )
                                 else self.config.ttrl.n_samples_per_prompt
                             )
@@ -1349,6 +1363,382 @@ class RayPPOTrainer:
                                         )
                                     )
                             if sps_mode in (
+                                "direct_sharpened_prob",
+                                "process_tilted_sharpened_prob",
+                                "contrastive_process_sharpened_prob",
+                                "gated_contrastive_process_sharpened_prob",
+                                "band_limited_process_sharpened_prob",
+                                "count_neutral_process_sharpened_prob",
+                                "pairwise_process_count_neutral_sharpened_prob",
+                                "support_gated_process_sharpened_prob",
+                                "support_mixture_process_sharpened_prob",
+                                "support_calibrated_process_sharpened_prob",
+                                "support_residual_process_sharpened_prob",
+                                "split_support_process_sharpened_prob",
+                                "capacity_braked_process_sharpened_prob",
+                                "basin_contrast_process_sharpened_prob",
+                            ):
+                                from verl.trainer.ppo.ttrl_utils import (
+                                    apply_direct_sharpened_ttrl_reward,
+                                    select_top_k_per_prompt,
+                                )
+
+                                with marked_timer("sps_direct_sharpened_reward", timing_raw):
+                                    batch, sps_reward_tensor, sps_info = apply_direct_sharpened_ttrl_reward(
+                                        batch=batch,
+                                        gen_batch_output=gen_batch_output,
+                                        n=K,
+                                        tokenizer=self.tokenizer,
+                                        ref_log_prob=base_lp.batch["ref_log_prob"],
+                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                        response_mask=response_mask,
+                                        beta=self.config.ttrl.get("sps_direct_beta", 4.0),
+                                        target_temperature=self.config.ttrl.get(
+                                            "sps_direct_target_temperature", 1.0
+                                        ),
+                                        length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                        reward_scale=self.config.ttrl.get("sps_direct_reward_scale", 1.0),
+                                        per_sample_mode=self.config.ttrl.get(
+                                            "sps_direct_per_sample_mode", "answer_mass"
+                                        ),
+                                        reward_floor=self.config.ttrl.get("sps_direct_reward_floor", 0.0),
+                                        low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
+                                        process_tail_fraction=self.config.ttrl.get(
+                                            "sps_process_tail_fraction", 0.5
+                                        ),
+                                        process_tilt_strength=(
+                                            self.config.ttrl.get("sps_direct_process_tilt_strength", 0.0)
+                                            if sps_mode
+                                            in (
+                                                "process_tilted_sharpened_prob",
+                                                "contrastive_process_sharpened_prob",
+                                                "gated_contrastive_process_sharpened_prob",
+                                                "band_limited_process_sharpened_prob",
+                                                "count_neutral_process_sharpened_prob",
+                                                "pairwise_process_count_neutral_sharpened_prob",
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "split_support_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 0.0
+                                        ),
+                                        process_cluster_tilt_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_process_cluster_tilt_strength", 0.0
+                                            )
+                                            if sps_mode
+                                            in (
+                                                "process_tilted_sharpened_prob",
+                                                "contrastive_process_sharpened_prob",
+                                                "gated_contrastive_process_sharpened_prob",
+                                                "band_limited_process_sharpened_prob",
+                                                "count_neutral_process_sharpened_prob",
+                                                "pairwise_process_count_neutral_sharpened_prob",
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "split_support_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 0.0
+                                        ),
+                                        base_contrast_strength=(
+                                            self.config.ttrl.get("sps_direct_base_contrast_strength", 0.0)
+                                            if sps_mode
+                                            in (
+                                                "contrastive_process_sharpened_prob",
+                                                "gated_contrastive_process_sharpened_prob",
+                                            )
+                                            else 0.0
+                                        ),
+                                        base_contrast_gate_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_base_contrast_gate_strength", 0.0
+                                            )
+                                            if sps_mode == "gated_contrastive_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        base_contrast_process_margin=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_base_contrast_process_margin", 0.0
+                                            )
+                                            if sps_mode == "gated_contrastive_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        target_effective_k_min=(
+                                            self.config.ttrl.get("sps_direct_target_effective_k_min", 0.0)
+                                            if sps_mode == "band_limited_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        target_effective_k_max=(
+                                            self.config.ttrl.get("sps_direct_target_effective_k_max", 0.0)
+                                            if sps_mode == "band_limited_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        target_effective_k_strength=(
+                                            self.config.ttrl.get("sps_direct_target_effective_k_strength", 0.0)
+                                            if sps_mode == "band_limited_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        count_neutral_aggregation=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_count_neutral_aggregation", False
+                                            )
+                                            if sps_mode == "count_neutral_process_sharpened_prob"
+                                            or sps_mode == "pairwise_process_count_neutral_sharpened_prob"
+                                            else False
+                                        ),
+                                        pairwise_process_preference_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_pairwise_process_preference_strength", 0.0
+                                            )
+                                            if sps_mode == "pairwise_process_count_neutral_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        pairwise_process_preference_temperature=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_pairwise_process_preference_temperature", 1.0
+                                            )
+                                            if sps_mode == "pairwise_process_count_neutral_sharpened_prob"
+                                            else 1.0
+                                        ),
+                                        support_gate_strength=(
+                                            self.config.ttrl.get("sps_direct_support_gate_strength", 0.0)
+                                            if sps_mode
+                                            in (
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 0.0
+                                        ),
+                                        support_gate_temperature=(
+                                            self.config.ttrl.get("sps_direct_support_gate_temperature", 1.0)
+                                            if sps_mode
+                                            in (
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 1.0
+                                        ),
+                                        support_gate_floor=(
+                                            self.config.ttrl.get("sps_direct_support_gate_floor", 0.05)
+                                            if sps_mode
+                                            in (
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 0.05
+                                        ),
+                                        support_gate_base_weight=(
+                                            self.config.ttrl.get("sps_direct_support_gate_base_weight", 1.0)
+                                            if sps_mode
+                                            in (
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 1.0
+                                        ),
+                                        support_gate_low_budget_weight=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_gate_low_budget_weight", 1.0
+                                            )
+                                            if sps_mode
+                                            in (
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                                "basin_contrast_process_sharpened_prob",
+                                            )
+                                            else 1.0
+                                        ),
+                                        support_gate_process_weight=(
+                                            self.config.ttrl.get("sps_direct_support_gate_process_weight", 1.0)
+                                            if sps_mode
+                                            in (
+                                                "support_gated_process_sharpened_prob",
+                                                "support_mixture_process_sharpened_prob",
+                                                "support_calibrated_process_sharpened_prob",
+                                                "support_residual_process_sharpened_prob",
+                                                "capacity_braked_process_sharpened_prob",
+                                            )
+                                            else 1.0
+                                        ),
+                                        support_mixture_strength=(
+                                            self.config.ttrl.get("sps_direct_support_mixture_strength", 0.0)
+                                            if sps_mode == "support_mixture_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        support_mixture_confidence_threshold=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_mixture_confidence_threshold", 0.85
+                                            )
+                                            if sps_mode == "support_mixture_process_sharpened_prob"
+                                            else 0.85
+                                        ),
+                                        support_mixture_effective_k_threshold=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_mixture_effective_k_threshold", 2.0
+                                            )
+                                            if sps_mode == "support_mixture_process_sharpened_prob"
+                                            else 2.0
+                                        ),
+                                        support_mixture_overlap_threshold=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_mixture_overlap_threshold", 0.85
+                                            )
+                                            if sps_mode == "support_mixture_process_sharpened_prob"
+                                            else 0.85
+                                        ),
+                                        support_confidence_cap_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_confidence_cap_strength", 0.0
+                                            )
+                                            if sps_mode == "support_calibrated_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        support_confidence_cap_margin=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_confidence_cap_margin", 0.20
+                                            )
+                                            if sps_mode == "support_calibrated_process_sharpened_prob"
+                                            else 0.20
+                                        ),
+                                        support_confidence_cap_min=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_confidence_cap_min", 0.55
+                                            )
+                                            if sps_mode == "support_calibrated_process_sharpened_prob"
+                                            else 0.55
+                                        ),
+                                        support_residual_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_support_residual_strength", 0.0
+                                            )
+                                            if sps_mode == "support_residual_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        split_support_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_split_support_strength", 0.0
+                                            )
+                                            if sps_mode == "split_support_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        split_support_floor=(
+                                            self.config.ttrl.get("sps_direct_split_support_floor", 0.05)
+                                            if sps_mode == "split_support_process_sharpened_prob"
+                                            else 0.05
+                                        ),
+                                        capacity_brake_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_capacity_brake_strength", 0.0
+                                            )
+                                            if sps_mode == "capacity_braked_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        capacity_brake_min_effective_k=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_capacity_brake_min_effective_k", 0.0
+                                            )
+                                            if sps_mode == "capacity_braked_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        capacity_brake_confidence_threshold=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_capacity_brake_confidence_threshold", 1.0
+                                            )
+                                            if sps_mode == "capacity_braked_process_sharpened_prob"
+                                            else 1.0
+                                        ),
+                                        capacity_brake_overlap_threshold=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_capacity_brake_overlap_threshold", 1.0
+                                            )
+                                            if sps_mode == "capacity_braked_process_sharpened_prob"
+                                            else 1.0
+                                        ),
+                                        basin_contrast_strength=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_basin_contrast_strength", 0.0
+                                            )
+                                            if sps_mode == "basin_contrast_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        basin_contrast_margin=(
+                                            self.config.ttrl.get(
+                                                "sps_direct_basin_contrast_margin", 0.0
+                                            )
+                                            if sps_mode == "basin_contrast_process_sharpened_prob"
+                                            else 0.0
+                                        ),
+                                        mode_id=(
+                                            20.0
+                                            if sps_mode == "basin_contrast_process_sharpened_prob"
+                                            else
+                                            19.0
+                                            if sps_mode == "capacity_braked_process_sharpened_prob"
+                                            else
+                                            18.0
+                                            if sps_mode == "split_support_process_sharpened_prob"
+                                            else
+                                            17.0
+                                            if sps_mode == "support_residual_process_sharpened_prob"
+                                            else
+                                            16.0
+                                            if sps_mode == "support_calibrated_process_sharpened_prob"
+                                            else
+                                            15.0
+                                            if sps_mode == "support_mixture_process_sharpened_prob"
+                                            else 14.0
+                                            if sps_mode == "support_gated_process_sharpened_prob"
+                                            else 13.0
+                                            if sps_mode == "pairwise_process_count_neutral_sharpened_prob"
+                                            else
+                                            12.0
+                                            if sps_mode == "count_neutral_process_sharpened_prob"
+                                            else 11.0
+                                            if sps_mode == "band_limited_process_sharpened_prob"
+                                            else 10.0
+                                            if sps_mode == "gated_contrastive_process_sharpened_prob"
+                                            else 9.0
+                                            if sps_mode == "contrastive_process_sharpened_prob"
+                                            else 8.0
+                                            if sps_mode == "process_tilted_sharpened_prob"
+                                            else 7.0
+                                        ),
+                                    )
+                                gen_batch_output = gen_batch_output.union(
+                                    DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
+                                )
+                                gen_batch_output = select_top_k_per_prompt(
+                                    gen_batch_output, K, self.config.ttrl.n_samples_per_prompt
+                                )
+                                assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
+                            elif sps_mode in (
                                 "answer_weighted_vote",
                                 "answer_weighted_gate",
                                 "answer_conf_filter",
@@ -1364,74 +1754,379 @@ class RayPPOTrainer:
                                     select_top_k_per_prompt,
                                 )
 
-                                with marked_timer("sps_apply_weighted_gt", timing_raw):
-                                    batch = apply_sps_weighted_ttrl_gt(
-                                        batch=batch,
-                                        gen_batch_output=gen_batch_output,
-                                        n=K,
-                                        tokenizer=self.tokenizer,
-                                        ref_log_prob=base_lp.batch["ref_log_prob"],
-                                        rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
-                                        response_mask=response_mask,
-                                        alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
-                                        length_normalize=self.config.ttrl.get("sps_length_normalize", True),
-                                        weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
-                                        use_majority_fallback=sps_mode == "answer_weighted_gate",
-                                        gate_confidence_threshold=self.config.ttrl.get("sps_gate_confidence_threshold", 0.8),
-                                        gate_majority_ratio_threshold=self.config.ttrl.get("sps_gate_majority_ratio_threshold", 0.75),
-                                        confidence_filter=sps_mode == "answer_conf_filter",
-                                        confidence_weight=sps_mode in ("answer_conf_weight", "answer_rule_conf_weight"),
-                                        filter_confidence_threshold=self.config.ttrl.get("sps_filter_confidence_threshold", 0.8),
-                                        filter_majority_ratio_threshold=self.config.ttrl.get("sps_filter_majority_ratio_threshold", 0.75),
-                                        weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
-                                        clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
-                                        weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
-                                        answer_sharpen_beta=self.config.ttrl.get("sps_answer_sharpen_beta", 1.0),
-                                        answer_sharpen_capacity=self.config.ttrl.get("sps_answer_sharpen_capacity", False),
-                                        consistency_capacity=self.config.ttrl.get(
-                                            "sps_consistency_capacity", False
-                                        ),
-                                        consistency_disagreement_penalty=self.config.ttrl.get(
-                                            "sps_consistency_disagreement_penalty", 0.5
-                                        ),
-                                        low_budget_capacity=self.config.ttrl.get(
-                                            "sps_low_budget_capacity", False
-                                        ),
-                                        low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
-                                        low_budget_disagreement_penalty=self.config.ttrl.get(
-                                            "sps_low_budget_disagreement_penalty", 0.35
-                                        ),
-                                        base_support_capacity=self.config.ttrl.get(
-                                            "sps_base_support_capacity", False
-                                        ),
-                                        base_support_temperature=self.config.ttrl.get(
-                                            "sps_base_support_temperature", 1.0
-                                        ),
-                                        base_support_disagreement_penalty=self.config.ttrl.get(
-                                            "sps_base_support_disagreement_penalty", 0.35
-                                        ),
-                                        cross_view_capacity=self.config.ttrl.get(
-                                            "sps_cross_view_capacity", False
-                                        ),
-                                        cross_view_disagreement_penalty=self.config.ttrl.get(
-                                            "sps_cross_view_disagreement_penalty", 0.35
-                                        ),
-                                        margin_capacity=self.config.ttrl.get(
-                                            "sps_margin_capacity", False
-                                        ),
-                                        margin_capacity_floor=self.config.ttrl.get(
-                                            "sps_margin_capacity_floor", 0.35
-                                        ),
-                                        process_consistency_capacity=self.config.ttrl.get(
-                                            "sps_process_consistency_capacity", False
-                                        ),
-                                        process_tail_fraction=self.config.ttrl.get(
-                                            "sps_process_tail_fraction", 0.5
-                                        ),
-                                        process_disagreement_penalty=self.config.ttrl.get(
-                                            "sps_process_disagreement_penalty", 0.35
-                                        ),
+                                if sps_mode == "direct_sharpened_prob":
+                                    with marked_timer("sps_direct_sharpened_reward", timing_raw):
+                                        batch, sps_reward_tensor, sps_info = apply_direct_sharpened_ttrl_reward(
+                                            batch=batch,
+                                            gen_batch_output=gen_batch_output,
+                                            n=K,
+                                            tokenizer=self.tokenizer,
+                                            ref_log_prob=base_lp.batch["ref_log_prob"],
+                                            rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                            response_mask=response_mask,
+                                            beta=self.config.ttrl.get("sps_direct_beta", 4.0),
+                                            target_temperature=self.config.ttrl.get(
+                                                "sps_direct_target_temperature", 1.0
+                                            ),
+                                            length_normalize=self.config.ttrl.get(
+                                                "sps_length_normalize", True
+                                            ),
+                                            reward_scale=self.config.ttrl.get(
+                                                "sps_direct_reward_scale", 1.0
+                                            ),
+                                            per_sample_mode=self.config.ttrl.get(
+                                                "sps_direct_per_sample_mode", "answer_mass"
+                                            ),
+                                            reward_floor=self.config.ttrl.get(
+                                                "sps_direct_reward_floor", 0.0
+                                            ),
+                                            low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
+                                            process_tail_fraction=self.config.ttrl.get(
+                                                "sps_process_tail_fraction", 0.5
+                                            ),
+                                        )
+                                    gen_batch_output = gen_batch_output.union(
+                                        DataProto.from_dict(tensors={"sps_reward": sps_reward_tensor})
                                     )
+                                else:
+                                    with marked_timer("sps_apply_weighted_gt", timing_raw):
+                                        batch = apply_sps_weighted_ttrl_gt(
+                                            batch=batch,
+                                            gen_batch_output=gen_batch_output,
+                                            n=K,
+                                            tokenizer=self.tokenizer,
+                                            ref_log_prob=base_lp.batch["ref_log_prob"],
+                                            rollout_log_probs=gen_batch_output.batch["rollout_log_probs"],
+                                            response_mask=response_mask,
+                                            alpha=1.0 / self.config.ttrl.get("sps_weight_temperature_base", sps_temp),
+                                            length_normalize=self.config.ttrl.get("sps_length_normalize", True),
+                                            weight_temperature=self.config.ttrl.get("sps_weight_temperature", 1.0),
+                                            use_majority_fallback=sps_mode == "answer_weighted_gate",
+                                            gate_confidence_threshold=self.config.ttrl.get("sps_gate_confidence_threshold", 0.8),
+                                            gate_majority_ratio_threshold=self.config.ttrl.get("sps_gate_majority_ratio_threshold", 0.75),
+                                            confidence_filter=sps_mode == "answer_conf_filter",
+                                            confidence_weight=sps_mode in ("answer_conf_weight", "answer_rule_conf_weight"),
+                                            filter_confidence_threshold=self.config.ttrl.get("sps_filter_confidence_threshold", 0.8),
+                                            filter_majority_ratio_threshold=self.config.ttrl.get("sps_filter_majority_ratio_threshold", 0.75),
+                                            weight_floor=self.config.ttrl.get("sps_weight_floor", 0.25),
+                                            clip_penalty=self.config.ttrl.get("sps_clip_penalty", 0.0),
+                                            weight_power=self.config.ttrl.get("sps_weight_power", 1.0),
+                                            answer_sharpen_beta=self.config.ttrl.get("sps_answer_sharpen_beta", 1.0),
+                                            answer_sharpen_capacity=self.config.ttrl.get("sps_answer_sharpen_capacity", False),
+                                            consistency_capacity=self.config.ttrl.get(
+                                                "sps_consistency_capacity", False
+                                            ),
+                                            consistency_disagreement_penalty=self.config.ttrl.get(
+                                                "sps_consistency_disagreement_penalty", 0.5
+                                            ),
+                                            low_budget_capacity=self.config.ttrl.get(
+                                                "sps_low_budget_capacity", False
+                                            ),
+                                            low_budget_k=self.config.ttrl.get("sps_low_budget_k", 4),
+                                            low_budget_disagreement_penalty=self.config.ttrl.get(
+                                                "sps_low_budget_disagreement_penalty", 0.35
+                                            ),
+                                            base_support_capacity=self.config.ttrl.get(
+                                                "sps_base_support_capacity", False
+                                            ),
+                                            base_support_temperature=self.config.ttrl.get(
+                                                "sps_base_support_temperature", 1.0
+                                            ),
+                                            base_support_disagreement_penalty=self.config.ttrl.get(
+                                                "sps_base_support_disagreement_penalty", 0.35
+                                            ),
+                                            cross_view_capacity=self.config.ttrl.get(
+                                                "sps_cross_view_capacity", False
+                                            ),
+                                            cross_view_disagreement_penalty=self.config.ttrl.get(
+                                                "sps_cross_view_disagreement_penalty", 0.35
+                                            ),
+                                            margin_capacity=self.config.ttrl.get(
+                                                "sps_margin_capacity", False
+                                            ),
+                                            margin_capacity_floor=self.config.ttrl.get(
+                                                "sps_margin_capacity_floor", 0.35
+                                            ),
+                                            process_consistency_capacity=self.config.ttrl.get(
+                                                "sps_process_consistency_capacity", False
+                                            ),
+                                            process_tail_fraction=self.config.ttrl.get(
+                                                "sps_process_tail_fraction", 0.5
+                                            ),
+                                            process_disagreement_penalty=self.config.ttrl.get(
+                                                "sps_process_disagreement_penalty", 0.35
+                                            ),
+                                            process_sample_weight=self.config.ttrl.get(
+                                                "sps_process_sample_weight", False
+                                            ),
+                                            process_sample_positive=self.config.ttrl.get(
+                                                "sps_process_sample_positive", 1.25
+                                            ),
+                                            process_sample_inconsistent=self.config.ttrl.get(
+                                                "sps_process_sample_inconsistent", 0.75
+                                            ),
+                                            process_sample_negative=self.config.ttrl.get(
+                                                "sps_process_sample_negative", 0.35
+                                            ),
+                                            process_sample_invalid=self.config.ttrl.get(
+                                                "sps_process_sample_invalid", 0.25
+                                            ),
+                                            low_budget_negative_reward=self.config.ttrl.get(
+                                                "sps_low_budget_negative_reward", False
+                                            ),
+                                            low_budget_negative_value=self.config.ttrl.get(
+                                                "sps_low_budget_negative_value", 0.35
+                                            ),
+                                            low_budget_negative_min_support=self.config.ttrl.get(
+                                                "sps_low_budget_negative_min_support", 0.65
+                                            ),
+                                            low_budget_negative_process_min=self.config.ttrl.get(
+                                                "sps_low_budget_negative_process_min", 0.70
+                                            ),
+                                            low_budget_negative_base_min=self.config.ttrl.get(
+                                                "sps_low_budget_negative_base_min", 0.65
+                                            ),
+                                            low_budget_soft_reward=self.config.ttrl.get(
+                                                "sps_low_budget_soft_reward", False
+                                            ),
+                                            low_budget_soft_value=self.config.ttrl.get(
+                                                "sps_low_budget_soft_value", 0.25
+                                            ),
+                                            low_budget_rescue_reward=self.config.ttrl.get(
+                                                "sps_low_budget_rescue_reward", False
+                                            ),
+                                            low_budget_rescue_value=self.config.ttrl.get(
+                                                "sps_low_budget_rescue_value", 0.15
+                                            ),
+                                            low_budget_rescue_min_base=self.config.ttrl.get(
+                                                "sps_low_budget_rescue_min_base", 0.08
+                                            ),
+                                            low_budget_rescue_min_process=self.config.ttrl.get(
+                                                "sps_low_budget_rescue_min_process", 0.50
+                                            ),
+                                            low_budget_rescue_min_cluster_mass=self.config.ttrl.get(
+                                                "sps_low_budget_rescue_min_cluster_mass", 0.03125
+                                            ),
+                                            low_budget_rescue_min_support=self.config.ttrl.get(
+                                                "sps_low_budget_rescue_min_support", 0.15
+                                            ),
+                                            low_budget_local_reward=self.config.ttrl.get(
+                                                "sps_low_budget_local_reward", False
+                                            ),
+                                            low_budget_local_value=self.config.ttrl.get(
+                                                "sps_low_budget_local_value", 0.12
+                                            ),
+                                            low_budget_local_min_mass=self.config.ttrl.get(
+                                                "sps_low_budget_local_min_mass", 0.50
+                                            ),
+                                            low_budget_local_min_base=self.config.ttrl.get(
+                                                "sps_low_budget_local_min_base", 0.08
+                                            ),
+                                            low_budget_local_min_process=self.config.ttrl.get(
+                                                "sps_low_budget_local_min_process", 0.50
+                                            ),
+                                            low_budget_local_min_support=self.config.ttrl.get(
+                                                "sps_low_budget_local_min_support", 0.15
+                                            ),
+                                            independent_support_reward=self.config.ttrl.get(
+                                                "sps_independent_support_reward", False
+                                            ),
+                                            independent_support_value=self.config.ttrl.get(
+                                                "sps_independent_support_value", 0.18
+                                            ),
+                                            independent_support_min_base=self.config.ttrl.get(
+                                                "sps_independent_support_min_base", 0.12
+                                            ),
+                                            independent_support_min_process=self.config.ttrl.get(
+                                                "sps_independent_support_min_process", 0.65
+                                            ),
+                                            independent_support_min_cluster_mass=self.config.ttrl.get(
+                                                "sps_independent_support_min_cluster_mass", 0.0625
+                                            ),
+                                            independent_support_min_support=self.config.ttrl.get(
+                                                "sps_independent_support_min_support", 0.20
+                                            ),
+                                            independent_support_entropy_gate=self.config.ttrl.get(
+                                                "sps_independent_support_entropy_gate", 1.15
+                                            ),
+                                            independent_support_allow_majority=self.config.ttrl.get(
+                                                "sps_independent_support_allow_majority", True
+                                            ),
+                                            independent_support_majority_margin_max=self.config.ttrl.get(
+                                                "sps_independent_support_majority_margin_max", 1.0
+                                            ),
+                                            independent_support_competition_min=self.config.ttrl.get(
+                                                "sps_independent_support_competition_min", 0.0
+                                            ),
+                                            process_answer_reward=self.config.ttrl.get(
+                                                "sps_process_answer_reward", False
+                                            ),
+                                            process_answer_value=self.config.ttrl.get(
+                                                "sps_process_answer_value", 0.16
+                                            ),
+                                            process_answer_min_base=self.config.ttrl.get(
+                                                "sps_process_answer_min_base", 0.10
+                                            ),
+                                            process_answer_min_process=self.config.ttrl.get(
+                                                "sps_process_answer_min_process", 0.60
+                                            ),
+                                            process_answer_min_support=self.config.ttrl.get(
+                                                "sps_process_answer_min_support", 0.20
+                                            ),
+                                            process_answer_majority_scale=self.config.ttrl.get(
+                                                "sps_process_answer_majority_scale", 0.50
+                                            ),
+                                            contrastive_alt_reward=self.config.ttrl.get(
+                                                "sps_contrastive_alt_reward", False
+                                            ),
+                                            contrastive_alt_value=self.config.ttrl.get(
+                                                "sps_contrastive_alt_value", 0.14
+                                            ),
+                                            contrastive_alt_majority_penalty=self.config.ttrl.get(
+                                                "sps_contrastive_alt_majority_penalty", 0.06
+                                            ),
+                                            contrastive_alt_min_base=self.config.ttrl.get(
+                                                "sps_contrastive_alt_min_base", 0.08
+                                            ),
+                                            contrastive_alt_min_process=self.config.ttrl.get(
+                                                "sps_contrastive_alt_min_process", 0.60
+                                            ),
+                                            contrastive_alt_min_support=self.config.ttrl.get(
+                                                "sps_contrastive_alt_min_support", 0.18
+                                            ),
+                                            contrastive_alt_sharp_min=self.config.ttrl.get(
+                                                "sps_contrastive_alt_sharp_min", 0.92
+                                            ),
+                                            contrastive_alt_effective_k_max=self.config.ttrl.get(
+                                                "sps_contrastive_alt_effective_k_max", 1.35
+                                            ),
+                                            contrastive_alt_low_budget_mass_min=self.config.ttrl.get(
+                                                "sps_contrastive_alt_low_budget_mass_min", 0.70
+                                            ),
+                                            contrastive_alt_majority_support_min=self.config.ttrl.get(
+                                                "sps_contrastive_alt_majority_support_min", 0.70
+                                            ),
+                                            entropy_band_capacity=self.config.ttrl.get(
+                                                "sps_entropy_band_capacity", False
+                                            ),
+                                            entropy_band_min_weight=self.config.ttrl.get(
+                                                "sps_entropy_band_min_weight", 0.45
+                                            ),
+                                            entropy_band_low_k=self.config.ttrl.get(
+                                                "sps_entropy_band_low_k", 1.25
+                                            ),
+                                            entropy_band_high_k=self.config.ttrl.get(
+                                                "sps_entropy_band_high_k", 4.0
+                                            ),
+                                            entropy_band_sharp_min=self.config.ttrl.get(
+                                                "sps_entropy_band_sharp_min", 0.92
+                                            ),
+                                            entropy_band_low_budget_mass_min=self.config.ttrl.get(
+                                                "sps_entropy_band_low_budget_mass_min", 0.70
+                                            ),
+                                            entropy_band_support_min=self.config.ttrl.get(
+                                                "sps_entropy_band_support_min", 0.70
+                                            ),
+                                            low_budget_rebalance_reward=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_reward", False
+                                            ),
+                                            low_budget_rebalance_alt_value=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_alt_value", 0.10
+                                            ),
+                                            low_budget_rebalance_majority_penalty=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_majority_penalty", 0.04
+                                            ),
+                                            low_budget_rebalance_sharp_min=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_sharp_min", 0.92
+                                            ),
+                                            low_budget_rebalance_effective_k_max=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_effective_k_max", 1.35
+                                            ),
+                                            low_budget_rebalance_mass_min=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_mass_min", 0.70
+                                            ),
+                                            low_budget_rebalance_support_min=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_support_min", 0.70
+                                            ),
+                                            low_budget_rebalance_min_base=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_min_base", 0.06
+                                            ),
+                                            low_budget_rebalance_min_process=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_min_process", 0.55
+                                            ),
+                                            low_budget_rebalance_min_support=self.config.ttrl.get(
+                                                "sps_low_budget_rebalance_min_support", 0.12
+                                            ),
+                                            process_quality_reward=self.config.ttrl.get(
+                                                "sps_process_quality_reward", False
+                                            ),
+                                            process_quality_positive=self.config.ttrl.get(
+                                                "sps_process_quality_positive", 0.08
+                                            ),
+                                            process_quality_negative=self.config.ttrl.get(
+                                                "sps_process_quality_negative", 0.10
+                                            ),
+                                            process_quality_sharp_min=self.config.ttrl.get(
+                                                "sps_process_quality_sharp_min", 0.92
+                                            ),
+                                            process_quality_effective_k_max=self.config.ttrl.get(
+                                                "sps_process_quality_effective_k_max", 1.35
+                                            ),
+                                            process_quality_mass_min=self.config.ttrl.get(
+                                                "sps_process_quality_mass_min", 0.70
+                                            ),
+                                            process_quality_majority_scale=self.config.ttrl.get(
+                                                "sps_process_quality_majority_scale", 0.25
+                                            ),
+                                            process_quality_nonmajority_scale=self.config.ttrl.get(
+                                                "sps_process_quality_nonmajority_scale", 1.0
+                                            ),
+                                            process_quality_bad_majority_scale=self.config.ttrl.get(
+                                                "sps_process_quality_bad_majority_scale", 1.0
+                                            ),
+                                            process_quality_bad_nonmajority_scale=self.config.ttrl.get(
+                                                "sps_process_quality_bad_nonmajority_scale", 0.5
+                                            ),
+                                            anti_collapse_capacity=self.config.ttrl.get(
+                                                "sps_anti_collapse_capacity", False
+                                            ),
+                                            anti_collapse_min_weight=self.config.ttrl.get(
+                                                "sps_anti_collapse_min_weight", 0.45
+                                            ),
+                                            anti_collapse_sharp_min=self.config.ttrl.get(
+                                                "sps_anti_collapse_sharp_min", 0.95
+                                            ),
+                                            anti_collapse_effective_k_max=self.config.ttrl.get(
+                                                "sps_anti_collapse_effective_k_max", 1.25
+                                            ),
+                                            anti_collapse_low_budget_mass_min=self.config.ttrl.get(
+                                                "sps_anti_collapse_low_budget_mass_min", 0.75
+                                            ),
+                                            anti_collapse_margin_gap_min=self.config.ttrl.get(
+                                                "sps_anti_collapse_margin_gap_min", 0.15
+                                            ),
+                                            support_conflict_capacity=self.config.ttrl.get(
+                                                "sps_support_conflict_capacity", False
+                                            ),
+                                            support_conflict_min_weight=self.config.ttrl.get(
+                                                "sps_support_conflict_min_weight", 0.15
+                                            ),
+                                            support_conflict_sharp_min=self.config.ttrl.get(
+                                                "sps_support_conflict_sharp_min", 0.90
+                                            ),
+                                            support_conflict_effective_k_max=self.config.ttrl.get(
+                                                "sps_support_conflict_effective_k_max", 2.0
+                                            ),
+                                            support_conflict_base_min=self.config.ttrl.get(
+                                                "sps_support_conflict_base_min", 0.55
+                                            ),
+                                            support_conflict_low_budget_min=self.config.ttrl.get(
+                                                "sps_support_conflict_low_budget_min", 0.50
+                                            ),
+                                            support_conflict_process_min=self.config.ttrl.get(
+                                                "sps_support_conflict_process_min", 0.70
+                                            ),
+                                        )
                                 with marked_timer("sps_compute_reward", timing_raw):
                                     sps_reward_tensor, sps_info = compute_sps_reward(
                                         ref_log_prob=base_lp.batch["ref_log_prob"],
@@ -1544,7 +2239,114 @@ class RayPPOTrainer:
                                     sps_info["sps/low_budget_majority_margin"] = float(
                                         batch.non_tensor_batch["sps_low_budget_majority_margin_list"].mean()
                                     )
+                                if "sps_entropy_band_capacity_list" in batch.non_tensor_batch:
+                                    sps_info["sps/entropy_band_capacity"] = float(
+                                        batch.non_tensor_batch["sps_entropy_band_capacity_list"].mean()
+                                    )
+                                    sps_info["sps/entropy_band_low_active_rate"] = float(
+                                        batch.non_tensor_batch["sps_entropy_band_low_active_list"].mean()
+                                    )
+                                    sps_info["sps/entropy_band_high_active_rate"] = float(
+                                        batch.non_tensor_batch["sps_entropy_band_high_active_list"].mean()
+                                    )
+                                    sps_info["sps/entropy_band_score"] = float(
+                                        batch.non_tensor_batch["sps_entropy_band_score_list"].mean()
+                                    )
+                                if "sps_low_budget_rebalance_reward_mean_list" in batch.non_tensor_batch:
+                                    sps_info["sps/low_budget_rebalance_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rebalance_alt_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_alt_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rebalance_majority_penalty_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_majority_penalty_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rebalance_gate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_gate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rebalance_support"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_support_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rebalance_base"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_base_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rebalance_process"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rebalance_process_list"
+                                        ].mean()
+                                    )
+                                if "sps_process_quality_reward_mean_list" in batch.non_tensor_batch:
+                                    sps_info["sps/process_quality_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_quality_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_quality_positive_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_quality_positive_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_quality_negative_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_quality_negative_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_quality_bad_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_quality_bad_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_quality_collapse_gate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_quality_collapse_gate_list"
+                                        ].mean()
+                                    )
                                 if "sps_process_consistency_capacity_list" in batch.non_tensor_batch:
+                                    if "sps_anti_collapse_capacity_list" in batch.non_tensor_batch:
+                                        sps_info["sps/anti_collapse_capacity"] = float(
+                                            batch.non_tensor_batch[
+                                                "sps_anti_collapse_capacity_list"
+                                            ].mean()
+                                        )
+                                        sps_info["sps/anti_collapse_active_rate"] = float(
+                                            batch.non_tensor_batch[
+                                                "sps_anti_collapse_active_list"
+                                            ].mean()
+                                        )
+                                        sps_info["sps/anti_collapse_margin_gap"] = float(
+                                            batch.non_tensor_batch[
+                                                "sps_anti_collapse_margin_gap_list"
+                                            ].mean()
+                                        )
+                                    if "sps_support_conflict_capacity_list" in batch.non_tensor_batch:
+                                        sps_info["sps/support_conflict_capacity"] = float(
+                                            batch.non_tensor_batch[
+                                                "sps_support_conflict_capacity_list"
+                                            ].mean()
+                                        )
+                                        sps_info["sps/support_conflict_active_rate"] = float(
+                                            batch.non_tensor_batch[
+                                                "sps_support_conflict_active_list"
+                                            ].mean()
+                                        )
+                                        sps_info["sps/support_conflict_score"] = float(
+                                            batch.non_tensor_batch[
+                                                "sps_support_conflict_score_list"
+                                            ].mean()
+                                        )
                                     sps_info["sps/process_consistency_capacity"] = float(
                                         batch.non_tensor_batch[
                                             "sps_process_consistency_capacity_list"
@@ -1570,6 +2372,214 @@ class RayPPOTrainer:
                                     sps_info["sps/process_revision_after_final_rate"] = float(
                                         batch.non_tensor_batch[
                                             "sps_process_revision_after_final_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_sample_weight"] = float(
+                                        batch.non_tensor_batch["sps_process_sample_weight_list"].mean()
+                                    )
+                                    sps_info["sps/process_sample_positive_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_sample_positive_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_sample_inconsistent_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_sample_inconsistent_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_sample_negative_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_sample_negative_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_sample_invalid_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_sample_invalid_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_negative_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_negative_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_negative_gate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_negative_gate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_soft_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_soft_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_soft_reward_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_soft_reward_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_soft_nonmajority_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_soft_nonmajority_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_soft_nonmajority_reward"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_soft_nonmajority_reward_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_soft_support_effective_K"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_soft_support_effective_k_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rescue_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rescue_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rescue_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rescue_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rescue_support"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rescue_support_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_rescue_cluster_mass"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_rescue_cluster_mass_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_local_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_local_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_local_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_local_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_local_support"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_local_support_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_local_mass"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_local_mass_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/low_budget_local_agreement"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_low_budget_local_agreement_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_nonmajority_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_nonmajority_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_value"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_value_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_effective_K"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_effective_k_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_margin"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_margin_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_competition_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_competition_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/independent_support_majority_gate_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_independent_support_majority_gate_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_answer_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_answer_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_answer_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_answer_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_answer_nonmajority_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_answer_nonmajority_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_answer_support"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_answer_support_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_answer_base"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_answer_base_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/process_answer_process"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_process_answer_process_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_reward_mean"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_reward_mean_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_majority_penalty_rate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_majority_penalty_rate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_gate"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_gate_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_support"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_support_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_base"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_base_list"
+                                        ].mean()
+                                    )
+                                    sps_info["sps/contrastive_alt_process"] = float(
+                                        batch.non_tensor_batch[
+                                            "sps_contrastive_alt_process_list"
                                         ].mean()
                                     )
                                 if sps_mode != "answer_rule_conf_weight":
@@ -1945,6 +2955,236 @@ class RayPPOTrainer:
                                         reward_tensor.sum(-1).to(torch.float32).mean().item()
                                     )
 
+                        if (
+                            self.config.get("ttrl", {}).get("enable", False)
+                            and self.config.ttrl.get("sps_enable", False)
+                        ):
+                            if (
+                                self.config.ttrl.get("sps_low_budget_negative_reward", False)
+                                and "sps_low_budget_negative_reward" in batch.non_tensor_batch
+                            ):
+                                low_budget_negative = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_low_budget_negative_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert low_budget_negative.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                negative_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                negative_reward.scatter_(1, idx, low_budget_negative.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + negative_reward
+                                )
+                                with torch.no_grad():
+                                    active = (low_budget_negative != 0).to(torch.float32)
+                                    metrics["train/sps_low_budget_negative_reward_applied"] = float(
+                                        low_budget_negative.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_low_budget_negative_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_low_budget_soft_reward", False)
+                                and "sps_low_budget_soft_reward" in batch.non_tensor_batch
+                            ):
+                                low_budget_soft = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_low_budget_soft_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert low_budget_soft.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                soft_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                soft_reward.scatter_(1, idx, low_budget_soft.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + soft_reward
+                                )
+                                with torch.no_grad():
+                                    active = (low_budget_soft != 0).to(torch.float32)
+                                    metrics["train/sps_low_budget_soft_reward_applied"] = float(
+                                        low_budget_soft.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_low_budget_soft_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_low_budget_rescue_reward", False)
+                                and "sps_low_budget_rescue_reward" in batch.non_tensor_batch
+                            ):
+                                low_budget_rescue = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_low_budget_rescue_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert low_budget_rescue.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                rescue_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                rescue_reward.scatter_(1, idx, low_budget_rescue.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + rescue_reward
+                                )
+                                with torch.no_grad():
+                                    active = (low_budget_rescue != 0).to(torch.float32)
+                                    metrics["train/sps_low_budget_rescue_reward_applied"] = float(
+                                        low_budget_rescue.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_low_budget_rescue_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_low_budget_local_reward", False)
+                                and "sps_low_budget_local_reward" in batch.non_tensor_batch
+                            ):
+                                low_budget_local = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_low_budget_local_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert low_budget_local.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                local_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                local_reward.scatter_(1, idx, low_budget_local.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + local_reward
+                                )
+                                with torch.no_grad():
+                                    active = (low_budget_local != 0).to(torch.float32)
+                                    metrics["train/sps_low_budget_local_reward_applied"] = float(
+                                        low_budget_local.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_low_budget_local_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_independent_support_reward", False)
+                                and "sps_independent_support_reward" in batch.non_tensor_batch
+                            ):
+                                independent_support = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_independent_support_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert independent_support.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                support_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                support_reward.scatter_(1, idx, independent_support.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + support_reward
+                                )
+                                with torch.no_grad():
+                                    active = (independent_support != 0).to(torch.float32)
+                                    metrics["train/sps_independent_support_reward_applied"] = float(
+                                        independent_support.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_independent_support_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_process_answer_reward", False)
+                                and "sps_process_answer_reward" in batch.non_tensor_batch
+                            ):
+                                process_answer = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_process_answer_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert process_answer.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                pa_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                pa_reward.scatter_(1, idx, process_answer.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + pa_reward
+                                )
+                                with torch.no_grad():
+                                    active = (process_answer != 0).to(torch.float32)
+                                    metrics["train/sps_process_answer_reward_applied"] = float(
+                                        process_answer.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_process_answer_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_contrastive_alt_reward", False)
+                                and "sps_contrastive_alt_reward" in batch.non_tensor_batch
+                            ):
+                                contrastive_alt = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_contrastive_alt_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert contrastive_alt.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                alt_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                alt_reward.scatter_(1, idx, contrastive_alt.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + alt_reward
+                                )
+                                with torch.no_grad():
+                                    active = (contrastive_alt != 0).to(torch.float32)
+                                    metrics["train/sps_contrastive_alt_reward_applied"] = float(
+                                        contrastive_alt.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_contrastive_alt_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_low_budget_rebalance_reward", False)
+                                and "sps_low_budget_rebalance_reward" in batch.non_tensor_batch
+                            ):
+                                low_budget_rebalance = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_low_budget_rebalance_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert low_budget_rebalance.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                rebalance_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                rebalance_reward.scatter_(1, idx, low_budget_rebalance.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + rebalance_reward
+                                )
+                                with torch.no_grad():
+                                    active = (low_budget_rebalance != 0).to(torch.float32)
+                                    metrics["train/sps_low_budget_rebalance_reward_applied"] = float(
+                                        low_budget_rebalance.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_low_budget_rebalance_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+                            if (
+                                self.config.ttrl.get("sps_process_quality_reward", False)
+                                and "sps_process_quality_reward" in batch.non_tensor_batch
+                            ):
+                                process_quality = torch.as_tensor(
+                                    batch.non_tensor_batch["sps_process_quality_reward"],
+                                    device=batch.batch["token_level_scores"].device,
+                                    dtype=batch.batch["token_level_scores"].dtype,
+                                )
+                                assert process_quality.shape[0] == batch.batch["token_level_scores"].shape[0]
+                                valid_lens = batch.batch["response_mask"].sum(dim=-1).long().clamp(min=1)
+                                idx = (valid_lens - 1).unsqueeze(-1)
+                                pq_reward = torch.zeros_like(batch.batch["token_level_scores"])
+                                pq_reward.scatter_(1, idx, process_quality.unsqueeze(-1))
+                                batch.batch["token_level_scores"] = (
+                                    batch.batch["token_level_scores"] + pq_reward
+                                )
+                                with torch.no_grad():
+                                    active = (process_quality != 0).to(torch.float32)
+                                    metrics["train/sps_process_quality_reward_applied"] = float(
+                                        process_quality.to(torch.float32).mean().item()
+                                    )
+                                    metrics["train/sps_process_quality_active_rate"] = float(
+                                        active.mean().item()
+                                    )
+
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
@@ -1997,6 +3237,26 @@ class RayPPOTrainer:
                             batch.batch["token_level_scores"] = (
                                 batch.batch["token_level_scores"] * sample_weight.unsqueeze(-1)
                             )
+
+                        if (
+                            self.config.get("ttrl", {}).get("enable", False)
+                            and self.config.ttrl.get("sps_enable", False)
+                            and self.config.ttrl.get("sps_process_sample_weight", False)
+                            and "sps_sample_weight" in batch.non_tensor_batch
+                        ):
+                            sps_sample_weight = torch.as_tensor(
+                                batch.non_tensor_batch["sps_sample_weight"],
+                                device=batch.batch["token_level_scores"].device,
+                                dtype=batch.batch["token_level_scores"].dtype,
+                            )
+                            assert sps_sample_weight.shape[0] == batch.batch["token_level_scores"].shape[0]
+                            batch.batch["token_level_scores"] = (
+                                batch.batch["token_level_scores"] * sps_sample_weight.unsqueeze(-1)
+                            )
+                            with torch.no_grad():
+                                metrics["train/sps_process_sample_weight_applied"] = float(
+                                    sps_sample_weight.to(torch.float32).mean().item()
+                                )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

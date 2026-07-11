@@ -360,6 +360,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sync_module_states = fsdp_config.get("sync_module_states", True)
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -375,7 +376,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
+                sync_module_states=sync_module_states,
                 device_mesh=self.device_mesh,
                 use_orig_params=self.config.actor.fsdp_config.get("use_orig_params", False),
                 forward_prefetch=self.config.actor.fsdp_config.get("forward_prefetch", False),
@@ -819,7 +820,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        # SPS needs the *base* (temperature=1.0) sequence logprob. Allow callers to
+        # override the temperature used for ref logprob via meta_info; default keeps
+        # the original behavior (rollout.temperature).
+        ref_temperature = data.meta_info.get("ref_temperature_override", None)
+        data.meta_info["temperature"] = (
+            ref_temperature if ref_temperature is not None else self.config.rollout.temperature
+        )
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
@@ -1095,6 +1102,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sync_module_states = self.config.model.fsdp_config.get("sync_module_states", True)
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         if config.strategy == "fsdp":
@@ -1106,7 +1114,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
+                sync_module_states=sync_module_states,
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
                 cpu_offload=None,
@@ -1392,6 +1400,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sync_module_states = self.config.model.fsdp_config.get("sync_module_states", True)
 
         if config.strategy == "fsdp":
             reward_module = FSDP(
@@ -1401,7 +1410,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
-                sync_module_states=True,
+                sync_module_states=sync_module_states,
                 cpu_offload=CPUOffload(offload_params=True),
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,

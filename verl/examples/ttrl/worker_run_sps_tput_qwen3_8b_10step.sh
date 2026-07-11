@@ -14,6 +14,7 @@ LOCAL_MODEL=${LOCAL_MODEL:-/tmp/qwen3_8b_local_v21_answer_sharpen}
 
 echo "WORKER_QWEN3_8B_TPUT_START exp=${EXP_NAME} $(date '+%F %T')" | tee "$LOG"
 echo "HOST $(hostname)" | tee -a "$LOG"
+bash /opt/tiger/TTRL/verl/examples/ttrl/check_cuda_compat_preflight.sh 2>&1 | tee -a "$LOG"
 if [ ! -e /proc/self ] || [ ! -e /proc/meminfo ]; then
   echo "WORKER_QWEN3_8B_TPUT_PROC_BAD $(date '+%F %T')" | tee -a "$LOG"
   ls -ld /proc /proc/self /proc/meminfo 2>&1 | tee -a "$LOG" || true

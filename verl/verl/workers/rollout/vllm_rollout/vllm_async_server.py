@@ -31,7 +31,13 @@ from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
-from vllm.worker.worker_base import WorkerWrapperBase
+
+# vllm v1 moved WorkerWrapperBase from `vllm.worker.worker_base` to
+# `vllm.v1.worker.worker_base`.
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ImportError:  # vllm v1
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
