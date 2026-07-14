@@ -1137,19 +1137,26 @@ class RayPPOTrainer:
                         if self.config.get("ttrl", {}).get("enable", False):
                             from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt
 
-                            gen_batch.meta_info["kwargs"] = {"n": self.config.ttrl.n_votes_per_prompt}
+                            powerflow_no_majority = self.config.ttrl.get("powerflow_no_majority", False)
+                            rollout_n = (
+                                self.config.ttrl.n_samples_per_prompt
+                                if powerflow_no_majority
+                                else self.config.ttrl.n_votes_per_prompt
+                            )
+                            gen_batch.meta_info["kwargs"] = {"n": rollout_n}
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                            assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_votes_per_prompt
+                            assert len(gen_batch_output) == len(batch) * rollout_n
 
-                            batch = apply_ttrl_gt(
-                                batch,
-                                gen_batch_output,
-                                self.config.ttrl.n_votes_per_prompt,
-                                self.tokenizer,
-                                self.config.ttrl.get("majority_vote_num_processes", 0),
-                            )
-                            gen_batch_output = select_top_k_per_prompt(gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.config.ttrl.n_samples_per_prompt)
+                            if not powerflow_no_majority:
+                                batch = apply_ttrl_gt(
+                                    batch,
+                                    gen_batch_output,
+                                    self.config.ttrl.n_votes_per_prompt,
+                                    self.tokenizer,
+                                    self.config.ttrl.get("majority_vote_num_processes", 0),
+                                )
+                                gen_batch_output = select_top_k_per_prompt(gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.config.ttrl.n_samples_per_prompt)
 
                             assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
                         else:
@@ -1276,36 +1283,51 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        powerflow_enabled = self.config.actor_rollout_ref.actor.get("powerflow_enable", False)
+                        if powerflow_enabled:
+                            batch.batch["boxed_reward"] = reward_tensor
+                            batch.batch["token_level_scores"] = torch.zeros_like(reward_tensor)
+                            batch.batch["token_level_rewards"] = torch.zeros_like(reward_tensor)
+                            batch.batch["advantages"] = torch.zeros_like(reward_tensor)
+                            batch.batch["returns"] = torch.zeros_like(reward_tensor)
+                            metrics["train/powerflow_observed_reward"] = (
+                                reward_tensor.sum(dim=-1).float().mean().detach().item()
+                            )
+                            metrics["train/powerflow_no_majority"] = float(
+                                self.config.ttrl.get("powerflow_no_majority", False)
+                            )
+                        else:
+                            batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                        if not powerflow_enabled:
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # compute advantages, executed on the driver process
+
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                config=self.config.algorithm,
                             )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            config=self.config.algorithm,
-                        )
 
                     # update critic
                     if self.use_critic:
@@ -1323,7 +1345,7 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    if self.config.get("ttrl", {}).get("enable", False):
+                    if self.config.get("ttrl", {}).get("enable", False) and not self.config.ttrl.get("powerflow_no_majority", False):
                         from verl.trainer.ppo.ttrl_utils import apply_original_gt, compute_ttrl_metrics
                         batch = apply_original_gt(batch)
                         reward_tensor_original, reward_extra_infos_dict_original = compute_reward(batch, self.reward_fn)

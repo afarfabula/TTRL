@@ -19,3 +19,7 @@ ttrl:
   # CPU processes for majority-vote answer extraction/simplification. 0 keeps
   # the original serial path.
   majority_vote_num_processes: 0
+
+  # Skip majority pseudo-label generation for verifier-free PowerFlow-style
+  # experiments. This keeps validation unchanged and only affects training.
+  powerflow_no_majority: false

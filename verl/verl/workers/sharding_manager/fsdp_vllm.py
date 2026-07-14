@@ -199,7 +199,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 params = __collect_lora_params()
             else:
                 params = self.module.state_dict()
+            params = {name: param for name, param in params.items() if not name.startswith("proj_z")}
             params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+            params = {name: param for name, param in params.items() if not name.startswith("proj_z")}
             log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
             if self.rollout_config.free_cache_engine:

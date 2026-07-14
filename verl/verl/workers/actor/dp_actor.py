@@ -50,6 +50,36 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def masked_std(values, mask, axis):
+    """Compute standard deviation over masked sequence summaries."""
+    mean = verl_F.masked_mean(values, mask, axis=axis)
+    total_mean = verl_F.masked_mean(values, mask)
+    return ((mean - total_mean) ** 2).mean(axis=axis) ** 0.5
+
+
+class ProjZModule(torch.nn.Module):
+    """Small projection head used by PowerFlow to estimate log Z."""
+
+    def __init__(self, hidden_size: int, num_layers: int = 3, dropout: float = 0.1, init_offset: float = 1.08):
+        super().__init__()
+        layers = []
+        for _ in range(num_layers - 1):
+            layers.extend(
+                [
+                    torch.nn.Linear(hidden_size, hidden_size),
+                    torch.nn.GELU(),
+                    torch.nn.LayerNorm(hidden_size),
+                    torch.nn.Dropout(dropout),
+                ]
+            )
+        layers.append(torch.nn.Linear(hidden_size, 1))
+        self.net = torch.nn.Sequential(*layers)
+        self.init_offset = init_offset
+
+    def forward(self, x):
+        return self.net(x) - self.init_offset
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -78,9 +108,19 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self.powerflow_beta_coef = self.config.get("powerflow_beta_coef", 4.0)
+
+    def _powerflow_project_log_z(self, avg_hidden):
+        proj_z = getattr(self.actor_module, "proj_z", None)
+        if proj_z is None:
+            wrapped = getattr(self.actor_module, "_fsdp_wrapped_module", None)
+            proj_z = getattr(wrapped, "proj_z", None) if wrapped is not None else None
+        if proj_z is None:
+            raise RuntimeError("PowerFlow is enabled but actor module has no proj_z head.")
+        return proj_z(avg_hidden)
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self, micro_batch, temperature, calculate_entropy=False, return_log_z=False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -170,6 +210,7 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
+                    output_hidden_states=True if return_log_z else False,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
@@ -249,6 +290,7 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
+                    output_hidden_states=True if return_log_z else False,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
@@ -268,7 +310,103 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
+            if return_log_z:
+                last_hidden = output.hidden_states[-1]
+                if self.use_remove_padding:
+                    last_hidden = last_hidden.squeeze(0)
+                    if self.use_ulysses_sp:
+                        last_hidden = gather_outpus_and_unpad(
+                            last_hidden,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    full_last_hidden = pad_input(
+                        hidden_states=last_hidden,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                else:
+                    full_last_hidden = last_hidden
+
+                prompt_hidden = full_last_hidden[:, : -response_length - 1]
+                prompt_attention_mask = attention_mask[:, : -response_length - 1]
+                avg_hidden = verl_F.masked_mean(prompt_hidden, prompt_attention_mask.unsqueeze(-1), axis=1)
+                log_z = self._powerflow_project_log_z(avg_hidden)
+                return entropy, log_probs, log_z
+
             return entropy, log_probs
+
+    def compute_powerflow(
+        self,
+        log_prob,
+        ref_log_prob,
+        old_log_prob,
+        response_mask,
+        log_z,
+        boxed_reward=None,
+        rollout_log_probs=None,
+        use_boxed_reward=False,
+    ):
+        log_ratio = log_prob - old_log_prob
+        ratio = torch.exp(log_ratio)
+        condition_1 = ratio > 1.0 + self.config.get("clip_ratio_high", 0.28)
+        condition_2 = ratio < 1.0 - self.config.get("clip_ratio_low", 0.2)
+        cispo_mask = (~(condition_1 | condition_2)).float()
+        combined_mask = response_mask * cispo_mask
+
+        log_z = log_z.squeeze(-1)
+        avg_log_prob = verl_F.masked_mean(log_prob, combined_mask, axis=1)
+        avg_ref_log_prob = verl_F.masked_mean(ref_log_prob, combined_mask, axis=1)
+
+        if boxed_reward is None:
+            boxed_reward = torch.zeros_like(response_mask, dtype=torch.float32)
+        sequence_boxed_reward = verl_F.masked_sum(boxed_reward, combined_mask, axis=1)
+
+        if use_boxed_reward:
+            delta = log_z + avg_log_prob - self.powerflow_beta_coef * (
+                avg_ref_log_prob + (sequence_boxed_reward - 1) / 2
+            )
+        else:
+            delta = log_z + avg_log_prob - self.powerflow_beta_coef * avg_ref_log_prob
+
+        log_w = verl_F.masked_sum(log_prob - old_log_prob, combined_mask, axis=1)
+        imp_w_raw = torch.exp(log_w).detach()
+        imp_w = torch.clamp(
+            imp_w_raw,
+            1 - self.config.get("clip_ratio_low", 0.2),
+            1 + self.config.get("clip_ratio_high", 0.28),
+        )
+        avg_loss = torch.mean(imp_w * (delta**2))
+
+        ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
+        ref_kl = verl_F.masked_mean(-(log_prob - ref_log_prob), response_mask)
+        total_tokens = response_mask.sum()
+        cispo_dropped = (response_mask * (1 - cispo_mask)).sum()
+        cispo_mask_ratio = cispo_dropped / (total_tokens + 1e-8)
+
+        metrics = {
+            "actor/pg_loss": avg_loss.detach().item(),
+            "actor/powerflow_loss": avg_loss.detach().item(),
+            "actor/log_prob": verl_F.masked_mean(log_prob, response_mask).detach().item(),
+            "actor/old_log_prob": verl_F.masked_mean(old_log_prob, response_mask).detach().item(),
+            "actor/ref_log_prob": verl_F.masked_mean(ref_log_prob, response_mask).detach().item(),
+            "actor/ref_log_prob/std": masked_std(ref_log_prob, response_mask, axis=-1).detach().item(),
+            "actor/boxed_reward/mean": sequence_boxed_reward.mean().detach().item(),
+            "actor/boxed_reward/min": sequence_boxed_reward.min().detach().item(),
+            "actor/boxed_reward/max": sequence_boxed_reward.max().detach().item(),
+            "actor/log_z": log_z.mean().detach().item(),
+            "actor/importance_weight": imp_w.mean().detach().item(),
+            "actor/ppo_kl": ppo_kl.detach().item(),
+            "actor/ref_kl": ref_kl.detach().item(),
+            "actor/beta_coef": float(self.powerflow_beta_coef),
+            "actor/cispo_mask_ratio": cispo_mask_ratio.detach().item(),
+            "actor/cispo_dropped_tokens": cispo_dropped.detach().item(),
+            "actor/condition_1_count": (condition_1 * response_mask).sum().detach().item(),
+            "actor/condition_2_count": (condition_2 * response_mask).sum().detach().item(),
+        }
+        return avg_loss, metrics
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -393,7 +531,12 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
-        if self.config.use_kl_loss:
+        if self.config.get("powerflow_enable", False):
+            select_keys.append("boxed_reward")
+            select_keys.append("ref_log_prob")
+            if "rollout_log_probs" in data.batch:
+                select_keys.append("rollout_log_probs")
+        if self.config.use_kl_loss and "ref_log_prob" not in select_keys:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -470,7 +613,7 @@ class DataParallelPPOActor(BasePPOActor):
                         data = data.to(get_device_id())  # actor device is cpu when using offload
                     response_mask = data["response_mask"]
                     old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
+                    advantages = data.get("advantages", torch.zeros_like(response_mask, dtype=torch.float32))
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = (
@@ -487,47 +630,85 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-
-                    if self.config.policy_loss.loss_mode == "vanilla":
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                            old_log_prob=old_log_prob,
+                    if self.config.get("powerflow_enable", False):
+                        entropy, log_prob, log_z = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            calculate_entropy=False,
+                            return_log_z=True,
+                        )
+                        if self.config.get("powerflow_on_policy", False):
+                            old_log_prob = log_prob.detach()
+                        ref_log_prob = data["ref_log_prob"]
+                        boxed_reward = data.get("boxed_reward")
+                        policy_loss, powerflow_metrics = self.compute_powerflow(
                             log_prob=log_prob,
-                            advantages=advantages,
+                            ref_log_prob=ref_log_prob,
+                            old_log_prob=old_log_prob,
                             response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
+                            log_z=log_z,
+                            boxed_reward=boxed_reward,
+                            rollout_log_probs=data.get("rollout_log_probs"),
+                            use_boxed_reward=self.config.get("powerflow_use_boxed_reward", False),
                         )
+                        pg_loss = policy_loss
+                        micro_batch_metrics.update(powerflow_metrics)
+                        micro_batch_metrics["actor/pg_clipfrac"] = 0.0
+                        micro_batch_metrics["actor/pg_clipfrac_lower"] = 0.0
                     else:
-                        policy_loss_fn = get_policy_loss_fn(loss_mode)
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                            old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config
+                        entropy, log_prob = self._forward_micro_batch(
+                            micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
                         )
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
+                        if self.config.policy_loss.loss_mode == "vanilla":
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                        else:
+                            policy_loss_fn = get_policy_loss_fn(loss_mode)
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, self.config
+                            )
+
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                            # compute policy loss
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
+
+                        micro_batch_metrics.update(
+                            {
+                                "actor/pg_loss": pg_loss.detach().item(),
+                                "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                                "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            }
+                        )
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        if self.config.get("powerflow_enable", False):
+                            kl_loss = torch.zeros((), device=log_prob.device)
+                        else:
+                            # compute kl loss
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item()
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
@@ -538,14 +719,6 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
-                    micro_batch_metrics.update(
-                        {
-                            "actor/pg_loss": pg_loss.detach().item(),
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        }
-                    )
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

@@ -221,6 +221,27 @@ actor_rollout_ref:
     # Whether to use KL loss instead of KL reward penalty. True for GRPO
     use_kl_loss: false
 
+    # Enable PowerFlow trajectory-balance actor loss instead of PPO/GRPO loss.
+    # Default is disabled to preserve normal PPO/TTRL behavior.
+    powerflow_enable: false
+
+    # PowerFlow beta coefficient used in the trajectory-balance residual.
+    powerflow_beta_coef: 4.0
+
+    # Initial average reference log probability used to initialize the log-Z head offset.
+    powerflow_init_ref_log_prob: 0.36
+
+    # Number of hidden layers in the PowerFlow log-Z projection head.
+    powerflow_proj_layers: 3
+
+    # If true, include rule/reward score in PowerFlow residual. For verifier-free
+    # experiments this should stay false.
+    powerflow_use_boxed_reward: false
+
+    # If true, use current log probabilities as old log probabilities in the
+    # PowerFlow update. This is mainly useful for debugging.
+    powerflow_on_policy: false
+
     # Whether to use torch.compile()
     use_torch_compile: true
 

@@ -332,6 +332,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             _verify_attn_implementation(actor_module, attn_implementation, role, self.rank)
 
+            if role == "actor" and self._is_actor and self.config.actor.get("powerflow_enable", False):
+                from verl.workers.actor.dp_actor import ProjZModule
+
+                hidden_size = actor_module.config.hidden_size
+                proj_layers = self.config.actor.get("powerflow_proj_layers", 3)
+                init_ref_log_prob = self.config.actor.get("powerflow_init_ref_log_prob", 0.36)
+                beta_coef = self.config.actor.get("powerflow_beta_coef", 4.0)
+                init_offset = init_ref_log_prob * (beta_coef - 1)
+                actor_module.add_module(
+                    "proj_z",
+                    ProjZModule(hidden_size, num_layers=proj_layers, init_offset=init_offset),
+                )
+                if self.rank == 0:
+                    print(
+                        "[PowerFlow] Added proj_z "
+                        f"(layers={proj_layers}, hidden={hidden_size}, init_offset={init_offset})"
+                    )
+
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
@@ -398,6 +416,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_rollout and self.config.rollout.name == "hf":
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
             auto_wrap_policy = None
+
+        if role == "actor" and self._is_actor and self.config.actor.get("powerflow_enable", False):
+            from verl.workers.actor.dp_actor import ProjZModule
+
+            original_wrap_policy = auto_wrap_policy
+
+            def powerflow_wrap_policy(module, recurse, nonwrapped_numel):
+                if isinstance(module, ProjZModule):
+                    return True
+                if original_wrap_policy is not None:
+                    return original_wrap_policy(module, recurse, nonwrapped_numel)
+                return False
+
+            auto_wrap_policy = powerflow_wrap_policy
+            if self.rank == 0:
+                print("[PowerFlow] Updated auto_wrap_policy to wrap ProjZModule")
 
         if self.rank == 0:
             print(f"wrap_policy: {auto_wrap_policy}")
