@@ -31,6 +31,7 @@ import os
 import pickle
 import socket
 import threading
+import inspect
 from contextlib import contextmanager
 from copy import deepcopy
 from types import MethodType
@@ -45,18 +46,37 @@ from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
+from vllm.engine.arg_utils import EngineArgs
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+try:
+    from vllm.model_executor.sampling_metadata import SamplingMetadata
+except ModuleNotFoundError:
+    SamplingMetadata = Any
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _filter_supported_engine_kwargs(engine_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep vLLM extra kwargs compatible across vLLM releases."""
+    supported = set(inspect.signature(EngineArgs.__init__).parameters)
+    supported.discard("self")
+    dropped = sorted(key for key in engine_kwargs if key not in supported)
+    if dropped:
+        logger.warning("Dropping unsupported vLLM engine kwargs for this version: %s", dropped)
+    return {key: value for key, value in engine_kwargs.items() if key in supported}
 
 # TODO
 # 1. support pp in vllm
@@ -155,6 +175,7 @@ class vLLMRollout(BaseRollout):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+        engine_kwargs = _filter_supported_engine_kwargs(engine_kwargs)
 
         self.inference_engine = LLM(
             model=model_path,

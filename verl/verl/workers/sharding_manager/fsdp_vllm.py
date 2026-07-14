@@ -65,6 +65,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         offload_param: bool = False,
         load_format: str = "dummy_hf",
         layered_summon: bool = True,
+        is_lora: bool = False,
     ):
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer initialized in vLLMAsyncRollout.load_model
@@ -84,6 +85,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.offload_param = offload_param
         self.load_format = load_format
         self.layered_summon = layered_summon
+        self.is_lora = is_lora
 
         # Full params
         self.full_params = full_params
@@ -113,7 +115,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.gen_random_states = None
 
         self.base_sync_done: bool = "dummy" not in load_format
-        if is_version_ge(pkg="vllm", minver="0.7.3"):
+        if self.is_lora and is_version_ge(pkg="vllm", minver="0.7.3"):
             VLLMHijack.hijack()
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)

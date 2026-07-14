@@ -16,7 +16,9 @@ the class for Worker
 """
 
 import os
+import re
 import socket
+import time
 from dataclasses import dataclass
 from typing import Dict
 
@@ -58,6 +60,9 @@ class WorkerHelper:
         host_ip_by_env = host_ipv4 or host_ipv6
         host_ip_by_sdk = get_node_ip_by_sdk()
 
+        if os.getenv("WG_BACKEND", None) == "ray":
+            return host_ipv4 or host_ip_by_sdk
+
         host_ip = host_ip_by_env or host_ip_by_sdk
         return host_ip
 
@@ -84,6 +89,11 @@ class Worker(WorkerHelper):
 
     fused_worker_attr_name = "fused_worker_dict"
 
+    @staticmethod
+    def _apply_verl_runtime_env_vars(runtime_env_vars):
+        if runtime_env_vars:
+            os.environ.update({str(key): str(value) for key, value in runtime_env_vars.items() if value is not None})
+
     def __new__(cls, *args, **kwargs):
         """Create a new Worker instance with proper initialization based on environment settings."""
         instance = super().__new__(cls)
@@ -93,8 +103,49 @@ class Worker(WorkerHelper):
         if disable_worker_init:
             return instance
 
+        cls._apply_verl_runtime_env_vars(kwargs.get("_verl_runtime_env_vars"))
+
         rank = os.environ.get("RANK", None)
         worker_group_prefix = os.environ.get("WG_PREFIX", None)
+
+        if None in [rank, worker_group_prefix]:
+            actor_name = ray.get_runtime_context().get_actor_name()
+            match = re.match(
+                r"(?P<prefix>.+?)__verl__(?P<rank>\d+)__(?P<local_world_size>\d+)__(?P<local_rank>\d+)__.*$",
+                actor_name or "",
+            )
+            if match:
+                prefix = match.group("prefix")
+                rank = match.group("rank")
+                local_rank = int(match.group("local_rank"))
+                register_center = ray.get_actor(f"{prefix}_register_center")
+                rank_zero_info = ray.get(register_center.get_rank_zero_info.remote())
+                if int(rank) != 0:
+                    start_time = time.time()
+                    while (
+                        time.time() - start_time < 300
+                        and (not rank_zero_info.get("MASTER_ADDR") or not rank_zero_info.get("MASTER_PORT"))
+                    ):
+                        time.sleep(1)
+                        rank_zero_info = ray.get(register_center.get_rank_zero_info.remote())
+                    if not rank_zero_info.get("MASTER_ADDR") or not rank_zero_info.get("MASTER_PORT"):
+                        raise TimeoutError("Timed out waiting for rank 0 to publish MASTER_ADDR/MASTER_PORT")
+
+                os.environ.update(
+                    {
+                        "WORLD_SIZE": str(rank_zero_info["WORLD_SIZE"]),
+                        "RANK": rank,
+                        "WG_PREFIX": prefix,
+                        "WG_BACKEND": "ray",
+                        "LOCAL_WORLD_SIZE": str(rank_zero_info["LOCAL_WORLD_SIZE"]),
+                        "LOCAL_RANK": str(local_rank),
+                        "RAY_LOCAL_WORLD_SIZE": str(rank_zero_info["LOCAL_WORLD_SIZE"]),
+                        "RAY_LOCAL_RANK": str(local_rank),
+                        "MASTER_ADDR": str(rank_zero_info["MASTER_ADDR"]),
+                        "MASTER_PORT": str(rank_zero_info["MASTER_PORT"]),
+                    }
+                )
+                worker_group_prefix = prefix
 
         # when decorator @ray.remote applies, __new__ will be called while we don't want to apply _configure_before_init
         if None not in [rank, worker_group_prefix] and "ActorClass(" not in cls.__name__:
@@ -114,22 +165,38 @@ class Worker(WorkerHelper):
         assert isinstance(rank, int), f"rank must be int, instead of {type(rank)}"
 
         if rank == 0:
-            master_addr, master_port = self.get_availale_master_addr_port()
-            rank_zero_info = {
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": master_port,
-            }
-
             if os.getenv("WG_BACKEND", None) == "ray":
-                from verl.single_controller.base.register_center.ray import create_worker_group_register_center
-
-                self.register_center = create_worker_group_register_center(
-                    name=register_center_name, info=rank_zero_info
+                self.register_center = ray.get_actor(register_center_name)
+                rank_zero_info = ray.get(self.register_center.get_rank_zero_info.remote())
+                master_addr, master_port = self.get_availale_master_addr_port()
+                rank_zero_info.update(
+                    {
+                        "MASTER_ADDR": master_addr,
+                        "MASTER_PORT": master_port,
+                    }
                 )
+                ray.get(self.register_center.set_rank_zero_info.remote(rank_zero_info))
+            else:
+                master_addr, master_port = self.get_availale_master_addr_port()
+                rank_zero_info = {
+                    "MASTER_ADDR": master_addr,
+                    "MASTER_PORT": master_port,
+                }
 
             os.environ.update(rank_zero_info)
         else:
             self.register_center = ray.get_actor(register_center_name)
+            start_time = time.time()
+            rank_zero_info = ray.get(self.register_center.get_rank_zero_info.remote())
+            while (
+                time.time() - start_time < 300
+                and (not rank_zero_info.get("MASTER_ADDR") or not rank_zero_info.get("MASTER_PORT"))
+            ):
+                time.sleep(1)
+                rank_zero_info = ray.get(self.register_center.get_rank_zero_info.remote())
+            if not rank_zero_info.get("MASTER_ADDR") or not rank_zero_info.get("MASTER_PORT"):
+                raise TimeoutError("Timed out waiting for rank 0 to publish MASTER_ADDR/MASTER_PORT")
+            os.environ.update({str(key): str(value) for key, value in rank_zero_info.items() if value is not None})
 
         # set worker info for node affinity scheduling
         ray.get(self.register_center.set_worker_info.remote(rank, ray.get_runtime_context().get_node_id()))
@@ -147,7 +214,7 @@ class Worker(WorkerHelper):
             "CUDA_VISIBLE_DEVICES",
         ]
 
-    def __init__(self, cuda_visible_devices=None) -> None:
+    def __init__(self, cuda_visible_devices=None, _verl_runtime_env_vars=None) -> None:
         """Initialize the worker with environment settings and device configuration.
 
         Args:
@@ -158,6 +225,7 @@ class Worker(WorkerHelper):
         # it is executed remotely
         import os
 
+        self._apply_verl_runtime_env_vars(_verl_runtime_env_vars)
         self._setup_env_cuda_visible_devices()
 
         world_size = int(os.environ["WORLD_SIZE"])

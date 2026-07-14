@@ -17,10 +17,11 @@ from typing import List
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
-from vllm.lora.request import LoRARequest
-from vllm.lora.utils import get_adapter_absolute_path
-from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+
+try:
+    from vllm.lora.request import LoRARequest
+except ModuleNotFoundError:
+    LoRARequest = object
 
 from verl.third_party.vllm import get_version
 
@@ -114,6 +115,13 @@ class TensorLoRARequest(LoRARequest):
 class VLLMHijack:
     @staticmethod
     def hijack():
+        try:
+            from vllm.lora.models import LoRAModel
+            from vllm.lora.utils import get_adapter_absolute_path
+            from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("LoRA tensor synchronization is not compatible with this vLLM version.") from exc
+
         def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
             """
             based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors

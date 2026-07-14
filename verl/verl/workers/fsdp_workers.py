@@ -79,6 +79,42 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _get_dist_init_kwargs():
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    init_method = os.environ.get("DIST_INIT_METHOD", None)
+    if init_method is None and os.environ.get("MASTER_ADDR") and os.environ.get("MASTER_PORT"):
+        master_addr = os.environ["MASTER_ADDR"]
+        if ":" in master_addr and not master_addr.startswith("["):
+            master_addr = f"[{master_addr}]"
+        init_method = f"tcp://{master_addr}:{os.environ['MASTER_PORT']}"
+
+    logger.warning(
+        "Initializing torch.distributed: rank=%s world_size=%s init_method=%s master=%s:%s",
+        rank,
+        world_size,
+        init_method,
+        os.environ.get("MASTER_ADDR"),
+        os.environ.get("MASTER_PORT"),
+    )
+    return rank, world_size, init_method
+
+
+def _get_attn_implementation(model_config) -> str:
+    return str(model_config.get("attn_implementation", "flash_attention_2"))
+
+
+def _verify_attn_implementation(module, expected: str, role: str, rank: int):
+    actual = getattr(module.config, "_attn_implementation", None)
+    if actual != expected:
+        raise RuntimeError(
+            f"{role} model must use {expected}, got {actual!r}. "
+            "This run is intentionally aborted instead of silently falling back."
+        )
+    if rank == 0:
+        print(f"{role} attention implementation verified: {actual}")
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -115,13 +151,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         import datetime
 
         if not torch.distributed.is_initialized():
-            rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            rank, world_size, init_method = _get_dist_init_kwargs()
             torch.distributed.init_process_group(
                 backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
                 rank=rank,
                 world_size=world_size,
-                init_method=os.environ.get("DIST_INIT_METHOD", None),
+                init_method=init_method,
                 timeout=datetime.timedelta(days=1)
             )
 
@@ -221,7 +256,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            AutoModelForVision2Seq = None
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -249,8 +289,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
+        attn_implementation = _get_attn_implementation(self.config.model)
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
 
         # patch for kimi-vl
@@ -276,7 +317,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            if AutoModelForVision2Seq is not None and type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
                 actor_module_class = AutoModelForVision2Seq
             else:
                 actor_module_class = AutoModelForCausalLM
@@ -286,7 +327,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 torch_dtype=torch_dtype,
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation,
             )
+
+            _verify_attn_implementation(actor_module, attn_implementation, role, self.rank)
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -513,6 +557,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_param=self._is_offload_param,
                 load_format=self.config.rollout.load_format,
                 layered_summon=self.config.rollout.get("layered_summon", False),
+                is_lora=self._is_lora,
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
@@ -925,8 +970,9 @@ class CriticWorker(Worker, DistProfilerExtension):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
+            rank, world_size, init_method = _get_dist_init_kwargs()
             torch.distributed.init_process_group(
-                backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
+                backend=get_nccl_backend(), rank=rank, world_size=world_size, init_method=init_method
             )
         self.config = config
 
@@ -1013,9 +1059,10 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         from transformers import AutoConfig
 
+        attn_implementation = _get_attn_implementation(config.model)
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             trust_remote_code=config.model.get("trust_remote_code", False),
         )
         critic_model_config.num_labels = 1
@@ -1038,7 +1085,9 @@ class CriticWorker(Worker, DistProfilerExtension):
                 torch_dtype,
                 critic_model_config,
                 config.model.get("trust_remote_code", False),
+                attn_implementation=attn_implementation,
             )
+            _verify_attn_implementation(critic_module, attn_implementation, "critic", self.rank)
 
             use_remove_padding = config.model.get("use_remove_padding", False)
 
@@ -1312,8 +1361,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
+            rank, world_size, init_method = _get_dist_init_kwargs()
             torch.distributed.init_process_group(
-                backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
+                backend=get_nccl_backend(), rank=rank, world_size=world_size, init_method=init_method
             )
         self.config = config
 
@@ -1361,7 +1411,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
 
         trust_remote_code = config.model.get("trust_remote_code", False)
-        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        attn_implementation = _get_attn_implementation(config.model)
+        model_config = AutoConfig.from_pretrained(
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
+        )
         model_config.num_labels = 1
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
@@ -1376,9 +1429,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_implementation,
                 trust_remote_code=trust_remote_code,
             )
+
+            _verify_attn_implementation(reward_module, attn_implementation, "reward", self.rank)
 
             apply_monkey_patch(
                 model=reward_module,
@@ -1429,7 +1484,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
     def _forward_micro_batch(self, micro_batch):
         if is_cuda_available:
-            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+            from verl.utils.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
         elif is_npu_available:
             from transformers.integrations.npu_flash_attention import (
                 index_first_axis,

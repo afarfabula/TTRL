@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from typing import Callable, Optional
@@ -40,9 +41,7 @@ async def single_compute_score(evaluation_func, completion, reference, task, tas
         return None  # Default value for failed rows
 
 
-async def parallel_compute_score_async(
-    evaluation_func, completions, references, tasks, extra_info=None, num_processes=64
-):
+async def parallel_compute_score_async(evaluation_func, completions, references, tasks, extra_info=None, num_processes=64):
     if extra_info is None:
         extra_info = [None] * len(tasks)
     scores = []
@@ -74,15 +73,13 @@ async def parallel_compute_score_async(
                     pass
             print(f"[Shutdown] {terminated_count} subprocess(es) terminated.")
 
-    # Process results
+    # Preserve the score/dict semantics used by NaiveRewardManager. Failed rows
+    # become score 0.0, matching the previous PRIME fallback behavior.
     for result, completion, reference, task in zip(results, completions, references, tasks):
         if isinstance(result, Exception) or result is None:
-            # Handle failed or timed-out tasks
             scores.append(0.0)
-        elif isinstance(result, (int, float, bool)):
-            scores.append(float(result))
         else:
-            scores.append(float(result[0]))
+            scores.append(result)
     return scores
 
 
@@ -109,11 +106,13 @@ class PrimeRewardManager:
         num_examine: int,
         compute_score: Optional[Callable] = None,
         reward_fn_key: str = "data_source",
+        num_processes: int = 64,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
+        self.num_processes = num_processes
 
     def verify(self, data):
         """
@@ -136,7 +135,7 @@ class PrimeRewardManager:
                 references=ground_truth,
                 tasks=data_sources,
                 extra_info=extra_info,
-                num_processes=64,
+                num_processes=self.num_processes,
             )
         except asyncio.TimeoutError:
             print("[Timeout] Global reward scoring timed out. Setting all as 0.")
@@ -144,7 +143,6 @@ class PrimeRewardManager:
         except Exception as e:
             print(f"[Error] Unexpected error during scoring. Setting all as 0. {e}")
             scores = [0.0 for _ in range(len(sequences_str))]
-        data.batch["acc"] = torch.tensor(scores, dtype=torch.float32, device=prompt_ids.device)
         return scores
 
     def __call__(self, data: DataProto, return_dict: bool = False):
@@ -152,9 +150,13 @@ class PrimeRewardManager:
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
-            return data.batch["rm_scores"]
+            if return_dict:
+                return {"reward_tensor": data.batch["rm_scores"]}
+            else:
+                return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
 
@@ -168,10 +170,22 @@ class PrimeRewardManager:
         data_sources = data.non_tensor_batch["data_source"]
 
         scores = self.verify(data)
+        rewards = []
 
         for i in range(len(data)):
             data_source = data_sources[i]
-            reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
+            score = scores[i]
+            if isinstance(score, dict):
+                reward = score["score"]
+                for key, value in score.items():
+                    reward_extra_info[key].append(value)
+            elif isinstance(score, (int, float, bool)):
+                reward = float(score)
+            else:
+                reward = float(score[0])
+
+            rewards.append(reward)
+            reward_tensor[i, valid_response_length[i].item() - 1] = reward
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -180,7 +194,9 @@ class PrimeRewardManager:
                 already_print_data_sources[data_source] += 1
                 print(sequences_str)
 
+        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+
         if return_dict:
-            return {"reward_tensor": reward_tensor}
+            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
         else:
             return reward_tensor

@@ -27,6 +27,7 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from verl.protocol import DataProto, _padding_size_key
+from verl.single_controller.base.register_center.ray import create_worker_group_register_center
 from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
 
@@ -186,6 +187,7 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         super().__init__(cls, *args, **kwargs)
         self._options = {}
         self._additional_resource = {}
+        self._verl_runtime_env_vars = {}
 
     def set_additional_resource(self, additional_resource):
         """Set additional resource requirements for the actor.
@@ -202,6 +204,10 @@ class RayClassWithInitArgs(ClassWithInitArgs):
             options: Dictionary of options to update
         """
         self._options.update(options)
+
+    def update_verl_runtime_env_vars(self, env_vars: Dict):
+        """Pass per-worker environment without using Ray runtime_env."""
+        self._verl_runtime_env_vars = dict(env_vars)
 
     def __call__(
         self,
@@ -230,7 +236,10 @@ class RayClassWithInitArgs(ClassWithInitArgs):
             cuda_visible_devices = ray.get(sharing_with.get_cuda_visible_devices.remote())
             options = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=target_node_id, soft=False)}
             return self.cls.options(**options).remote(
-                *self.args, cuda_visible_devices=cuda_visible_devices, **self.kwargs
+                *self.args,
+                cuda_visible_devices=cuda_visible_devices,
+                _verl_runtime_env_vars=self._verl_runtime_env_vars,
+                **self.kwargs,
             )
 
         options = {
@@ -252,7 +261,9 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         # print("cls:", self.cls)
         # print("args: ", self.args)
         # print("kwargs: ", self.kwargs)
-        return self.cls.options(**options).remote(*self.args, **self.kwargs)
+        return self.cls.options(**options).remote(
+            *self.args, _verl_runtime_env_vars=self._verl_runtime_env_vars, **self.kwargs
+        )
 
 
 class RayWorkerGroup(WorkerGroup):
@@ -360,46 +371,91 @@ class RayWorkerGroup(WorkerGroup):
         self._world_size = world_size
         # cia.add_kwarg("_world_size", world_size)
         num_gpus = 1 / resource_pool.max_colocate_count
+        local_world_size = resource_pool.store[0]
+
+        self._master_addr = None
+        self._master_port = None
+        rank_zero_info = {
+            "MASTER_ADDR": self._master_addr,
+            "MASTER_PORT": self._master_port,
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_WORLD_SIZE": str(local_world_size),
+        }
+        self._register_center_actor = create_worker_group_register_center(
+            name=f"{self.name_prefix}_register_center", info=rank_zero_info
+        )
 
         rank = -1
-        local_world_size = resource_pool.store[0]
         for pg_idx, pg in enumerate(sort_placement_group_by_node_ip(pgs)):
             assert local_world_size <= pg.bundle_count, f"when generating for {self.name_prefix}, for the "
             for local_rank in range(local_world_size):
                 rank += 1
 
-                # we pass in environment variable at option so that Worker can use environment variable to set
                 env_vars = {
                     "WORLD_SIZE": str(world_size),
                     "RANK": str(rank),
                     "WG_PREFIX": self.name_prefix,
                     "WG_BACKEND": "ray",
+                    "LOCAL_WORLD_SIZE": str(local_world_size),
+                    "LOCAL_RANK": str(local_rank),
                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
                     "RAY_LOCAL_RANK": str(local_rank),
                 }
-                if rank != 0:
-                    env_vars["MASTER_ADDR"] = self._master_addr
-                    env_vars["MASTER_PORT"] = self._master_port
+                for key in [
+                    "CUDA_HOME",
+                    "LD_LIBRARY_PATH",
+                    "PATH",
+                    "HF_HOME",
+                    "HUGGINGFACE_HUB_CACHE",
+                    "TRANSFORMERS_CACHE",
+                    "TMPDIR",
+                    "RAY_TMPDIR",
+                    "XDG_CACHE_HOME",
+                    "XDG_CONFIG_HOME",
+                    "VLLM_CACHE_ROOT",
+                    "FLASHINFER_WORKSPACE_BASE",
+                    "TORCHINDUCTOR_CACHE_DIR",
+                    "TRITON_CACHE_DIR",
+                    "CUDA_CACHE_PATH",
+                    "VLLM_USE_FLASHINFER_SAMPLER",
+                    "VLLM_LOGGING_LEVEL",
+                    "VLLM_ALLOW_RUNTIME_LORA_UPDATING",
+                    "NCCL_DEBUG",
+                    "NCCL_NVLS_ENABLE",
+                    "NCCL_P2P_DISABLE",
+                    "NCCL_P2P_LEVEL",
+                    "NCCL_IB_DISABLE",
+                    "NCCL_SOCKET_IFNAME",
+                    "NCCL_SOCKET_FAMILY",
+                    "NCCL_NET",
+                    "NCCL_NET_PLUGIN",
+                    "HF_HUB_OFFLINE",
+                    "TRANSFORMERS_OFFLINE",
+                    "TOKENIZERS_PARALLELISM",
+                ]:
+                    if key in os.environ:
+                        env_vars[key] = os.environ[key]
 
                 import re
 
                 cia_name = type(ray_cls_with_init.cls).__name__
                 match = re.search(r"ActorClass\(([^)]+)\)", cia_name)  # ray.remote(Obj) -> "ActorClass(Obj)"
                 cia_name = match.group(1) if match else cia_name  # "ActorClass(Obj)" -> "Obj"
-                name = f"{self.name_prefix}{cia_name}_{pg_idx}:{local_rank}"  # e.g. Worker_2:5
+                name = f"{self.name_prefix}__verl__{rank}__{local_world_size}__{local_rank}__{cia_name}"
 
                 if self.profile_steps:
                     ray_cls_with_init.update_options(
                         {
                             "runtime_env": {
-                                "env_vars": env_vars,
                                 "nsight": self.worker_nsight_options,
                             },
                             "name": name,
                         }
                     )
                 else:
-                    ray_cls_with_init.update_options({"runtime_env": {"env_vars": env_vars}, "name": name})
+                    ray_cls_with_init.update_options({"name": name})
+
+                ray_cls_with_init.update_verl_runtime_env_vars(env_vars)
 
                 if detached:
                     ray_cls_with_init.update_options({"lifetime": "detached"})
@@ -416,38 +472,7 @@ class RayWorkerGroup(WorkerGroup):
                 self._worker_names.append(name)
 
                 if rank == 0:
-                    register_center_actor = None
-                    actor_name = f"{self.name_prefix}_register_center"
-                    start_time = time.time()
-
-                    while time.time() - start_time < self._ray_wait_register_center_timeout:
-                        if actor_name in list_named_actors():
-                            register_center_actor = ray.get_actor(actor_name)
-                            break
-
-                        elapsed = int(time.time() - start_time)
-                        if elapsed % 30 == 0:
-                            logging.warning(
-                                "Waiting for register center actor %s to be ready. Elapsed time: %s seconds out of "
-                                "%s seconds.",
-                                actor_name,
-                                elapsed,
-                                self._ray_wait_register_center_timeout,
-                            )
-                        time.sleep(1)
-
-                    if register_center_actor is None:
-                        raise TimeoutError(
-                            f"Failed to get register_center_actor {actor_name} "
-                            f"in {list_named_actors(all_namespaces=True)} "
-                            f"for {self._ray_wait_register_center_timeout} seconds. "
-                            "Ensure that any lingering Ray resources from previous "
-                            "runs are cleaned up (e.g., by restarting the Ray cluster), "
-                            "or adjust the waiting time by modifying the config "
-                            "`trainer.ray_wait_register_center_timeout`."
-                        )
-
-                    rank_zero_info = ray.get(register_center_actor.get_rank_zero_info.remote())
+                    rank_zero_info = ray.get(self._register_center_actor.get_rank_zero_info.remote())
                     self._master_addr, self._master_port = rank_zero_info["MASTER_ADDR"], rank_zero_info["MASTER_PORT"]
                     # print(f"rank_zero_info: {rank_zero_info}")
                     # print(f"master_addr: {self._master_addr}, master_port: {self._master_port}")
@@ -777,8 +802,8 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
 
     # TODO: create a class with customizable name
     class WorkerDict(worker_cls):
-        def __init__(self):
-            super().__init__()
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
             self.worker_dict = {}
             for key, user_defined_cls in cls_dict.items():
                 user_defined_cls = _unwrap_ray_remote(user_defined_cls)

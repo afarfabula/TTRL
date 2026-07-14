@@ -27,6 +27,9 @@ class WorkerGroupRegisterCenter:
     def get_rank_zero_info(self):
         return self.rank_zero_info
 
+    def set_rank_zero_info(self, rank_zero_info):
+        self.rank_zero_info = rank_zero_info
+
     def set_worker_info(self, rank, node_id) -> None:
         self.workers_info[rank] = node_id
 

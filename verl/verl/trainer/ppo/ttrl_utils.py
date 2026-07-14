@@ -13,6 +13,7 @@
 # limitations under the License.
 from typing import List
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 import torch
 import numpy as np
 from verl.utils.reward_score.ttrl_math import extract_answer, simplify_expression_string, grade
@@ -47,7 +48,7 @@ def apply_original_gt(batch):
     return batch
 
 
-def apply_ttrl_gt(batch, gen_batch_output, n, tokenizer):
+def apply_ttrl_gt(batch, gen_batch_output, n, tokenizer, majority_vote_num_processes=0):
     """
     Apply the majority vote ground truth to the batch.
     """
@@ -55,20 +56,15 @@ def apply_ttrl_gt(batch, gen_batch_output, n, tokenizer):
     num_prompts = len(gen_batch_output) // n
     assert len(batch) == num_prompts, "batch length must be equal to the number of prompts"
 
-    model_outputs = []  
-    for i in range(num_prompts):
-        start = i * n
-        for j in range(n):
-            data_item = gen_batch_output[start + j]
-            prompt_ids = data_item.batch["prompts"]
-            prompt_length = prompt_ids.shape[-1]
-            response_ids = data_item.batch["responses"]
-            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-            response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-            model_outputs.append(response_str)
+    response_ids = gen_batch_output.batch["responses"]
+    prompt_length = gen_batch_output.batch["prompts"].shape[-1]
+    valid_response_lengths = gen_batch_output.batch["attention_mask"][:, prompt_length:].sum(dim=-1).cpu().tolist()
+    valid_response_ids = [response_ids[i][: int(valid_response_lengths[i])] for i in range(len(gen_batch_output))]
+    model_outputs = tokenizer.batch_decode(valid_response_ids, skip_special_tokens=True)
 
-    majority_gt_list, majority_ratio_list = _batch_majority_vote(model_outputs, n)
+    majority_gt_list, majority_ratio_list = _batch_majority_vote(
+        model_outputs, n, num_processes=majority_vote_num_processes
+    )
     
     assert len(batch) == len(majority_gt_list), "batch length must be equal to the number of model outputs"
     
@@ -83,7 +79,7 @@ def apply_ttrl_gt(batch, gen_batch_output, n, tokenizer):
     return batch
 
 
-def _batch_majority_vote(model_outputs: List[str], n: int) -> tuple[List[str], List[float]]:
+def _batch_majority_vote(model_outputs: List[str], n: int, num_processes: int = 0) -> tuple[List[str], List[float]]:
     """
     Used to generate the ground truth for TTRL.
     Input:
@@ -93,13 +89,18 @@ def _batch_majority_vote(model_outputs: List[str], n: int) -> tuple[List[str], L
         majority_gt_list: list of str
         majority_ratio_list: list of float
     """
-    majority_gt_list = []
-    majority_ratio_list = []
     assert len(model_outputs) % n == 0
     n_prompts = len(model_outputs) // n
+    if num_processes and num_processes > 1:
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
+            results = list(executor.map(_majority_vote, (model_outputs[i * n:(i + 1) * n] for i in range(n_prompts))))
+    else:
+        results = [_majority_vote(model_outputs[i * n:(i + 1) * n]) for i in range(n_prompts)]
+
+    majority_gt_list = []
+    majority_ratio_list = []
     for i in range(n_prompts):
-        prompt_outputs = model_outputs[i * n:(i + 1) * n]
-        prompt_majority_gt, prompt_majority_ratio = _majority_vote(prompt_outputs)
+        prompt_majority_gt, prompt_majority_ratio = results[i]
         majority_gt_list.append(prompt_majority_gt)
         majority_ratio_list.append(prompt_majority_ratio)
         
@@ -108,13 +109,17 @@ def _batch_majority_vote(model_outputs: List[str], n: int) -> tuple[List[str], L
 
 def _majority_vote(model_outputs: List[str]) -> tuple[str, float]:
     assert len(model_outputs) > 0
-    model_answers = [extract_answer(generated_text) for generated_text in model_outputs]
-    model_answers = [answer for answer in model_answers if answer is not None]
-    model_answers = [simplify_expression_string(answer) for answer in model_answers]
-    if len(model_answers) == 0:
+    raw_answers = [extract_answer(generated_text) for generated_text in model_outputs]
+    raw_answers = [answer for answer in raw_answers if answer is not None]
+    if len(raw_answers) == 0:
         return "None", 0.0
-    
-    counter = Counter(model_answers)
+
+    # Avoid repeatedly running sympy simplification for duplicated answers in
+    # the same vote group. Counting after canonicalization preserves semantics.
+    raw_counter = Counter(raw_answers)
+    counter = Counter()
+    for answer, count in raw_counter.items():
+        counter[simplify_expression_string(answer)] += count
     
     majority_answer, majority_count = counter.most_common(1)[0]
     majority_ratio = majority_count / len(model_outputs)

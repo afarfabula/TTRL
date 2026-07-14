@@ -138,6 +138,10 @@ actor_rollout_ref:
     # Whether to use Liger for linear layer fusion
     use_liger: false
 
+    # HuggingFace attention backend. Use flash_attention_2 when Dao flash-attn is
+    # installed; use sdpa on B200 where torch SDPA dispatches to flash kernels.
+    attn_implementation: flash_attention_2
+
     # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
     use_fused_kernels: false
 
@@ -482,6 +486,10 @@ actor_rollout_ref:
         # Whether to disable the preprocessor cache for multimodel models.
         disable_mm_preprocessor_cache: False
 
+        # vLLM 0.24+ attention config. null keeps vLLM default auto-selection.
+        attention_config:
+          backend: null
+
       # for sglang
       sglang:
 
@@ -558,6 +566,10 @@ actor_rollout_ref:
     # support logging rollout prob for debugging purpose
     calculate_log_probs: False
 
+    # Reuse rollout token log-probs as PPO old_log_probs when sampling params match
+    # the actor log-prob definition. This is an infra optimization and is disabled by default.
+    use_rollout_log_probs_as_old: False
+
     # profiler configs
     profiler:
 
@@ -632,6 +644,9 @@ critic:
 
     # Use remove padding optimization (saves compute)
     use_remove_padding: False
+
+    # HuggingFace attention backend for critic workers.
+    attn_implementation: ${actor_rollout_ref.model.attn_implementation}
 
     # Whether to trust remote code from Hugging Face models
     trust_remote_code: ${actor_rollout_ref.model.trust_remote_code}
@@ -774,6 +789,9 @@ reward_model:
     # Whether to use fused reward kernels for speedup
     use_fused_kernels: ${actor_rollout_ref.model.use_fused_kernels}
 
+    # HuggingFace attention backend for reward model workers.
+    attn_implementation: ${actor_rollout_ref.model.attn_implementation}
+
     # Whether to enable loading a remote code model, default to False
     trust_remote_code: False
 
@@ -821,6 +839,9 @@ reward_model:
   # Default is naive. If all verification functions are multiprocessing-safe,
   # the reward manager can be set to prime for parallel verification.
   reward_manager: naive
+
+  # CPU worker processes used by reward managers that support multiprocessing.
+  num_processes: 64
 
   # Whether to launch custom reward function asynchronously during log_prob
   launch_reward_fn_async: False

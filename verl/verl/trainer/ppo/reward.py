@@ -15,6 +15,7 @@
 import multiprocessing
 import os
 from functools import partial
+from pathlib import Path
 
 import ray
 
@@ -34,13 +35,18 @@ def get_custom_reward_fn(config):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Reward function file '{file_path}' not found.")
 
-    spec = importlib.util.spec_from_file_location("custom_module", file_path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        sys.modules["custom_module"] = module
-        spec.loader.exec_module(module)
-    except Exception as e:
-        raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
+    module_path = Path(file_path).resolve()
+    module_name = f"verl_custom_reward_{abs(hash(str(module_path)))}"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        try:
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        except Exception as e:
+            sys.modules.pop(module_name, None)
+            raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
 
     function_name = reward_fn_config.get("name")
     if not hasattr(module, function_name):
@@ -50,11 +56,9 @@ def get_custom_reward_fn(config):
     raw_fn = getattr(module, function_name)
 
     reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
-
-    def wrapped_fn(*args, **kwargs):
-        return raw_fn(*args, **kwargs, **reward_kwargs)
-
-    return wrapped_fn
+    if reward_kwargs:
+        return partial(raw_fn, **reward_kwargs)
+    return raw_fn
 
 
 def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
@@ -105,12 +109,16 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
             final_compute_score = default_compute_score
 
     # Instantiate and return the reward manager with the specified parameters
+    reward_manager_kwargs = dict(reward_kwargs)
+    if "num_processes" in reward_manager_cls.__init__.__code__.co_varnames:
+        reward_manager_kwargs.setdefault("num_processes", config.reward_model.get("num_processes", 64))
+
     return reward_manager_cls(
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
-        **reward_kwargs,
+        **reward_manager_kwargs,
     )
 
 
