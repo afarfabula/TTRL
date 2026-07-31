@@ -78,3 +78,8 @@ ttrl:
   chunk_state_teacher_anchor_enable: false
   chunk_state_teacher_anchor_score: 1.0
   chunk_state_teacher_anchor_candidate_index: 0
+  # If enabled, inject the source rollout's original next chunk into one
+  # candidate slot, but keep the normal probe-based PowerFlow soft target. This
+  # is different from teacher_anchor: it does not force a score floor.
+  chunk_state_source_chunk_enable: false
+  chunk_state_source_chunk_candidate_index: 0

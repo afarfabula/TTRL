@@ -1951,3 +1951,69 @@ steady step after warmup: roughly 58-62s/step
 - 这个 gate 指标失败：`mean@16=0.4335`、`maj@16=0.55015`，远低于 20-step MV baseline 和 PowerFlow 原 repo 轨迹。不能直接扩到 80 step。
 - 主要问题不是 loss 没接上，而是 target construction 仍然太弱：即使 source 是 successful rollout，chunk probe 在 step20 仍有 `state_all_negative_ratio=0.438`，并且 positive ratio 只有 0.276。当前 chunk target 很容易把模型推向“局部看起来可行但终局不稳”的 next-chunk 分布。
 - 下一轮必须继续以 PowerFlow distribution matching 为主 loss，但重做 target：优先考虑对每个 state 保留原 successful source chunk 作为 support candidate，并用 probe-improved distribution 做软重加权，而不是只依赖重采样 chunk；同时减少全负 state 的更新权重，避免错误地把无信息 state 当成有效训练信号。
+
+## 2026-07-31 Source Chunk Support + PowerFlow 3-step Smoke
+
+改动：
+
+```text
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_source_chunk_candidate_index=0
+ttrl.chunk_state_teacher_anchor_enable=False
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+```
+
+这个版本不是 teacher anchor。它只把 successful source rollout 的原始 next chunk 注入候选 support 的第 0 个位置；后续仍然用同一套 probe rollout 给所有候选打分，再构造 PowerFlow soft target。也就是说，source chunk 进入分布支持集，但不被硬设满分，不做 score floor。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_sourcechunk_probe4_b32_r32_v64_3step_20260731
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+DIAG_JSONL=/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_sourcechunk_probe4_b32_r32_v64_3step_20260731.jsonl
+launcher=/mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_sourcechunk_probe4_b32_r32_v64_20step_20260731.sh
+```
+
+稳定性和注入：
+
+```text
+jsonl_rows=96
+step1: source_chunk_injected_ratio=1.000 source_chunk_mean_len=232.094
+step2: source_chunk_injected_ratio=1.000 source_chunk_mean_len=221.438
+step3: source_chunk_injected_ratio=1.000 source_chunk_mean_len=213.312
+Final validation skipped
+```
+
+目标信号：
+
+```text
+step1: selected_original_acc_mean=0.906 positive_ratio=0.341 informative_ratio=0.750 state_all_negative_ratio=0.250 state_mixed_ratio=0.625
+step2: selected_original_acc_mean=0.906 positive_ratio=0.279 informative_ratio=0.719 state_all_negative_ratio=0.281 state_mixed_ratio=0.562
+step3: selected_original_acc_mean=0.969 positive_ratio=0.310 informative_ratio=0.812 state_all_negative_ratio=0.188 state_mixed_ratio=0.625
+```
+
+PowerFlow actor update：
+
+```text
+step1: actor/powerflow_loss=0.845 grad_norm=8.119 boxed_reward_mean=0.289
+step2: actor/powerflow_loss=0.734 grad_norm=8.753 boxed_reward_mean=0.109
+step3: actor/powerflow_loss=0.999 grad_norm=8.869 boxed_reward_mean=0.414
+```
+
+耗时：
+
+```text
+step1: gen=51.277s chunk_state_probe=6.356s chunk_state_score=11.247s update_actor=8.820s
+step2: gen=23.343s chunk_state_probe=6.916s chunk_state_score=10.858s update_actor=8.432s
+step3: gen=22.817s chunk_state_probe=6.673s chunk_state_score=11.130s update_actor=8.381s
+```
+
+结论：
+
+- 这个 smoke 通过。source chunk 100% 注入，PowerFlow loss 正常，且没有启用 teacher-anchor score floor。
+- 相比上一版 success-source/no-anchor 3-step，step3 的 `state_all_negative_ratio` 从 0.219 降到 0.188，`informative_ratio` 从 0.781 升到 0.812；step1 positive ratio 也从 0.310 升到 0.341。
+- 这说明“把成功轨迹 next chunk 纳入 support，再用 probe-improved PowerFlow 分布软更新”是更合理的 target construction。下一步进入 20-step gate，看 final validation 能否摆脱前一版 `mean@16=0.4335` 的失败区间。
