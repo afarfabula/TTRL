@@ -1637,3 +1637,54 @@ step 3:
 - 第 3 步出现 1 个 `boundary=0`，离线看是单个 source response 长度只有 95，说明 `chunk_state_min_boundary=256` 仍可能在极短成功轨迹上退回 0 boundary；不是整体退化，但后续 20-step 前最好把 source selection 改成严格过滤短于 256 的 source，而不是 fallback。
 - 稳态速度比 1-step 更清楚：step2/3 的 `gen` 降到 24.9s/22.4s，`update_actor` 为 7.2s/7.5s。当前新增开销主要是 rule-based scoring，`chunk_state_score` 约 11.5s，probe generation 约 6.7s。
 - 下一步不建议直接上 80-step；建议先修掉短 source fallback，再跑 20-step with validation gate，看 mean@16 是否能明显超过此前 chunk MVP 的 0.49 区间。
+
+## 2026-07-31 Strict Source Boundary 修复
+
+问题：
+
+- 3-step gate 的第 3 步出现 1 个 `boundary=0`。
+- 原因是 `_make_chunk_state_prompts` 在某个 prompt 下找不到长度达到 `chunk_state_min_boundary=256` 的 source 时，会 fallback 到任意 source；如果这个 source response 太短，allowed boundary 为空，最后退回 query-only state。
+- 这会把训练单位从 chunk-level transition 退化成 query-level prefix，和当前方法定义不一致。
+
+代码修复：
+
+- 当 `chunk_state_min_boundary > 0` 时，source 选择必须满足最小 response 长度。
+- 对于没有合法 source 的 prompt，跳过该 prompt 的 chunk state，不再 fallback 到 boundary 0。
+- 若整个 batch 没有合法 chunk state，直接抛出错误，而不是静默训练 query-only state。
+- 新增诊断字段：
+
+```text
+chunk_state_diag/skipped_short_sources
+skipped_short_sources
+```
+
+Strict smoke：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_midstate_probe4_strictsrc_b32_r32_v64_1step_20260731
+trainer.total_training_steps=1
+trainer.final_val_enable=False
+ttrl.chunk_state_probe_samples=4
+```
+
+结果：
+
+```text
+jsonl_rows=32
+boundary_counts={256: 14, 512: 11, 768: 7}
+skipped_short_sources_values=[0]
+boundary_zero_ratio=0.000
+all_negative=0
+all_positive=5
+mixed=27
+probe_mean_avg=0.37890625
+source_len_min=296
+source_len_mean=1272.65625
+Final validation skipped
+```
+
+结论：
+
+- 修复没有改变正常 batch 的样本数和 target 分布。
+- 后续如果遇到极短 source，会跳过该 state，并通过 `skipped_short_sources` 记录，而不是混入 boundary 0。
+- 现在可以进入更有意义的 20-step gate：仍然使用 PowerFlow loss 做 chunk actor update，先看 final val 是否摆脱此前 `mean@16≈0.49` 的失败区间。

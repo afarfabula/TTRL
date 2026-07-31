@@ -1092,6 +1092,7 @@ class RayPPOTrainer:
         source_locals = []
         state_boundaries = []
         source_response_lengths = []
+        skipped_short_sources = 0
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
                 source_offset = self.global_steps + prompt_idx + state_idx
@@ -1114,10 +1115,16 @@ class RayPPOTrainer:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
                     elif min_required_response_len > 0 and long_locals.numel() > 0:
                         source_local = int(long_locals[source_offset % long_locals.numel()].item())
+                    elif min_required_response_len > 0:
+                        skipped_short_sources += 1
+                        continue
                     else:
                         source_local = source_offset % n
                 elif min_required_response_len > 0 and long_locals.numel() > 0:
                     source_local = int(long_locals[source_offset % long_locals.numel()].item())
+                elif min_required_response_len > 0:
+                    skipped_short_sources += 1
+                    continue
                 else:
                     source_local = source_offset % n
                 source_index = prompt_idx * n + source_local
@@ -1128,12 +1135,11 @@ class RayPPOTrainer:
                 allowed_boundaries = [
                     b for b in boundaries if b <= valid_response_len and b <= max_prefix_tokens
                 ]
-                if not allowed_boundaries:
-                    allowed_boundaries = [0]
                 if min_boundary > 0:
-                    nonzero_boundaries = [b for b in allowed_boundaries if b >= min_boundary]
-                    if nonzero_boundaries:
-                        allowed_boundaries = nonzero_boundaries
+                    allowed_boundaries = [b for b in allowed_boundaries if b >= min_boundary]
+                if not allowed_boundaries:
+                    skipped_short_sources += 1
+                    continue
                 boundary = allowed_boundaries[(self.global_steps + prompt_idx + state_idx) % len(allowed_boundaries)]
                 prefix_ids = batch.batch["responses"][source_index, :boundary]
                 state_ids = torch.cat([prompt_ids, prefix_ids], dim=0)
@@ -1156,6 +1162,12 @@ class RayPPOTrainer:
                 state_boundaries.append(boundary)
                 source_response_lengths.append(valid_response_len)
 
+        if not state_input_ids:
+            raise RuntimeError(
+                "chunk-state source selection produced no valid states; "
+                f"min_required_response_len={min_required_response_len}, boundaries={boundaries}"
+            )
+
         input_ids = torch.stack(state_input_ids, dim=0)
         attention_mask = torch.stack(state_attention_masks, dim=0)
         position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
@@ -1175,6 +1187,9 @@ class RayPPOTrainer:
         state_non_tensor["chunk_state_source_local"] = np.asarray(source_locals, dtype=np.int64)
         state_non_tensor["chunk_state_boundary"] = np.asarray(state_boundaries, dtype=np.int64)
         state_non_tensor["chunk_state_source_response_len"] = np.asarray(source_response_lengths, dtype=np.int64)
+        state_non_tensor["chunk_state_skipped_short_sources"] = np.asarray(
+            [skipped_short_sources] * len(source_indices), dtype=np.int64
+        )
         if source_correctness is not None:
             state_non_tensor["chunk_state_source_original_correct"] = (
                 source_correctness[np.asarray(source_indices, dtype=np.int64)].numpy().astype(np.float32)
@@ -1204,12 +1219,17 @@ class RayPPOTrainer:
         source_response_lens = torch.as_tensor(
             state_prompts.non_tensor_batch["chunk_state_source_response_len"], dtype=torch.float32
         )
+        skipped_short_sources = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
+            dtype=torch.float32,
+        )
         metrics.update(
             {
                 "chunk_state_diag/boundary_mean": boundaries.mean().item(),
                 "chunk_state_diag/boundary_min": boundaries.min().item(),
                 "chunk_state_diag/boundary_max": boundaries.max().item(),
                 "chunk_state_diag/boundary_zero_ratio": (boundaries == 0).float().mean().item(),
+                "chunk_state_diag/skipped_short_sources": skipped_short_sources.max().item(),
                 "chunk_state_diag/source_response_len_mean": source_response_lens.mean().item(),
                 "chunk_state_diag/probe_score_std": score_matrix.std(unbiased=False).item(),
                 "chunk_state_diag/state_probe_mean_max": score_matrix.mean(dim=-1).max().item(),
@@ -1285,6 +1305,10 @@ class RayPPOTrainer:
         source_response_lens = np.asarray(
             state_prompts.non_tensor_batch["chunk_state_source_response_len"], dtype=np.int64
         )
+        skipped_short_sources = np.asarray(
+            state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
+            dtype=np.int64,
+        )
         source_original = state_prompts.non_tensor_batch.get("chunk_state_source_original_correct", None)
         if source_original is not None:
             source_original = np.asarray(source_original, dtype=np.float32)
@@ -1302,6 +1326,7 @@ class RayPPOTrainer:
                     "source_local": int(source_locals[state_idx]),
                     "boundary": int(boundaries[state_idx]),
                     "source_response_len": int(source_response_lens[state_idx]),
+                    "skipped_short_sources": int(skipped_short_sources.max()) if skipped_short_sources.size else 0,
                     "source_original_correct": (
                         float(source_original[state_idx]) if source_original is not None else None
                     ),
