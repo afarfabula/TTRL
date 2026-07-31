@@ -1812,3 +1812,71 @@ step3: gen=22.812s chunk_state_probe=6.977s chunk_state_score=11.023s update_act
 - 工程链路正确：3 step 都完成，chunk actor update 走的是 PowerFlow loss，不是 GRPO 或 weighted NLL。
 - 但完全 random source 的监督信号太稀疏：`state_all_negative_ratio` 从 0.469 升到 0.656，`positive_ratio` 从 0.205 降到 0.085。继续放大到 20 step 很可能只是用大量全负 state 做退化更新。
 - 下一版应保持 no-teacher-anchor 和 PowerFlow loss，但把 source selection 改成 successful full rollout source：`ttrl.chunk_state_source_mode=success`、`ttrl.chunk_state_teacher_anchor_enable=False`。这样仍然从完整 rollout 构造 chunk state，不做 teacher 硬替换，但会提高 probe target 的正信号密度。
+
+## 2026-07-31 Success Source + No Teacher Anchor PowerFlow 3-step Smoke
+
+Run:
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_successsrc_noanchor_probe4_b32_r32_v64_3step_20260731
+train_batch_size=32
+rollout.n=32
+trainer.total_training_steps=3
+trainer.test_freq=2000000
+trainer.final_val_enable=False
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_boundaries=[0,256,512,768,1024]
+ttrl.chunk_state_min_boundary=0
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.use_dynamic_bsz=False
+```
+
+这次 smoke 只改 state source：从 random source 改成 successful full rollout source，但仍然不做 teacher-anchor hard replacement，也不做 score floor。训练更新继续是 PowerFlow chunk loss。
+
+配置/infra 证据：
+
+```text
+model.path=/models/Qwen2.5-Math-7B
+rollout backend=vLLM FLASH_ATTN
+vLLM CUDA graph capture enabled
+flashinfer autotune triggered
+NCCL isAllDirectP2p=1
+NCCL_NVLS_ENABLE=1, nvls channels available
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+PowerFlow proj_z added and wrapped by FSDP
+```
+
+目标信号诊断：
+
+```text
+step1: selected_original_acc_mean=0.906 positive_ratio=0.310 informative_ratio=0.750 state_all_negative_ratio=0.250 state_mixed_ratio=0.656
+step2: selected_original_acc_mean=0.906 positive_ratio=0.215 informative_ratio=0.625 state_all_negative_ratio=0.375 state_mixed_ratio=0.625
+step3: selected_original_acc_mean=0.906 positive_ratio=0.325 informative_ratio=0.781 state_all_negative_ratio=0.219 state_mixed_ratio=0.625
+```
+
+PowerFlow actor update：
+
+```text
+step1: actor/powerflow_loss=1.914 grad_norm=35.559 boxed_reward_mean=0.258
+step2: actor/powerflow_loss=1.565 grad_norm=46.741 boxed_reward_mean=0.172
+step3: actor/powerflow_loss=0.413 grad_norm=30.287 boxed_reward_mean=0.352
+```
+
+耗时拆分：
+
+```text
+step1: gen=51.138s chunk_state_probe=6.469s chunk_state_score=10.893s update_actor=8.828s
+step2: gen=23.109s chunk_state_probe=6.992s chunk_state_score=11.860s update_actor=8.273s
+step3: gen=30.547s chunk_state_probe=6.842s chunk_state_score=11.039s update_actor=8.432s
+```
+
+结论：
+
+- 这个版本通过 3-step smoke gate。相比 random source，正信号和 mixed-state 比例明显更健康，`state_all_negative_ratio` 稳定在 0.219 到 0.375，而不是持续升高到 0.656。
+- 它仍然符合当前主线：先完整 on-policy rollout，再构造 chunk search state，用 PowerFlow distribution matching 更新 next-chunk actor；没有切回 GRPO，也没有用 weighted NLL 替代。
+- 可以进入 20-step gate，观察 final validation 是否至少摆脱 strict teacher-anchor 版本的 `mean@16=0.399875` 失败区间，并评估是否有机会接近/超过 20-step MV baseline。
