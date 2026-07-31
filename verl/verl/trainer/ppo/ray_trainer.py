@@ -1053,6 +1053,10 @@ class RayPPOTrainer:
         state_input_ids = []
         state_attention_masks = []
         source_indices = []
+        source_prompt_indices = []
+        source_locals = []
+        state_boundaries = []
+        source_response_lengths = []
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
                 source_local = (self.global_steps + prompt_idx + state_idx) % n
@@ -1083,6 +1087,10 @@ class RayPPOTrainer:
                 state_input_ids.append(state_ids.squeeze(0))
                 state_attention_masks.append(attn.squeeze(0))
                 source_indices.append(source_index)
+                source_prompt_indices.append(prompt_idx)
+                source_locals.append(source_local)
+                state_boundaries.append(boundary)
+                source_response_lengths.append(valid_response_len)
 
         input_ids = torch.stack(state_input_ids, dim=0)
         attention_mask = torch.stack(state_attention_masks, dim=0)
@@ -1098,6 +1106,11 @@ class RayPPOTrainer:
         state_non_tensor = {}
         for key, value in batch.non_tensor_batch.items():
             state_non_tensor[key] = value[np.asarray(source_indices, dtype=np.int64)]
+        state_non_tensor["chunk_state_source_index"] = np.asarray(source_indices, dtype=np.int64)
+        state_non_tensor["chunk_state_source_prompt_index"] = np.asarray(source_prompt_indices, dtype=np.int64)
+        state_non_tensor["chunk_state_source_local"] = np.asarray(source_locals, dtype=np.int64)
+        state_non_tensor["chunk_state_boundary"] = np.asarray(state_boundaries, dtype=np.int64)
+        state_non_tensor["chunk_state_source_response_len"] = np.asarray(source_response_lengths, dtype=np.int64)
         state_proto = DataProto(batch=state_batch, non_tensor_batch=state_non_tensor)
         state_proto.meta_info = {
             "eos_token_id": self.tokenizer.eos_token_id,
@@ -1106,6 +1119,106 @@ class RayPPOTrainer:
             "do_sample": True,
         }
         return state_proto, source_indices
+
+    def _compute_chunk_state_diag_metrics(
+        self,
+        full_batch: DataProto,
+        state_prompts: DataProto,
+        scores: torch.Tensor,
+    ) -> dict:
+        cfg = self.config.ttrl
+        candidates = int(cfg.get("chunk_state_candidates", 8))
+        num_states = len(state_prompts)
+        score_matrix = scores.view(num_states, candidates).float()
+        metrics = {}
+
+        boundaries = torch.as_tensor(state_prompts.non_tensor_batch["chunk_state_boundary"], dtype=torch.float32)
+        source_response_lens = torch.as_tensor(
+            state_prompts.non_tensor_batch["chunk_state_source_response_len"], dtype=torch.float32
+        )
+        metrics.update(
+            {
+                "chunk_state_diag/boundary_mean": boundaries.mean().item(),
+                "chunk_state_diag/boundary_min": boundaries.min().item(),
+                "chunk_state_diag/boundary_max": boundaries.max().item(),
+                "chunk_state_diag/boundary_zero_ratio": (boundaries == 0).float().mean().item(),
+                "chunk_state_diag/source_response_len_mean": source_response_lens.mean().item(),
+                "chunk_state_diag/probe_score_std": score_matrix.std(unbiased=False).item(),
+                "chunk_state_diag/state_probe_mean_max": score_matrix.mean(dim=-1).max().item(),
+                "chunk_state_diag/state_probe_mean_min": score_matrix.mean(dim=-1).min().item(),
+                "chunk_state_diag/state_all_positive_ratio": (score_matrix.min(dim=-1).values > 0.0).float().mean().item(),
+                "chunk_state_diag/state_all_negative_ratio": (score_matrix.max(dim=-1).values <= 0.0).float().mean().item(),
+                "chunk_state_diag/state_mixed_ratio": (
+                    (score_matrix.max(dim=-1).values > 0.0) & (score_matrix.min(dim=-1).values <= 0.0)
+                ).float().mean().item(),
+            }
+        )
+
+        if not bool(cfg.get("chunk_state_diag_enable", False)):
+            return metrics
+
+        pseudo_reward_tensor, _ = compute_reward(full_batch, self.reward_fn)
+        pseudo_rewards = pseudo_reward_tensor.sum(dim=-1).detach().cpu().float()
+
+        original_non_tensor = dict(full_batch.non_tensor_batch)
+        if "reward_model" in original_non_tensor:
+            reward_models = []
+            has_original_gt = False
+            for reward_model in original_non_tensor["reward_model"]:
+                reward_model_copy = dict(reward_model)
+                if "original_gt" in reward_model_copy:
+                    reward_model_copy["ground_truth"] = reward_model_copy["original_gt"]
+                    has_original_gt = True
+                reward_models.append(reward_model_copy)
+            original_non_tensor["reward_model"] = np.asarray(reward_models, dtype=object)
+        else:
+            has_original_gt = False
+
+        if has_original_gt:
+            original_batch = DataProto(
+                batch=full_batch.batch,
+                non_tensor_batch=original_non_tensor,
+                meta_info=full_batch.meta_info,
+            )
+            original_reward_tensor, _ = compute_reward(original_batch, self.reward_fn)
+            original_rewards = original_reward_tensor.sum(dim=-1).detach().cpu().float()
+        else:
+            original_rewards = pseudo_rewards
+
+        source_indices = torch.as_tensor(state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=torch.long)
+        source_prompt_indices = torch.as_tensor(
+            state_prompts.non_tensor_batch["chunk_state_source_prompt_index"], dtype=torch.long
+        )
+        n = int(cfg.n_samples_per_prompt)
+        prompt_count = len(full_batch) // n
+        pseudo_prompt = pseudo_rewards.view(prompt_count, n)
+        original_prompt = original_rewards.view(prompt_count, n)
+        selected_pseudo = pseudo_rewards[source_indices]
+        selected_original = original_rewards[source_indices]
+        selected_prompt_original_mean = original_prompt[source_prompt_indices].mean(dim=-1)
+        selected_prompt_original_pass = (original_prompt[source_prompt_indices].max(dim=-1).values > 0.0).float()
+        selected_prompt_pseudo_mean = pseudo_prompt[source_prompt_indices].mean(dim=-1)
+
+        probe_mean = score_matrix.mean(dim=-1)
+        correct_mask = selected_original > 0.0
+        wrong_mask = ~correct_mask
+        metrics.update(
+            {
+                "chunk_state_diag/source_pseudo_acc_mean": selected_pseudo.mean().item(),
+                "chunk_state_diag/source_original_acc_mean": selected_original.mean().item(),
+                "chunk_state_diag/prompt_pseudo_mean": selected_prompt_pseudo_mean.mean().item(),
+                "chunk_state_diag/prompt_original_mean": selected_prompt_original_mean.mean().item(),
+                "chunk_state_diag/prompt_original_pass": selected_prompt_original_pass.mean().item(),
+                "chunk_state_diag/probe_mean_source_original_correct": (
+                    probe_mean[correct_mask].mean().item() if correct_mask.any() else 0.0
+                ),
+                "chunk_state_diag/probe_mean_source_original_wrong": (
+                    probe_mean[wrong_mask].mean().item() if wrong_mask.any() else 0.0
+                ),
+                "chunk_state_diag/source_original_correct_ratio": correct_mask.float().mean().item(),
+            }
+        )
+        return metrics
 
     def _combine_state_and_completion_prompts(
         self,
@@ -1363,6 +1476,7 @@ class RayPPOTrainer:
             probe_batch = self._build_probe_reward_batch(state_prompts, chunk_output, probe_output)
             reward_tensor, _ = compute_reward(probe_batch, self.reward_fn)
             scores = reward_tensor.sum(dim=-1).detach().cpu()
+            metrics.update(self._compute_chunk_state_diag_metrics(full_batch, state_prompts, scores))
 
         with marked_timer("chunk_state_build_actor_batch", timing_raw, color="blue"):
             actor_batch, chunk_metrics = self._build_chunk_actor_batch(state_prompts, chunk_output, scores)

@@ -287,3 +287,147 @@ timing_s/testing=302.242
 - 把 candidate chunk 的 probe correctness、原 full rollout correctness、同 prompt majority correctness 同时落日志，确认 chunk label 是否和最终答案方向一致。
 - 尝试减少 probe horizon 或改成 top candidates full-probe，以降低噪声和成本。
 - PowerFlow loss 主线保留，但需要把 improved distribution 从 hard boxed reward 改成更稳定的 sharpened distribution / ranking distribution，而不是直接把 sparse binary probe reward 写入 chunk update。
+
+## 2026-07-31 3-Step 诊断实验
+
+目的：
+
+- 20-step pilot 明显低于 MV gate 后，不继续盲跑 80 step。
+- 增加 `ttrl.chunk_state_diag_enable=True` 诊断字段，只打点，不改变 chunk PowerFlow 训练语义。
+- 同时记录 state boundary、source rollout correctness、prompt-level pass、probe label 分布，判断失败来自 state sampling、probe scoring 还是 PowerFlow loss。
+
+新增诊断代码：
+
+- `ttrl.chunk_state_diag_enable` 默认关闭。
+- `_make_chunk_state_prompts` 给 state 记录来源：
+  - `chunk_state_source_index`
+  - `chunk_state_source_prompt_index`
+  - `chunk_state_source_local`
+  - `chunk_state_boundary`
+  - `chunk_state_source_response_len`
+- `_compute_chunk_state_diag_metrics` 在开关打开时额外计算：
+  - full rollout pseudo-label reward
+  - full rollout original-GT reward
+  - selected source rollout correctness
+  - prompt-level original mean / pass
+  - probe mean 在 source correct / source wrong 上的差异
+
+诊断脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_diag_b32_r32_v64_3step_20260731.sh
+```
+
+配置：
+
+```text
+train_batch_size=32
+rollout.n=32
+val.n=16
+total_training_steps=3
+chunk_state_candidates=8
+chunk_state_chunk_size=256
+chunk_state_probe_max_tokens=3072
+actor.powerflow_enable=True
+actor.powerflow_use_boxed_reward=True
+actor.chunk_weighted_nll_enable=False
+actor.use_kl_loss=False
+ttrl.chunk_state_diag_enable=True
+```
+
+Infra 观察：
+
+- vLLM rollout config 显示 `attention_config.backend=FLASH_ATTN`。
+- FlashInfer JIT autotune 有启动日志。
+- vLLM 捕获了 mixed prefill-decode 和 decode CUDA graphs。
+- Actor 日志显示 flash attention monkey patch 和 Triton fused kernels。
+- NCCL 日志显示 `NCCL_NVLS_ENABLE=1`、NVLS multicast available、P2P direct available。
+- 这次诊断保留了 NCCL DEBUG 输出用于确认 infra，后续正式实验应降回 WARN，避免 stdout 过大。
+
+诊断 step 指标：
+
+```text
+step1:
+boundary_mean=344.000
+boundary_zero_ratio=0.281
+source_response_len_mean=1190.875
+source_original_acc_mean=0.406
+prompt_original_mean=0.334
+prompt_original_pass=0.906
+probe_score_std=0.374
+state_all_negative_ratio=0.438
+state_mixed_ratio=0.562
+probe_mean_source_original_correct=0.135
+probe_mean_source_original_wrong=0.191
+chunk_state/positive_ratio=0.168
+actor/boxed_reward/max=1.000
+timing_s/chunk_state_score=11.087
+
+step2:
+boundary_mean=360.000
+boundary_zero_ratio=0.375
+source_original_acc_mean=0.250
+prompt_original_mean=0.334
+prompt_original_pass=0.906
+probe_score_std=0.367
+state_all_positive_ratio=0.031
+state_all_negative_ratio=0.562
+state_mixed_ratio=0.406
+probe_mean_source_original_correct=0.344
+probe_mean_source_original_wrong=0.099
+chunk_state/positive_ratio=0.160
+actor/boxed_reward/max=0.000
+timing_s/chunk_state_score=9.480
+
+step3:
+boundary_mean=288.000
+boundary_zero_ratio=0.438
+source_response_len_mean=848.062
+source_original_acc_mean=0.281
+prompt_original_mean=0.330
+prompt_original_pass=0.969
+probe_score_std=0.419
+state_all_positive_ratio=0.000
+state_all_negative_ratio=0.469
+state_mixed_ratio=0.531
+probe_mean_source_original_correct=0.444
+probe_mean_source_original_wrong=0.141
+chunk_state/positive_ratio=0.227
+actor/boxed_reward/max=1.000
+timing_s/chunk_state_score=9.274
+```
+
+step3 validation：
+
+```text
+val-core/math/acc/mean@16=0.496375
+val-core/math/acc/maj@16/mean=0.626066
+val-core/math/acc/best@16/mean=0.863062
+val-aux/math/format_score/mean@16=0.910375
+```
+
+诊断结论：
+
+- 这不是 infra 失败。B200 上 FlashAttention / FlashInfer / CUDA graph / NVLS / P2P 都有实际日志证据。
+- 失败主要来自训练语义：prompt-level `pass@32` 很高，step1/2/3 分别约 0.906/0.906/0.969，但当前 state 采样选中的 source rollout original acc 只有 0.406/0.250/0.281。
+- 随机 source + 随机 boundary 浪费了大量可用成功轨迹。很多 state 来自错误 rollout，导致 next-chunk probe label 噪声很大。
+- `state_all_negative_ratio` 在 0.438/0.562/0.469，说明接近一半 state 的 8 个 candidates 全错；这些 state 对 PowerFlow 只提供低信息量甚至反向的局部监督。
+- step1 中 `probe_mean_source_original_correct < probe_mean_source_original_wrong`，说明单次 future probe 的 label 与完整 source correctness 不稳定；step2/3 转为正相关，但波动很大。
+- `chunk_state_score` 从原来的约 2.5s 增到约 9-11s，是因为诊断额外计算了 full rollout pseudo reward + original-GT reward。该成本只用于诊断，不应常开。
+- step2 的 `actor/boxed_reward/max=0` 需要继续查：同 step `chunk_state/positive_ratio=0.160`，但 actor 侧看到的 boxed reward 全 0，可能是 CISPO/PowerFlow token 过滤或 reward 落点统计存在边界问题。
+
+下一轮方法调整：
+
+- 不再用“随机 rollout source”作为主路径。
+- 改成 success-conditioned / contrastive state sampling：
+  - 对每个 prompt 的 32 条 full rollout 先按 original-GT reward 分成 success / fail。
+  - 优先从 success rollout 上截 state，保证局部 state 至少位于一条可成功轨迹上。
+  - 同时采 fail rollout 的相同或相近 boundary，构造 contrastive state/chunk 对。
+  - 对 success-state 的 candidates 用 probe success 构造 PowerFlow target；全错 state 降权或跳过。
+- 增加 `skip_all_negative` 或 state weight，避免全错 state 批量拉低局部分布。
+- 保留 PowerFlow loss 主线，但 target 从 sparse boxed reward 进一步改为 per-state sharpened distribution / ranking distribution。
+- 下一次实验先跑 3-step smoke 验证：
+  - source_original_acc_mean 是否显著高于当前随机版。
+  - state_all_negative_ratio 是否下降。
+  - actor/boxed_reward/max 是否稳定为 1。
+  - step3/20 val 是否不再快速跌到 0.49/0.47。

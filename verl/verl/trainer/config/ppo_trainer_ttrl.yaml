@@ -57,3 +57,4 @@ ttrl:
   chunk_state_eps: 0.05
   chunk_state_min_informative_gap: 0.0
   chunk_state_skip_uniform: false
+  chunk_state_diag_enable: false
