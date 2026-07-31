@@ -1688,3 +1688,71 @@ Final validation skipped
 - 修复没有改变正常 batch 的样本数和 target 分布。
 - 后续如果遇到极短 source，会跳过该 state，并通过 `skipped_short_sources` 记录，而不是混入 boundary 0。
 - 现在可以进入更有意义的 20-step gate：仍然使用 PowerFlow loss 做 chunk actor update，先看 final val 是否摆脱此前 `mean@16≈0.49` 的失败区间。
+
+## 2026-07-31 Strict Source + DP Padding 20-step Gate
+
+Run:
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_midstate_probe4_strictsrc_b32_r32_v64_20step_rerun_20260731
+train_batch_size=32
+rollout.n=32
+trainer.total_training_steps=20
+trainer.test_freq=20
+trainer.final_val_enable=True
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_boundaries=[256,512,768]
+ttrl.chunk_state_min_boundary=256
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_teacher_anchor_enable=True
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.use_dynamic_bsz=False
+```
+
+这次 rerun 使用 `Pad strict chunk states for DP rollout` 修复：strict source 过滤后，如果合法 state 数不是 8 的倍数，就复制最后一个合法 state 补齐，并把补齐样本的 `chunk_state_loss_weight` 设为 0。actor batch 中 `chunk_weights` 和 `powerflow_chunk_weights` 都乘该 loss weight，因此补齐样本不贡献 PowerFlow loss。
+
+运行稳定性：
+
+```text
+step1: real_states=32 pad_states=0 loss_weight_mean=1.000
+step2: real_states=30 pad_states=2 loss_weight_mean=0.938
+step3: real_states=31 pad_states=1 loss_weight_mean=0.969
+step18: real_states=29 pad_states=3 loss_weight_mean=0.906
+step19: real_states=30 pad_states=2 loss_weight_mean=0.938
+step20: real_states=31 pad_states=1 loss_weight_mean=0.969
+```
+
+结论是工程链路已跑通：没有再出现 `DataProto 31 and chunk 8`，`boundary_zero_ratio=0`，且每步都有 `actor/powerflow_loss`。step20 中 `actor/pg_loss=0.556`、`actor/powerflow_loss=0.556`，说明 actor update 确实走的是 PowerFlow loss。
+
+step20 耗时拆分：
+
+```text
+timing_s/gen=22.551
+timing_s/chunk_state_chunks=1.488
+timing_s/chunk_state_probe=6.988
+timing_s/chunk_state_score=12.380
+timing_s/chunk_state_ref=2.293
+timing_s/update_actor=7.367
+timing_s/testing=306.205
+```
+
+训练进度条显示不含 final validation 的稳态大约 58 到 62 秒/step。当前新增开销主要来自 probe4 搜索监督：`chunk_state_probe + chunk_state_score` 大约 19 秒/step。actor update 本身约 7.3 到 7.8 秒/step。
+
+Final validation:
+
+```text
+val-core/math/acc/mean@16=0.399875
+val-core/math/acc/maj@16/mean=0.500504
+val-core/math/acc/best@16/mean=0.813222
+val-aux/math/format_score/mean@16=0.874125
+val-aux/math/format_score/maj@16/mean=0.833808
+```
+
+结论：
+
+- 这个版本不通过 20-step gate，不能升 80-step。
+- 指标低于此前失败的 chunk MVP 区间，也远低于 MV baseline 的 20-step `mean@16≈0.735`。
+- `format_score` 仍高，但 acc 崩，说明模型仍会输出格式化答案，只是数学正确性/语义分布被破坏。
+- 失败更像目标构造问题，而不是 infra 问题：PowerFlow loss、chunk span、DP padding、Flash attention/vLLM 路径都已生效。
+- 需要停止沿着“strict success source + teacher anchor score floor=1 + probe4 PowerFlow target”直接扩展；下一版应重新设计 target，优先考虑降低 teacher-anchor 硬替换和 score floor 的强度，或改为从完整 rollout 随机截断后的 state 重新做 candidate/probe，避免每个 state 都被成功轨迹 teacher anchor 牵引到退化分布。
