@@ -1073,14 +1073,17 @@ class RayPPOTrainer:
         states_per_prompt = int(cfg.get("chunk_state_states_per_prompt", 1))
         max_prefix_tokens = int(cfg.get("chunk_state_max_prefix_tokens", 1024))
         boundaries = [int(x) for x in cfg.get("chunk_state_boundaries", [0, 256, 512, 768, 1024])]
+        min_boundary = int(cfg.get("chunk_state_min_boundary", 0))
         source_mode = str(cfg.get("chunk_state_source_mode", "random"))
         if not boundaries:
             boundaries = [0]
+        min_required_response_len = max([b for b in boundaries if b >= min_boundary], default=min_boundary)
 
         prompt_count = len(batch) // n
         prompt_len = batch.batch["prompts"].shape[-1]
         max_prompt_length = int(self.config.data.max_prompt_length)
         pad_token_id = self.tokenizer.pad_token_id
+        full_response_lens = batch.batch["response_mask"].bool().sum(dim=-1).detach().cpu()
 
         state_input_ids = []
         state_attention_masks = []
@@ -1092,13 +1095,29 @@ class RayPPOTrainer:
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
                 source_offset = self.global_steps + prompt_idx + state_idx
+                prompt_start = prompt_idx * n
+                prompt_stop = (prompt_idx + 1) * n
+                prompt_response_lens = full_response_lens[prompt_start:prompt_stop]
+                long_locals = torch.nonzero(
+                    prompt_response_lens >= min_required_response_len,
+                    as_tuple=False,
+                ).flatten()
                 if source_mode == "success" and source_correctness is not None:
-                    prompt_scores = source_correctness[prompt_idx * n : (prompt_idx + 1) * n]
+                    prompt_scores = source_correctness[prompt_start:prompt_stop]
                     good_locals = torch.nonzero(prompt_scores > 0.0, as_tuple=False).flatten()
+                    if min_required_response_len > 0 and long_locals.numel() > 0:
+                        long_good_mask = prompt_scores[long_locals] > 0.0
+                        long_good_locals = long_locals[long_good_mask]
+                        if long_good_locals.numel() > 0:
+                            good_locals = long_good_locals
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
+                    elif min_required_response_len > 0 and long_locals.numel() > 0:
+                        source_local = int(long_locals[source_offset % long_locals.numel()].item())
                     else:
                         source_local = source_offset % n
+                elif min_required_response_len > 0 and long_locals.numel() > 0:
+                    source_local = int(long_locals[source_offset % long_locals.numel()].item())
                 else:
                     source_local = source_offset % n
                 source_index = prompt_idx * n + source_local
@@ -1111,6 +1130,10 @@ class RayPPOTrainer:
                 ]
                 if not allowed_boundaries:
                     allowed_boundaries = [0]
+                if min_boundary > 0:
+                    nonzero_boundaries = [b for b in allowed_boundaries if b >= min_boundary]
+                    if nonzero_boundaries:
+                        allowed_boundaries = nonzero_boundaries
                 boundary = allowed_boundaries[(self.global_steps + prompt_idx + state_idx) % len(allowed_boundaries)]
                 prefix_ids = batch.batch["responses"][source_index, :boundary]
                 state_ids = torch.cat([prompt_ids, prefix_ids], dim=0)

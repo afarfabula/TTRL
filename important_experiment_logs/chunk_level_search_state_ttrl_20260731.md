@@ -1154,3 +1154,196 @@ boundary=257..768:
 3. 改 state 选择：减少 boundary=0，重点抽取 source correct 且 probe mixed 的中间 state；同时记录 source chunk 是否来自 correct final answer。
 4. 改 probe 设计：对每个 chunk candidate 做更短但更宽的 probe，优先获得 ranking/distribution，而不是只靠 0/1 稀疏 score。
 5. 再做 3-step smoke，只有 `mean@16` 不低于 0.60 且 `all_negative_ratio` 明显下降时才升 20-step。
+
+## 2026-07-31 Mid-State PowerFlow 变体设计
+
+动机：
+
+- 上一轮 JSONL 显示 `boundary=0` 的 probe 信号最强，但它不是我们要的 chunk-level search-state training；它退化成 prompt-only next chunk。
+- 真实创新点要求训练对象是 `query + generated prefix -> next chunk`，所以必须让 actor update 发生在中间推理状态。
+- 直接把 boundary 列表设成 `[256,512,768]` 仍不够：如果选中的 source rollout response 太短，原代码会 fallback 到 `0`。
+
+代码改动：
+
+- 新增默认关闭配置：
+
+```text
+ttrl.chunk_state_min_boundary=0
+```
+
+- 当该值为正数时，state 构造会优先选择 response 长度足够覆盖最小 boundary 的 source rollout。
+- 在 `source_mode=success` 下，优先级变成：
+
+```text
+correct and long enough source
+-> long enough source
+-> original fallback
+```
+
+- boundary 选择时，如果存在不小于 `min_boundary` 的合法 boundary，则过滤掉更短 boundary。
+- 默认值为 0，旧脚本语义不变。
+
+新 smoke 脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_midstate_b32_r32_v64_3step_20260731.sh
+```
+
+关键配置：
+
+```text
+ttrl.chunk_state_boundaries=[256,512,768]
+ttrl.chunk_state_min_boundary=256
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_teacher_anchor_enable=True
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+ttrl.chunk_state_actor_span=chunk
+ttrl.chunk_state_diag_jsonl=/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/${RUN_ID}.jsonl
+```
+
+验收重点：
+
+- `chunk_state_diag/boundary_zero_ratio` 必须接近 0。
+- `chunk_state_diag/state_all_negative_ratio` 相比上一轮 0.406 不能更差太多，理想下降。
+- `chunk_state/kept_state_ratio` 不能太低，否则训练样本不足。
+- `actor/powerflow_loss` 必须真实出现，确认仍是 PowerFlow actor update。
+- 3-step final val 如果仍在 0.45-0.46 附近，说明仅修正 mid-state 还不够，下一步转向 probe target 设计，而不是升 20-step。
+
+## 2026-07-31 Mid-State PowerFlow 3-Step Smoke 结果
+
+运行脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_midstate_b32_r32_v64_3step_20260731.sh
+```
+
+持久诊断产物：
+
+```text
+/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_midstate_b32_r32_v64_3step_20260731.jsonl
+```
+
+配置确认：
+
+```text
+total_training_steps=3
+train_batch_size=32
+rollout.n=32
+ttrl.chunk_state_boundaries=[256,512,768]
+ttrl.chunk_state_min_boundary=256
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_actor_span=chunk
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.use_dynamic_bsz=False
+rollout attention_config.backend=FLASH_ATTN
+```
+
+step-level 关键指标：
+
+```text
+step1:
+  boundary_mean=456.000
+  boundary_zero_ratio=0.000
+  state_all_negative_ratio=0.000
+  state_mixed_ratio=0.969
+  positive_ratio=0.320
+  kept_state_ratio=1.000
+  actor/powerflow_loss=0.574
+  update_actor=7.818s
+  training step wall=94.51s
+
+step2:
+  boundary_mean=424.000
+  boundary_zero_ratio=0.062
+  state_all_negative_ratio=0.000
+  state_mixed_ratio=1.000
+  positive_ratio=0.273
+  kept_state_ratio=1.000
+  actor/powerflow_loss=1.377
+  update_actor=7.046s
+  training step wall average=74.70s
+
+step3:
+  boundary_mean=488.000
+  boundary_zero_ratio=0.031
+  state_all_negative_ratio=0.000
+  state_mixed_ratio=0.938
+  positive_ratio=0.449
+  kept_state_ratio=1.000
+  actor/powerflow_loss=0.763
+  update_actor=7.501s
+  testing=292.974s
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16=0.49475
+val-core/math/acc/maj@16/mean=0.622692
+val-core/math/acc/best@16/mean=0.864892
+val-aux/math/format_score/mean@16=0.900625
+```
+
+JSONL 离线统计（三步合计 96 个 state）：
+
+```text
+rows=96
+steps=[1,2,3]
+
+step1:
+  boundary_zero_ratio=0.000
+  source_correct=0.90625
+  probe_mean=0.3203125
+  all_negative=0.000
+  mixed=0.96875
+  all_positive=0.03125
+  probe_positive_count_mean=2.5625
+
+step2:
+  boundary_zero_ratio=0.0625
+  source_correct=0.96875
+  probe_mean=0.2734375
+  all_negative=0.000
+  mixed=1.000
+  all_positive=0.000
+  probe_positive_count_mean=2.1875
+
+step3:
+  boundary_zero_ratio=0.03125
+  source_correct=0.9375
+  probe_mean=0.44921875
+  all_negative=0.000
+  mixed=0.9375
+  all_positive=0.0625
+  probe_positive_count_mean=3.59375
+
+overall:
+  boundary_mean=456.0
+  boundary_zero_ratio=0.03125
+  source_correct_ratio=0.9375
+  all_negative_ratio=0.0
+  mixed_ratio=0.96875
+  all_positive_ratio=0.03125
+  flat_score_mean=0.34765625
+  flat_positive_ratio=0.34765625
+```
+
+结论：
+
+- `chunk_state_min_boundary` 修复了上一轮最关键的监督退化问题：`boundary_zero_ratio` 从上一轮 0.25 降到整体 0.031，绝大多数训练样本是真正的中间 search state。
+- target 分布明显健康：上一轮 `state_all_negative_ratio=0.406`，这轮三步都是 0；`mixed_ratio` 约 0.94-1.00，PowerFlow target 有真实区分度。
+- actor 侧确认仍是 PowerFlow loss：`actor/powerflow_loss` 每步都有，且 `powerflow_use_chunk_weights=True` 后 `actor/powerflow_weight` 非恒等。
+- 但是 final val 仍然只有 `mean@16=0.49475`，比前几版 0.45-0.46 有改善，但距离 20-step gate 的 0.60 下限仍很远。
+- 这说明“mid-state 采样 + teacher anchor + weighted PowerFlow”修好了 target 统计，但还没修好训练语义对 full-answer accuracy 的破坏。
+
+下一步：
+
+1. 不升 20-step。
+2. 保留 mid-state gate 和 PowerFlow loss。
+3. 改 probe target：减少把单个 0/1 final reward 直接投影到 chunk 的噪声，优先做更宽/更短 probe 或 probe-majority target。
+4. 增加一个 no-final-val smoke 模式，避免 3-step 诊断每次多花约 293s validation。

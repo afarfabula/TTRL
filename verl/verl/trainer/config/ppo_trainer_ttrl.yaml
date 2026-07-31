@@ -53,6 +53,9 @@ ttrl:
   chunk_state_states_per_prompt: 1
   chunk_state_max_prefix_tokens: 1024
   chunk_state_boundaries: [0, 256, 512, 768, 1024]
+  # Keep 0 by default for backward compatibility. Diagnostic scripts can set a
+  # positive value to prefer true mid-reasoning states over prompt-only states.
+  chunk_state_min_boundary: 0
   chunk_state_alpha: 2.0
   chunk_state_eps: 0.05
   chunk_state_min_informative_gap: 0.0
