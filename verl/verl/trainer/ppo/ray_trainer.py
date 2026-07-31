@@ -1375,6 +1375,50 @@ class RayPPOTrainer:
             }
         return target
 
+    def _apply_chunk_state_teacher_anchor(
+        self,
+        full_batch: DataProto,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+    ) -> dict:
+        cfg = self.config.ttrl
+        candidates = int(cfg.get("chunk_state_candidates", 8))
+        anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
+        chunk_size = int(cfg.get("chunk_state_chunk_size", 256))
+        if anchor_idx < 0 or anchor_idx >= candidates:
+            raise ValueError(
+                f"chunk_state_teacher_anchor_candidate_index={anchor_idx} outside [0, {candidates})"
+            )
+
+        source_indices = np.asarray(state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=np.int64)
+        boundaries = np.asarray(state_prompts.non_tensor_batch["chunk_state_boundary"], dtype=np.int64)
+        full_response_mask = full_batch.batch["response_mask"].bool()
+        replacements = 0
+        anchor_lengths = []
+        for state_idx, (source_index, boundary) in enumerate(zip(source_indices, boundaries)):
+            valid_response_len = int(full_response_mask[source_index].sum().item())
+            if boundary >= valid_response_len:
+                continue
+            anchor_len = min(chunk_size, valid_response_len - int(boundary))
+            if anchor_len <= 0:
+                continue
+            target_idx = state_idx * candidates + anchor_idx
+            chunk_output.batch["responses"][target_idx].fill_(self.tokenizer.pad_token_id)
+            chunk_output.batch["response_mask"][target_idx].zero_()
+            anchor_tokens = full_batch.batch["responses"][source_index, int(boundary) : int(boundary) + anchor_len]
+            chunk_output.batch["responses"][target_idx, :anchor_len] = anchor_tokens
+            chunk_output.batch["response_mask"][target_idx, :anchor_len] = 1
+            replacements += 1
+            anchor_lengths.append(anchor_len)
+
+        state_count = len(state_prompts)
+        return {
+            "chunk_state_teacher_anchor/enabled": 1.0,
+            "chunk_state_teacher_anchor/replaced_ratio": replacements / max(state_count, 1),
+            "chunk_state_teacher_anchor/mean_len": float(np.mean(anchor_lengths)) if anchor_lengths else 0.0,
+            "chunk_state_teacher_anchor/candidate_index": float(anchor_idx),
+        }
+
     def _build_chunk_actor_batch(
         self,
         state_prompts: DataProto,
@@ -1504,6 +1548,8 @@ class RayPPOTrainer:
             chunk_prompts.meta_info["kwargs"] = {"n": candidates, "max_tokens": chunk_size}
             chunk_output = self.actor_rollout_wg.generate_sequences(chunk_prompts)
             chunk_output = self._repeat_non_tensor_like(state_prompts, chunk_output, candidates)
+            if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
+                metrics.update(self._apply_chunk_state_teacher_anchor(full_batch, state_prompts, chunk_output))
             if "timing" in chunk_output.meta_info:
                 for key, value in chunk_output.meta_info["timing"].items():
                     timing_raw[f"chunk_state_chunks/{key}"] = value
@@ -1527,6 +1573,16 @@ class RayPPOTrainer:
             probe_batch = self._build_probe_reward_batch(state_prompts, chunk_output, probe_output)
             reward_tensor, _ = compute_reward(probe_batch, self.reward_fn)
             scores = reward_tensor.sum(dim=-1).detach().cpu()
+            if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
+                anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
+                anchor_score = float(cfg.get("chunk_state_teacher_anchor_score", 1.0))
+                score_matrix = scores.view(len(state_prompts), candidates)
+                score_matrix[:, anchor_idx] = torch.maximum(
+                    score_matrix[:, anchor_idx],
+                    torch.full_like(score_matrix[:, anchor_idx], anchor_score),
+                )
+                scores = score_matrix.reshape(-1)
+                metrics["chunk_state_teacher_anchor/score_floor"] = anchor_score
             metrics.update(self._compute_chunk_state_diag_metrics(full_batch, state_prompts, scores))
 
         with marked_timer("chunk_state_build_actor_batch", timing_raw, color="blue"):

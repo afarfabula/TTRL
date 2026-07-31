@@ -62,3 +62,8 @@ ttrl:
   # are correct under original GT reward, falling back to random if none exist.
   chunk_state_source_mode: random
   chunk_state_skip_all_negative: false
+  # If enabled, replace one sampled chunk candidate with the source rollout's
+  # original next chunk to anchor the local target distribution on a successful path.
+  chunk_state_teacher_anchor_enable: false
+  chunk_state_teacher_anchor_score: 1.0
+  chunk_state_teacher_anchor_candidate_index: 0

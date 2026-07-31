@@ -680,3 +680,153 @@ timing_s/testing=297.709
   - success source 的 original next chunk 加入 PowerFlow target 或作为 anchor weight。
   - boundary 先试 `[256,512,768]`，避免 boundary=0 退化成普通 full-answer sampling。
   - 只低频打开 full original-GT diagnostic，避免每步多算 full rollout reward。
+
+## 2026-07-31 Teacher Anchor + Nonzero Boundary 设计
+
+动机：
+
+- Weighted PowerFlow target 已经确认进入 actor loss，但 3-step validation 仍未改善。
+- 当前 target 完全来自 `state + sampled chunk + probe` 的 verifier 结果，仍可能追逐短 probe 的偶然成功。
+- success-conditioned source rollout 本身已经是 original-GT correct 的完整轨迹，应把它在当前 boundary 后的 original next chunk 作为局部 teacher anchor。
+
+实现：
+
+```text
+state = query + source_response[:t]
+anchor_chunk = source_response[t : t + chunk_size]
+```
+
+在每个 state 的 K 个 candidates 中，不额外增加 candidate 数，而是把 `candidate[0]` 替换为 `anchor_chunk`，然后照常做 probe scoring。scoring 后对 anchor candidate 加 score floor：
+
+```text
+score_anchor = max(score_anchor_from_probe, teacher_anchor_score)
+```
+
+默认配置仍关闭，实验脚本显式打开：
+
+```text
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_score=1.0
+ttrl.chunk_state_teacher_anchor_candidate_index=0
+actor.powerflow_use_chunk_weights=True
+```
+
+同时把 boundary 收窄到非零中早段：
+
+```text
+ttrl.chunk_state_boundaries=[256,512,768]
+```
+
+预期：
+
+- `boundary_zero_ratio` 应显著低于 random-boundary 版本；如果 source response 短于所有指定 boundary，当前实现会 fallback 到 0。
+- `teacher_anchor/replaced_ratio` 应接近 1；如果明显低，说明很多 success source 长度短于 boundary。
+- `chunk_state/powerflow_weight_max` 仍应大于 1，说明 target distribution 不是 uniform。
+- `update_actor` 不应明显慢于 weighted-success smoke。
+
+待跑脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_anchor_nonzero_b32_r32_v64_3step_20260731.sh
+```
+
+## 2026-07-31 Teacher Anchor + Nonzero Boundary 3-step 结果
+
+配置：
+
+```text
+train_batch_size=32
+rollout.n=32
+val_kwargs.n=16
+total_training_steps=3
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=256
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_boundaries=[256,512,768]
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_score=1.0
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+actor.use_kl_loss=False
+```
+
+关键 step 指标：
+
+```text
+step1:
+selected_original_acc_mean=0.906
+teacher_anchor/replaced_ratio=1.000
+teacher_anchor/mean_len=177.281
+boundary_zero_ratio=0.031
+state_all_negative_ratio=0.000
+state_mixed_ratio=1.000
+positive_ratio=0.355
+target_entropy=0.837
+powerflow_weight_max=7.875
+actor/powerflow_loss=1.931
+timing_s/gen=52.047
+timing_s/chunk_state_probe=13.867
+timing_s/chunk_state_score=10.198
+timing_s/chunk_state_ref=5.850
+timing_s/update_actor=6.456
+
+step2:
+selected_original_acc_mean=0.906
+teacher_anchor/replaced_ratio=1.000
+teacher_anchor/mean_len=174.906
+boundary_zero_ratio=0.094
+state_all_negative_ratio=0.000
+state_mixed_ratio=1.000
+positive_ratio=0.309
+target_entropy=0.736
+powerflow_weight_max=7.875
+actor/powerflow_loss=1.757
+timing_s/gen=23.501
+timing_s/chunk_state_probe=13.798
+timing_s/chunk_state_score=9.090
+timing_s/chunk_state_ref=2.068
+timing_s/update_actor=6.562
+
+step3:
+selected_original_acc_mean=0.906
+teacher_anchor/replaced_ratio=1.000
+teacher_anchor/mean_len=181.062
+boundary_zero_ratio=0.031
+state_all_negative_ratio=0.000
+state_mixed_ratio=1.000
+positive_ratio=0.328
+target_entropy=0.788
+powerflow_weight_max=7.875
+actor/powerflow_loss=1.665
+timing_s/gen=23.615
+timing_s/chunk_state_probe=14.070
+timing_s/chunk_state_score=9.289
+timing_s/chunk_state_ref=2.130
+timing_s/update_actor=6.798
+timing_s/testing=300.769
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16=0.456125
+val-core/math/acc/maj@16/mean=0.579148
+val-core/math/acc/best@16/mean=0.844980
+val-aux/math/format_score/mean@16=0.897500
+```
+
+结论：
+
+- Teacher anchor 真实生效：每步 `replaced_ratio=1.0`，anchor score floor 生效，PowerFlow weighted loss 仍是 actor update 主路径。
+- target 诊断明显变健康：`state_all_negative_ratio=0`，`state_mixed_ratio=1.0`，说明 anchor 解决了 all-negative state 的训练信号缺失。
+- 但 final validation 仍和前两个 chunk-state 失败版本同档，低于 base/MV gate，不能升 20-step。
+- `boundary_zero_ratio` 仍有 3%-9%，原因是部分 source response 长度不够，`_make_chunk_state_prompts` fallback 到 0；这不是主要失败原因。
+- 这条结果说明：仅靠 success original chunk 作为 local teacher anchor，会把局部 target 变干净，但没有解决“局部 chunk 更新破坏 full-answer policy / target 与最终任务分布错配”的问题。
+
+下一步方向：
+
+- 不继续扩 teacher-anchor 3-step 到 20/80 step。
+- 优先改训练对象：不要只训练短 chunk 本身，考虑把 PowerFlow loss 作用在 `state + chunk + short continuation` 的可评分 span，或加入 full-answer distillation/regularization，避免模型只学局部补丁。
+- 降低 final validation 频率，后续 3-step smoke 只在关键 gate 做 val；诊断阶段记录 target stats 和少量 held-out prompts，减少 300s validation 固定成本。
