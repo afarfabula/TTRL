@@ -531,12 +531,18 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if self.config.get("chunk_weighted_nll_enable", False):
+            select_keys.append("chunk_weights")
         if self.config.get("powerflow_enable", False):
             select_keys.append("boxed_reward")
             select_keys.append("ref_log_prob")
             if "rollout_log_probs" in data.batch:
                 select_keys.append("rollout_log_probs")
-        if self.config.use_kl_loss and "ref_log_prob" not in select_keys:
+        if (
+            self.config.use_kl_loss
+            and not self.config.get("chunk_weighted_nll_enable", False)
+            and "ref_log_prob" not in select_keys
+        ):
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -613,7 +619,13 @@ class DataParallelPPOActor(BasePPOActor):
                         data = data.to(get_device_id())  # actor device is cpu when using offload
                     response_mask = data["response_mask"]
                     old_log_prob = data["old_log_probs"]
-                    advantages = data.get("advantages", torch.zeros_like(response_mask, dtype=torch.float32))
+                    data_keys = set(data.keys())
+                    advantages = (
+                        data["advantages"]
+                        if "advantages" in data_keys
+                        else torch.zeros_like(response_mask, dtype=torch.float32)
+                    )
+                    chunk_weights = data["chunk_weights"] if "chunk_weights" in data_keys else None
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = (
@@ -631,7 +643,31 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
 
-                    if self.config.get("powerflow_enable", False):
+                    if self.config.get("chunk_weighted_nll_enable", False):
+                        entropy, log_prob = self._forward_micro_batch(
+                            micro_batch=data, temperature=temperature, calculate_entropy=False
+                        )
+                        if chunk_weights is None:
+                            raise ValueError("chunk_weighted_nll_enable requires `chunk_weights` in actor batch")
+                        chunk_weights = chunk_weights.to(log_prob.dtype).view(-1, 1)
+                        token_loss = -log_prob * response_mask * chunk_weights
+                        denom = response_mask.sum().clamp(min=1).to(log_prob.dtype)
+                        policy_loss = token_loss.sum() / denom
+                        pg_loss = policy_loss
+                        ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
+                        micro_batch_metrics.update(
+                            {
+                                "actor/pg_loss": pg_loss.detach().item(),
+                                "actor/chunk_weighted_nll_loss": policy_loss.detach().item(),
+                                "actor/chunk_weight_mean": chunk_weights.mean().detach().item(),
+                                "actor/chunk_weight_max": chunk_weights.max().detach().item(),
+                                "actor/chunk_weight_min": chunk_weights.min().detach().item(),
+                                "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/pg_clipfrac": 0.0,
+                                "actor/pg_clipfrac_lower": 0.0,
+                            }
+                        )
+                    elif self.config.get("powerflow_enable", False):
                         entropy, log_prob, log_z = self._forward_micro_batch(
                             micro_batch=data,
                             temperature=temperature,
@@ -641,7 +677,7 @@ class DataParallelPPOActor(BasePPOActor):
                         if self.config.get("powerflow_on_policy", False):
                             old_log_prob = log_prob.detach()
                         ref_log_prob = data["ref_log_prob"]
-                        boxed_reward = data.get("boxed_reward")
+                        boxed_reward = data["boxed_reward"] if "boxed_reward" in data_keys else None
                         policy_loss, powerflow_metrics = self.compute_powerflow(
                             log_prob=log_prob,
                             ref_log_prob=ref_log_prob,
@@ -649,7 +685,7 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                             log_z=log_z,
                             boxed_reward=boxed_reward,
-                            rollout_log_probs=data.get("rollout_log_probs"),
+                            rollout_log_probs=data["rollout_log_probs"] if "rollout_log_probs" in data_keys else None,
                             use_boxed_reward=self.config.get("powerflow_use_boxed_reward", False),
                         )
                         pg_loss = policy_loss
@@ -698,7 +734,7 @@ class DataParallelPPOActor(BasePPOActor):
                             }
                         )
 
-                    if self.config.use_kl_loss:
+                    if self.config.use_kl_loss and not self.config.get("chunk_weighted_nll_enable", False):
                         ref_log_prob = data["ref_log_prob"]
                         if self.config.get("powerflow_enable", False):
                             kl_loss = torch.zeros((), device=log_prob.device)

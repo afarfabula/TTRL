@@ -38,6 +38,8 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from tensordict import TensorDict
+import verl.utils.torch_functional as verl_F
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -1034,6 +1036,353 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _make_chunk_state_prompts(self, batch: DataProto) -> tuple[DataProto, list[int]]:
+        cfg = self.config.ttrl
+        n = int(cfg.n_samples_per_prompt)
+        states_per_prompt = int(cfg.get("chunk_state_states_per_prompt", 1))
+        max_prefix_tokens = int(cfg.get("chunk_state_max_prefix_tokens", 1024))
+        boundaries = [int(x) for x in cfg.get("chunk_state_boundaries", [0, 256, 512, 768, 1024])]
+        if not boundaries:
+            boundaries = [0]
+
+        prompt_count = len(batch) // n
+        prompt_len = batch.batch["prompts"].shape[-1]
+        max_prompt_length = int(self.config.data.max_prompt_length)
+        pad_token_id = self.tokenizer.pad_token_id
+
+        state_input_ids = []
+        state_attention_masks = []
+        source_indices = []
+        for prompt_idx in range(prompt_count):
+            for state_idx in range(states_per_prompt):
+                source_local = (self.global_steps + prompt_idx + state_idx) % n
+                source_index = prompt_idx * n + source_local
+                valid_prompt_len = int(batch.batch["attention_mask"][source_index, :prompt_len].sum().item())
+                prompt_ids = batch.batch["prompts"][source_index, -valid_prompt_len:]
+                response_mask = batch.batch["response_mask"][source_index].bool()
+                valid_response_len = int(response_mask.sum().item())
+                allowed_boundaries = [
+                    b for b in boundaries if b <= valid_response_len and b <= max_prefix_tokens
+                ]
+                if not allowed_boundaries:
+                    allowed_boundaries = [0]
+                boundary = allowed_boundaries[(self.global_steps + prompt_idx + state_idx) % len(allowed_boundaries)]
+                prefix_ids = batch.batch["responses"][source_index, :boundary]
+                state_ids = torch.cat([prompt_ids, prefix_ids], dim=0)
+                if state_ids.numel() > max_prompt_length:
+                    state_ids = state_ids[-max_prompt_length:]
+                attn = torch.ones_like(state_ids)
+                state_ids, attn = verl_F.postprocess_data(
+                    input_ids=state_ids.unsqueeze(0),
+                    attention_mask=attn.unsqueeze(0),
+                    max_length=max_prompt_length,
+                    pad_token_id=pad_token_id,
+                    left_pad=True,
+                    truncation="left",
+                )
+                state_input_ids.append(state_ids.squeeze(0))
+                state_attention_masks.append(attn.squeeze(0))
+                source_indices.append(source_index)
+
+        input_ids = torch.stack(state_input_ids, dim=0)
+        attention_mask = torch.stack(state_attention_masks, dim=0)
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+        state_batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=(input_ids.shape[0],),
+        )
+        state_non_tensor = {}
+        for key, value in batch.non_tensor_batch.items():
+            state_non_tensor[key] = value[np.asarray(source_indices, dtype=np.int64)]
+        state_proto = DataProto(batch=state_batch, non_tensor_batch=state_non_tensor)
+        state_proto.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": True,
+        }
+        return state_proto, source_indices
+
+    def _combine_state_and_completion_prompts(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        max_completion_tokens: int,
+    ) -> DataProto:
+        prompt_len = state_prompts.batch["input_ids"].shape[-1]
+        response_mask = chunk_output.batch["response_mask"].bool()
+        combined_ids = []
+        combined_masks = []
+        candidates = len(chunk_output) // len(state_prompts)
+        for i in range(len(chunk_output)):
+            source_idx = i // candidates
+            state_valid_len = int(state_prompts.batch["attention_mask"][source_idx].sum().item())
+            state_ids = state_prompts.batch["input_ids"][source_idx, -state_valid_len:]
+            chunk_len = int(response_mask[i].sum().item())
+            chunk_ids = chunk_output.batch["responses"][i, :chunk_len]
+            combined = torch.cat([state_ids, chunk_ids], dim=0)
+            if combined.numel() > prompt_len:
+                combined = combined[-prompt_len:]
+            attn = torch.ones_like(combined)
+            combined, attn = verl_F.postprocess_data(
+                input_ids=combined.unsqueeze(0),
+                attention_mask=attn.unsqueeze(0),
+                max_length=prompt_len,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation="left",
+            )
+            combined_ids.append(combined.squeeze(0))
+            combined_masks.append(attn.squeeze(0))
+
+        input_ids = torch.stack(combined_ids, dim=0)
+        attention_mask = torch.stack(combined_masks, dim=0)
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+        prompt_batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=(len(chunk_output),),
+        )
+        non_tensor_batch = {}
+        for key, value in state_prompts.non_tensor_batch.items():
+            non_tensor_batch[key] = np.repeat(value, len(chunk_output) // len(state_prompts), axis=0)
+        proto = DataProto(batch=prompt_batch, non_tensor_batch=non_tensor_batch)
+        proto.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": True,
+            "kwargs": {"n": 1, "max_tokens": int(max_completion_tokens)},
+        }
+        return proto
+
+    def _build_probe_reward_batch(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        probe_output: DataProto,
+    ) -> DataProto:
+        candidates = len(chunk_output) // len(state_prompts)
+        prompt_ids = []
+        prompt_masks = []
+        prompt_position_ids = []
+        responses = []
+        response_masks = []
+        chunk_mask = chunk_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool()
+        max_response_len = chunk_output.batch["responses"].shape[-1] + probe_output.batch["responses"].shape[-1]
+
+        for i in range(len(chunk_output)):
+            source_idx = i // candidates
+            prompt_ids.append(state_prompts.batch["input_ids"][source_idx])
+            prompt_masks.append(state_prompts.batch["attention_mask"][source_idx])
+            prompt_position_ids.append(state_prompts.batch["position_ids"][source_idx])
+
+            chunk_len = int(chunk_mask[i].sum().item())
+            probe_len = int(probe_mask[i].sum().item())
+            response_ids = torch.cat(
+                [
+                    chunk_output.batch["responses"][i, :chunk_len],
+                    probe_output.batch["responses"][i, :probe_len],
+                ],
+                dim=0,
+            )
+            padded = torch.full(
+                (max_response_len,),
+                self.tokenizer.pad_token_id,
+                dtype=response_ids.dtype,
+                device=response_ids.device,
+            )
+            padded[: response_ids.numel()] = response_ids
+            mask = torch.zeros((max_response_len,), dtype=state_prompts.batch["attention_mask"].dtype, device=response_ids.device)
+            mask[: response_ids.numel()] = 1
+            responses.append(padded)
+            response_masks.append(mask)
+
+        prompt_ids = torch.stack(prompt_ids, dim=0)
+        prompt_masks = torch.stack(prompt_masks, dim=0)
+        prompt_position_ids = torch.stack(prompt_position_ids, dim=0)
+        responses = torch.stack(responses, dim=0)
+        response_masks = torch.stack(response_masks, dim=0)
+        input_ids = torch.cat([prompt_ids, responses], dim=-1)
+        attention_mask = torch.cat([prompt_masks, response_masks], dim=-1)
+        delta_position_id = torch.arange(1, responses.shape[-1] + 1, device=prompt_ids.device).unsqueeze(0)
+        response_position_ids = prompt_position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([prompt_position_ids, response_position_ids], dim=-1)
+
+        reward_batch = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "response_mask": response_masks,
+            },
+            batch_size=(len(chunk_output),),
+        )
+        non_tensor_batch = {
+            key: np.repeat(value, candidates, axis=0) for key, value in state_prompts.non_tensor_batch.items()
+        }
+        return DataProto(batch=reward_batch, non_tensor_batch=non_tensor_batch)
+
+    def _repeat_non_tensor_like(self, source: DataProto, target: DataProto, repeat_times: int) -> DataProto:
+        if len(target) == len(source) * repeat_times:
+            target.non_tensor_batch = {
+                key: np.repeat(value, repeat_times, axis=0) for key, value in source.non_tensor_batch.items()
+            }
+        return target
+
+    def _build_chunk_actor_batch(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        scores: torch.Tensor,
+    ) -> tuple[DataProto, dict]:
+        cfg = self.config.ttrl
+        num_states = len(state_prompts)
+        candidates = int(cfg.get("chunk_state_candidates", 8))
+        alpha = float(cfg.get("chunk_state_alpha", 2.0))
+        eps = float(cfg.get("chunk_state_eps", 0.05))
+        skip_uniform = bool(cfg.get("chunk_state_skip_uniform", False))
+
+        score_matrix = scores.view(num_states, candidates).float()
+        raw_weights = torch.pow(score_matrix + eps, alpha)
+        weight_sums = raw_weights.sum(dim=-1, keepdim=True)
+        uniform = torch.full_like(raw_weights, 1.0 / candidates)
+        weights = torch.where(weight_sums > 0, raw_weights / weight_sums.clamp(min=1e-12), uniform)
+        informative = ((score_matrix.max(dim=-1).values - score_matrix.min(dim=-1).values) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
+        if skip_uniform:
+            keep_state = informative.bool()
+        else:
+            keep_state = torch.ones(num_states, dtype=torch.bool)
+        keep_indices = []
+        for state_idx in range(num_states):
+            if keep_state[state_idx]:
+                keep_indices.extend(range(state_idx * candidates, (state_idx + 1) * candidates))
+        if not keep_indices:
+            keep_indices = list(range(len(chunk_output)))
+
+        repeated_state_prompts = state_prompts.repeat(repeat_times=candidates, interleave=True)
+        kept_states = repeated_state_prompts[keep_indices]
+        kept_chunks = chunk_output[keep_indices]
+        flat_weights = weights.reshape(-1)[keep_indices]
+
+        prompt_ids = kept_states.batch["input_ids"]
+        prompt_mask = kept_states.batch["attention_mask"]
+        responses = kept_chunks.batch["responses"]
+        response_mask = kept_chunks.batch["response_mask"]
+        input_ids = torch.cat([prompt_ids, responses], dim=-1)
+        attention_mask = torch.cat([prompt_mask, response_mask], dim=-1)
+        response_len = responses.shape[-1]
+        delta_position_id = torch.arange(1, response_len + 1, device=prompt_ids.device).unsqueeze(0)
+        response_position_ids = kept_states.batch["position_ids"][..., -1:] + delta_position_id
+        position_ids = torch.cat([kept_states.batch["position_ids"], response_position_ids], dim=-1)
+        actor_batch = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "response_mask": response_mask,
+                "old_log_probs": torch.zeros_like(responses, dtype=torch.float32),
+                "advantages": torch.zeros_like(responses, dtype=torch.float32),
+                "chunk_weights": flat_weights.to(dtype=torch.float32),
+                "boxed_reward": torch.zeros_like(responses, dtype=torch.float32),
+            },
+            batch_size=(len(keep_indices),),
+        )
+        response_lengths = response_mask.sum(dim=-1).clamp(min=1).long()
+        actor_batch["boxed_reward"][torch.arange(len(keep_indices)), response_lengths - 1] = score_matrix.reshape(-1)[
+            keep_indices
+        ].to(dtype=torch.float32)
+        actor_proto = DataProto(
+            batch=actor_batch,
+            non_tensor_batch=kept_states.non_tensor_batch,
+            meta_info={
+                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "multi_turn": self.config.actor_rollout_ref.rollout.multi_turn.enable,
+            },
+        )
+        metrics = {
+            "chunk_state/num_states": float(num_states),
+            "chunk_state/num_candidates": float(len(chunk_output)),
+            "chunk_state/num_actor_samples": float(len(actor_proto)),
+            "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
+            "chunk_state/informative_ratio": informative.mean().detach().item(),
+            "chunk_state/target_entropy": (-(weights * torch.log(weights.clamp(min=1e-12))).sum(dim=-1).mean()).detach().item(),
+            "chunk_state/weight_max": weights.max().detach().item(),
+            "chunk_state/weight_min": weights.min().detach().item(),
+        }
+        return actor_proto, metrics
+
+    def _run_chunk_state_training_step(self, full_batch: DataProto, metrics: dict, timing_raw: dict):
+        cfg = self.config.ttrl
+        candidates = int(cfg.get("chunk_state_candidates", 8))
+        chunk_size = int(cfg.get("chunk_state_chunk_size", 256))
+        probe_max_tokens = int(cfg.get("chunk_state_probe_max_tokens", self.config.data.max_response_length))
+        max_model_len = int(self.config.actor_rollout_ref.rollout.max_model_len)
+        max_prompt_len = int(self.config.data.max_prompt_length)
+
+        with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
+            state_prompts, _ = self._make_chunk_state_prompts(full_batch)
+
+        with marked_timer("chunk_state_chunks", timing_raw, color="red"):
+            chunk_prompts = deepcopy(state_prompts)
+            chunk_prompts.meta_info["kwargs"] = {"n": candidates, "max_tokens": chunk_size}
+            chunk_output = self.actor_rollout_wg.generate_sequences(chunk_prompts)
+            chunk_output = self._repeat_non_tensor_like(state_prompts, chunk_output, candidates)
+            if "timing" in chunk_output.meta_info:
+                for key, value in chunk_output.meta_info["timing"].items():
+                    timing_raw[f"chunk_state_chunks/{key}"] = value
+                chunk_output.meta_info.pop("timing", None)
+
+        with marked_timer("chunk_state_probe", timing_raw, color="red"):
+            probe_tokens = max(1, min(probe_max_tokens, max_model_len - max_prompt_len))
+            probe_prompts = self._combine_state_and_completion_prompts(
+                state_prompts=state_prompts,
+                chunk_output=chunk_output,
+                max_completion_tokens=probe_tokens,
+            )
+            probe_output = self.actor_rollout_wg.generate_sequences(probe_prompts)
+            probe_output.non_tensor_batch = probe_prompts.non_tensor_batch
+            if "timing" in probe_output.meta_info:
+                for key, value in probe_output.meta_info["timing"].items():
+                    timing_raw[f"chunk_state_probe/{key}"] = value
+                probe_output.meta_info.pop("timing", None)
+
+        with marked_timer("chunk_state_score", timing_raw, color="yellow"):
+            probe_batch = self._build_probe_reward_batch(state_prompts, chunk_output, probe_output)
+            reward_tensor, _ = compute_reward(probe_batch, self.reward_fn)
+            scores = reward_tensor.sum(dim=-1).detach().cpu()
+
+        with marked_timer("chunk_state_build_actor_batch", timing_raw, color="blue"):
+            actor_batch, chunk_metrics = self._build_chunk_actor_batch(state_prompts, chunk_output, scores)
+            metrics.update(chunk_metrics)
+            actor_batch.meta_info["global_token_num"] = torch.sum(actor_batch.batch["attention_mask"], dim=-1).tolist()
+
+        if self.config.actor_rollout_ref.actor.get("powerflow_enable", False):
+            with marked_timer("chunk_state_ref", timing_raw, color="olive"):
+                if not self.ref_in_actor:
+                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(actor_batch)
+                else:
+                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(actor_batch)
+                actor_batch = actor_batch.union(ref_log_prob)
+
+        with marked_timer("update_actor", timing_raw, color="red"):
+            actor_output = self.actor_rollout_wg.update_actor(actor_batch)
+        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+        metrics.update(actor_output_metrics)
+        return actor_batch
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1138,11 +1487,25 @@ class RayPPOTrainer:
                             from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt
 
                             powerflow_no_majority = self.config.ttrl.get("powerflow_no_majority", False)
-                            rollout_n = (
-                                self.config.ttrl.n_samples_per_prompt
-                                if powerflow_no_majority
-                                else self.config.ttrl.n_votes_per_prompt
-                            )
+                            if powerflow_no_majority:
+                                # Match the original PowerFlow dataflow: expand prompts first and
+                                # let vLLM sample one response per expanded prompt, instead of
+                                # asking vLLM for n responses per original prompt.
+                                batch.non_tensor_batch["uid"] = np.array(
+                                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                                )
+                                batch = batch.repeat(
+                                    repeat_times=self.config.ttrl.n_samples_per_prompt,
+                                    interleave=True,
+                                )
+                                gen_batch = gen_batch.repeat(
+                                    repeat_times=self.config.ttrl.n_samples_per_prompt,
+                                    interleave=True,
+                                )
+                                rollout_n = 1
+                            else:
+                                rollout_n = self.config.ttrl.n_votes_per_prompt
+                            gen_batch.meta_info["global_steps"] = self.global_steps
                             gen_batch.meta_info["kwargs"] = {"n": rollout_n}
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
@@ -1158,7 +1521,8 @@ class RayPPOTrainer:
                                 )
                                 gen_batch_output = select_top_k_per_prompt(gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.config.ttrl.n_samples_per_prompt)
 
-                            assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
+                            expected_samples = 1 if powerflow_no_majority else self.config.ttrl.n_samples_per_prompt
+                            assert len(gen_batch_output) == len(batch) * expected_samples
                         else:
                             if not self.async_rollout_mode:
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -1185,7 +1549,10 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    if not repeat_sampling_sglang_grpo:
+                    if not repeat_sampling_sglang_grpo and not (
+                        self.config.get("ttrl", {}).get("enable", False)
+                        and self.config.ttrl.get("powerflow_no_majority", False)
+                    ):
                         batch.non_tensor_batch["uid"] = np.array(
                             [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                         )
@@ -1196,6 +1563,60 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    if (
+                        self.config.get("ttrl", {}).get("enable", False)
+                        and self.config.ttrl.get("chunk_state_enable", False)
+                    ):
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                        self._run_chunk_state_training_step(batch, metrics, timing_raw)
+
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            metrics["chunk_state/rollout_dump_skipped"] = 1.0
+
+                        if (
+                            self.val_reward_fn is not None
+                            and self.config.trainer.test_freq > 0
+                            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                        ):
+                            with marked_timer("testing", timing_raw, color="green"):
+                                val_metrics: dict = self._validate()
+                                if is_last_step:
+                                    last_val_metrics = val_metrics
+                            metrics.update(val_metrics)
+
+                        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                        if "step" in timing_raw:
+                            metrics.update(
+                                compute_throughout_metrics(
+                                    batch=batch,
+                                    timing_raw=timing_raw,
+                                    n_gpus=self.config.trainer.n_gpus_per_node,
+                                )
+                            )
+                        logger.log(data=metrics, step=self.global_steps)
+                        self.global_steps += 1
+                        if is_last_step:
+                            pprint(f"Final validation metrics: {last_val_metrics}")
+                            progress_bar.close()
+                            return
+                        progress_bar.update(1)
+                        continue
+
+                    if (
+                        self.config.get("ttrl", {}).get("enable", False)
+                        and self.config.ttrl.get("sharpened_enable", False)
+                        and not self.config.ttrl.get("powerflow_no_majority", False)
+                    ):
+                        from verl.trainer.ppo.ttrl_utils import apply_sharpened_ttrl_reward
+
+                        batch = apply_sharpened_ttrl_reward(
+                            batch,
+                            self.config.ttrl.n_samples_per_prompt,
+                            self.tokenizer,
+                            self.config,
+                        )
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1297,6 +1718,25 @@ class RayPPOTrainer:
                                 self.config.ttrl.get("powerflow_no_majority", False)
                             )
                         else:
+                            if (
+                                self.config.get("ttrl", {}).get("enable", False)
+                                and self.config.ttrl.get("sharpened_enable", False)
+                                and "sharpened_token_level_scores" in batch.batch
+                            ):
+                                reward_tensor = batch.batch["sharpened_token_level_scores"]
+                                metrics["train/sharpened_reward"] = (
+                                    reward_tensor.sum(dim=-1).float().mean().detach().item()
+                                )
+                                for key in [
+                                    "sharpened_coverage",
+                                    "sharpened_top_prob",
+                                    "sharpened_entropy",
+                                    "sharpened_negative_rate",
+                                    "sharpened_label_hit",
+                                    "sharpened_negative_hit",
+                                ]:
+                                    if key in batch.non_tensor_batch:
+                                        metrics[f"train/{key}"] = float(np.mean(batch.non_tensor_batch[key]))
                             batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:

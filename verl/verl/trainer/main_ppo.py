@@ -170,8 +170,12 @@ class TaskRunner:
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 
-        # Add a reference policy worker if KL loss or KL reward is used.
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        # Add a reference policy worker if KL or PowerFlow needs reference log probabilities.
+        if (
+            config.algorithm.use_kl_in_reward
+            or config.actor_rollout_ref.actor.use_kl_loss
+            or config.actor_rollout_ref.actor.get("powerflow_enable", False)
+        ):
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
@@ -269,7 +273,8 @@ def create_rl_sampler(data_config, dataset):
         sampler (Sampler): The sampler.
     """
     import torch
-    from torch.utils.data import RandomSampler, SequentialSampler
+    from torch.utils.data import SequentialSampler
+    from torchdata.stateful_dataloader.sampler import RandomSampler
 
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.

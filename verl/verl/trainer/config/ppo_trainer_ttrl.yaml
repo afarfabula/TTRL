@@ -23,3 +23,37 @@ ttrl:
   # Skip majority pseudo-label generation for verifier-free PowerFlow-style
   # experiments. This keeps validation unchanged and only affects training.
   powerflow_no_majority: false
+
+  # Experimental GRPO-compatible sharpened answer posterior reward. When
+  # enabled, majority voting is still used to keep logging compatible, but the
+  # training reward is replaced by a selective sharpened answer distribution.
+  sharpened_enable: false
+  sharpened_alpha: 2.0
+  sharpened_tau_pos: 0.375
+  sharpened_tau_marg: 0.125
+  sharpened_use_confidence: true
+  sharpened_conf_temperature: 1.0
+  # prob keeps the original normalized sharpened posterior. top1_ratio keeps
+  # the top accepted answer at reward 1 and gives other answers a relative
+  # sharpened reward, preserving GRPO reward scale closer to majority voting.
+  # mv_anchor keeps majority-vote matches at reward 1 and adds a small soft
+  # posterior reward to non-majority accepted answers.
+  sharpened_reward_mode: prob
+  sharpened_soft_coef: 0.25
+  sharpened_negative_enable: true
+  sharpened_tau_low: 0.125
+  sharpened_negative_reward: -0.25
+
+  # Experimental chunk-level search-state training. This is disabled by
+  # default and only used by explicit pilot scripts.
+  chunk_state_enable: false
+  chunk_state_candidates: 8
+  chunk_state_chunk_size: 256
+  chunk_state_probe_max_tokens: 3072
+  chunk_state_states_per_prompt: 1
+  chunk_state_max_prefix_tokens: 1024
+  chunk_state_boundaries: [0, 256, 512, 768, 1024]
+  chunk_state_alpha: 2.0
+  chunk_state_eps: 0.05
+  chunk_state_min_informative_gap: 0.0
+  chunk_state_skip_uniform: false

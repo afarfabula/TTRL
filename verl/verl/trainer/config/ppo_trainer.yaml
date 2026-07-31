@@ -225,6 +225,10 @@ actor_rollout_ref:
     # Default is disabled to preserve normal PPO/TTRL behavior.
     powerflow_enable: false
 
+    # Fallback loss for chunk-state ablations. The main chunk-state pilot uses
+    # PowerFlow loss; this stays disabled unless explicitly requested.
+    chunk_weighted_nll_enable: false
+
     # PowerFlow beta coefficient used in the trajectory-balance residual.
     powerflow_beta_coef: 4.0
 

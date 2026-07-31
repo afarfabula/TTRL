@@ -188,11 +188,12 @@ class vLLMRollout(BaseRollout):
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
+            max_num_seqs=config.max_num_seqs,
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_prefix_caching=config.get("enable_prefix_caching", True),
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             **lora_kwargs,
@@ -207,6 +208,7 @@ class vLLMRollout(BaseRollout):
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
+            repetition_penalty=config.get("repetition_penalty", 1.0),
         )
 
         kwargs["detokenize"] = False
@@ -215,6 +217,10 @@ class vLLMRollout(BaseRollout):
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
+        # PowerFlow/TTRL expands prompts in the trainer before rollout, matching the
+        # original PowerFlow path. Keep vLLM at one sample per expanded prompt by
+        # default; per-call kwargs can still override this for non-expanded paths.
+        kwargs["n"] = 1
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
@@ -302,6 +308,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        sampling_kwargs = prompts.meta_info.get("kwargs", {})
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -319,6 +326,8 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+        elif sampling_kwargs:
+            kwargs = dict(sampling_kwargs)
 
         lora_requests = None
         if self.lora_kwargs:
@@ -353,12 +362,14 @@ class vLLMRollout(BaseRollout):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
+            output_response_length = int(getattr(self.sampling_params, "max_tokens", self.config.response_length))
+            output_response_length = min(output_response_length, int(self.config.response_length))
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=output_response_length).to(
                 idx.device
             )
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
+                    rollout_log_probs, -1, max_length=output_response_length
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 
@@ -368,18 +379,9 @@ class vLLMRollout(BaseRollout):
                 position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
                 batch_size = batch_size * self.sampling_params.n
                 # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
-                if "tools_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["tools_kwargs"] = _repeat_interleave(
-                        non_tensor_batch["tools_kwargs"], self.sampling_params.n
-                    )
-                if "interaction_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["interaction_kwargs"] = _repeat_interleave(
-                        non_tensor_batch["interaction_kwargs"], self.sampling_params.n
-                    )
-                if "raw_prompt" in non_tensor_batch.keys():
-                    non_tensor_batch["raw_prompt"] = _repeat_interleave(
-                        non_tensor_batch["raw_prompt"], self.sampling_params.n
-                    )
+                for key, value in list(non_tensor_batch.items()):
+                    if hasattr(value, "__len__") and len(value) == batch_size // self.sampling_params.n:
+                        non_tensor_batch[key] = _repeat_interleave(value, self.sampling_params.n)
 
             seq = torch.cat([idx, response], dim=-1)
 
@@ -408,6 +410,7 @@ class vLLMRollout(BaseRollout):
                 "input_ids": seq,  # here input_ids become the whole sentences
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
+                "response_mask": response_attention_mask,
             },
             batch_size=batch_size,
         )
