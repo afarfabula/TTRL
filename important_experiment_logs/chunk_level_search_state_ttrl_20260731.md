@@ -830,3 +830,150 @@ val-aux/math/format_score/mean@16=0.897500
 - 不继续扩 teacher-anchor 3-step 到 20/80 step。
 - 优先改训练对象：不要只训练短 chunk 本身，考虑把 PowerFlow loss 作用在 `state + chunk + short continuation` 的可评分 span，或加入 full-answer distillation/regularization，避免模型只学局部补丁。
 - 降低 final validation 频率，后续 3-step smoke 只在关键 gate 做 val；诊断阶段记录 target stats 和少量 held-out prompts，减少 300s validation 固定成本。
+
+## 2026-07-31 Scored Span PowerFlow 设计
+
+动机：
+
+- 之前三版 chunk-state PowerFlow 都只在 `next chunk` token 上做 actor update，但 score 来自 `state + chunk + probe continuation` 的最终 correctness。
+- 这会产生训练对象错配：被 verifier 打分的是完整可评分 span，实际更新的却只有短 chunk，模型可能学到局部补丁而破坏完整回答分布。
+- 下一版仍然保持 PowerFlow loss 主路径，不切 GRPO / weighted NLL；只把 actor response span 从 `chunk` 改成 `chunk + probe continuation`。
+
+实现计划：
+
+```text
+ttrl.chunk_state_actor_span=chunk        # default, old behavior
+ttrl.chunk_state_actor_span=chunk_probe  # new smoke
+```
+
+`chunk_probe` 模式下：
+
+```text
+actor_response = concat(chunk_tokens, probe_tokens)
+actor_response = actor_response[:data.max_response_length]
+boxed_reward   = probe final correctness
+powerflow_weight = sharpened q_j * K
+```
+
+关键点：
+
+- 仍然只把 `query + source_response[:t]` 作为 prompt，不训练 state prefix token。
+- reward 仍来自同一个 probe correctness，因此 target 语义不变。
+- response 最长截断到现有 `data.max_response_length=3072`，避免超过 `max_model_len=4096`。
+- 默认配置仍保持 `chunk`，不会影响已有 MV / PowerFlow / teacher-anchor 实验。
+
+第一版 smoke 隔离变量：
+
+```text
+source_mode=success
+skip_all_negative=True
+actor.powerflow_use_chunk_weights=True
+teacher_anchor=False
+actor_span=chunk_probe
+```
+
+预期：
+
+- `chunk_state_actor_span/mode_chunk_probe=1`
+- `chunk_state_actor_span/response_len_mean` 明显大于 256。
+- `update_actor` 会慢于 chunk-only，但应仍低于 full-response GRPO 级别；如果显著爆炸，说明 scored span 成本不可接受。
+- 如果 3-step final val 仍是 mean@16 约 0.46，则说明问题不只是 chunk-only mismatch，需要加入 full-answer regularization 或重新定义 state sampling。
+
+待跑脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_scoredspan_b32_r32_v64_3step_20260731.sh
+```
+
+## 2026-07-31 Scored Span PowerFlow 3-step 结果
+
+配置：
+
+```text
+train_batch_size=32
+rollout.n=32
+val_kwargs.n=16
+total_training_steps=3
+source_mode=success
+skip_all_negative=True
+actor.powerflow_use_chunk_weights=True
+teacher_anchor=False
+ttrl.chunk_state_actor_span=chunk_probe
+```
+
+关键 step 指标：
+
+```text
+step1:
+selected_original_acc_mean=0.906
+state_all_negative_ratio=0.406
+state_mixed_ratio=0.594
+num_actor_samples=152
+positive_ratio=0.215
+actor_span/response_len_mean=1560.223
+actor_span/truncated_ratio=0.195
+powerflow_weight_max=7.875
+actor/powerflow_loss=1.237
+timing_s/gen=51.865
+timing_s/chunk_state_probe=15.590
+timing_s/chunk_state_score=10.251
+timing_s/chunk_state_ref=7.496
+timing_s/update_actor=14.254
+
+step2:
+selected_original_acc_mean=0.875
+state_all_negative_ratio=0.344
+state_mixed_ratio=0.594
+num_actor_samples=168
+positive_ratio=0.281
+actor_span/response_len_mean=1356.617
+actor_span/truncated_ratio=0.168
+powerflow_weight_max=7.875
+actor/powerflow_loss=1.501
+timing_s/gen=23.703
+timing_s/chunk_state_probe=13.776
+timing_s/chunk_state_score=11.260
+timing_s/chunk_state_ref=4.264
+timing_s/update_actor=14.853
+
+step3:
+selected_original_acc_mean=0.938
+state_all_negative_ratio=0.312
+state_mixed_ratio=0.688
+num_actor_samples=176
+positive_ratio=0.285
+actor_span/response_len_mean=1398.367
+actor_span/truncated_ratio=0.164
+powerflow_weight_max=7.875
+actor/powerflow_loss=0.748
+timing_s/gen=34.290
+timing_s/chunk_state_probe=13.711
+timing_s/chunk_state_score=9.264
+timing_s/chunk_state_ref=4.917
+timing_s/update_actor=17.188
+timing_s/testing=302.175
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16=0.446125
+val-core/math/acc/maj@16/mean=0.565996
+val-core/math/acc/best@16/mean=0.852924
+val-aux/math/format_score/mean@16=0.895625
+```
+
+结论：
+
+- `chunk_probe` actor span 已真实生效：平均训练 response 从 256 附近变成 1350-1560 tokens，说明 actor update 覆盖了被 scorer 评估的 chunk+probe span。
+- 但这条比 chunk-only 更差，`mean@16=0.446`，低于 successdiag / weighted / teacher-anchor 三个失败版本。
+- update_actor 从 chunk-only 的约 3.7-6.8s 上升到 14-17s，ref 也上升到 4-7s；成本明显变差。
+- 截断率 16%-20%，说明很多 probe span 已经超过 3072 response budget，训练对象仍不是完整 scored trajectory。
+- 因此“把 loss 直接扩到 chunk+probe span”不是当前可行方向，不升 20-step。
+
+下一步判断：
+
+- 目前失败不是单一工程 bug，而是 chunk-level supervision 的语义还没稳定：success source、weighted target、teacher anchor、scored span 都无法把 mean@16 拉回 base/MV gate。
+- 继续做 chunk-state 前，应先加一个保护项：full-answer behavior regularization / base-policy distillation，限制局部更新不能破坏完整回答分布。
+- 另一个方向是先不更新 actor，只做 offline analysis：比较 source chunk、sampled chunk、probe success 与最终 answer type，确认 chunk score 是否真的能预测 full-answer correctness。
+- Infra 上不要继续扩大 scored-span，因为它同时更慢且更差；后续 smoke 应减少 final val 频率，并优先降低 scoring 长尾。

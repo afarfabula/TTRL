@@ -62,6 +62,10 @@ ttrl:
   # are correct under original GT reward, falling back to random if none exist.
   chunk_state_source_mode: random
   chunk_state_skip_all_negative: false
+  # Which response span receives the chunk-state actor loss. "chunk" preserves
+  # the original pilot behavior. "chunk_probe" aligns the loss with the scored
+  # chunk plus its probe continuation, truncated to the normal response budget.
+  chunk_state_actor_span: chunk
   # If enabled, replace one sampled chunk candidate with the source rollout's
   # original next chunk to anchor the local target distribution on a successful path.
   chunk_state_teacher_anchor_enable: false

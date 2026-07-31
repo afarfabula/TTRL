@@ -1375,6 +1375,75 @@ class RayPPOTrainer:
             }
         return target
 
+    def _build_chunk_state_response_span(
+        self,
+        chunk_output: DataProto,
+        probe_output: DataProto | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        cfg = self.config.ttrl
+        actor_span = str(cfg.get("chunk_state_actor_span", "chunk"))
+        chunk_responses = chunk_output.batch["responses"]
+        chunk_mask = chunk_output.batch["response_mask"]
+        if actor_span == "chunk":
+            metrics = {
+                "chunk_state_actor_span/mode_chunk": 1.0,
+                "chunk_state_actor_span/response_len_mean": chunk_mask.sum(dim=-1).float().mean().item(),
+                "chunk_state_actor_span/truncated_ratio": 0.0,
+            }
+            return chunk_responses, chunk_mask, metrics
+        if actor_span != "chunk_probe":
+            raise ValueError(f"Unsupported ttrl.chunk_state_actor_span={actor_span!r}")
+        if probe_output is None:
+            raise ValueError("probe_output is required when ttrl.chunk_state_actor_span='chunk_probe'")
+
+        max_response_len = int(self.config.data.max_response_length)
+        pad_token_id = self.tokenizer.pad_token_id
+        probe_responses = probe_output.batch["responses"]
+        probe_mask = probe_output.batch["response_mask"]
+        responses = []
+        response_masks = []
+        truncated = []
+        response_lengths = []
+        for idx in range(len(chunk_output)):
+            chunk_len = int(chunk_mask[idx].sum().item())
+            probe_len = int(probe_mask[idx].sum().item())
+            span = torch.cat(
+                [
+                    chunk_responses[idx, :chunk_len],
+                    probe_responses[idx, :probe_len],
+                ],
+                dim=0,
+            )
+            was_truncated = int(span.numel() > max_response_len)
+            if was_truncated:
+                span = span[:max_response_len]
+            padded = torch.full(
+                (max_response_len,),
+                pad_token_id,
+                dtype=chunk_responses.dtype,
+                device=chunk_responses.device,
+            )
+            mask = torch.zeros(
+                (max_response_len,),
+                dtype=chunk_mask.dtype,
+                device=chunk_mask.device,
+            )
+            padded[: span.numel()] = span
+            mask[: span.numel()] = 1
+            responses.append(padded)
+            response_masks.append(mask)
+            truncated.append(was_truncated)
+            response_lengths.append(span.numel())
+
+        responses = torch.stack(responses, dim=0)
+        response_masks = torch.stack(response_masks, dim=0)
+        metrics = {
+            "chunk_state_actor_span/mode_chunk_probe": 1.0,
+            "chunk_state_actor_span/response_len_mean": float(np.mean(response_lengths)) if response_lengths else 0.0,
+            "chunk_state_actor_span/truncated_ratio": float(np.mean(truncated)) if truncated else 0.0,
+        }
+        return responses, response_masks, metrics
+
     def _apply_chunk_state_teacher_anchor(
         self,
         full_batch: DataProto,
@@ -1424,6 +1493,7 @@ class RayPPOTrainer:
         state_prompts: DataProto,
         chunk_output: DataProto,
         scores: torch.Tensor,
+        probe_output: DataProto | None = None,
     ) -> tuple[DataProto, dict]:
         cfg = self.config.ttrl
         num_states = len(state_prompts)
@@ -1456,14 +1526,17 @@ class RayPPOTrainer:
 
         repeated_state_prompts = state_prompts.repeat(repeat_times=candidates, interleave=True)
         kept_states = repeated_state_prompts[keep_indices]
-        kept_chunks = chunk_output[keep_indices]
+        responses, response_mask, span_metrics = self._build_chunk_state_response_span(
+            chunk_output=chunk_output,
+            probe_output=probe_output,
+        )
+        responses = responses[keep_indices]
+        response_mask = response_mask[keep_indices]
         flat_weights = weights.reshape(-1)[keep_indices]
         powerflow_flat_weights = flat_weights * candidates
 
         prompt_ids = kept_states.batch["input_ids"]
         prompt_mask = kept_states.batch["attention_mask"]
-        responses = kept_chunks.batch["responses"]
-        response_mask = kept_chunks.batch["response_mask"]
         input_ids = torch.cat([prompt_ids, responses], dim=-1)
         attention_mask = torch.cat([prompt_mask, response_mask], dim=-1)
         response_len = responses.shape[-1]
@@ -1512,6 +1585,7 @@ class RayPPOTrainer:
             "chunk_state/powerflow_weight_max": powerflow_flat_weights.max().detach().item(),
             "chunk_state/powerflow_weight_min": powerflow_flat_weights.min().detach().item(),
         }
+        metrics.update(span_metrics)
         return actor_proto, metrics
 
     def _run_chunk_state_training_step(self, full_batch: DataProto, metrics: dict, timing_raw: dict):
@@ -1586,7 +1660,12 @@ class RayPPOTrainer:
             metrics.update(self._compute_chunk_state_diag_metrics(full_batch, state_prompts, scores))
 
         with marked_timer("chunk_state_build_actor_batch", timing_raw, color="blue"):
-            actor_batch, chunk_metrics = self._build_chunk_actor_batch(state_prompts, chunk_output, scores)
+            actor_batch, chunk_metrics = self._build_chunk_actor_batch(
+                state_prompts,
+                chunk_output,
+                scores,
+                probe_output=probe_output,
+            )
             metrics.update(chunk_metrics)
             actor_batch.meta_info["global_token_num"] = torch.sum(actor_batch.batch["attention_mask"], dim=-1).tolist()
 
