@@ -1756,3 +1756,59 @@ val-aux/math/format_score/maj@16/mean=0.833808
 - `format_score` 仍高，但 acc 崩，说明模型仍会输出格式化答案，只是数学正确性/语义分布被破坏。
 - 失败更像目标构造问题，而不是 infra 问题：PowerFlow loss、chunk span、DP padding、Flash attention/vLLM 路径都已生效。
 - 需要停止沿着“strict success source + teacher anchor score floor=1 + probe4 PowerFlow target”直接扩展；下一版应重新设计 target，优先考虑降低 teacher-anchor 硬替换和 score floor 的强度，或改为从完整 rollout 随机截断后的 state 重新做 candidate/probe，避免每个 state 都被成功轨迹 teacher anchor 牵引到退化分布。
+
+## 2026-07-31 Random Source + No Teacher Anchor PowerFlow 3-step Smoke
+
+Run:
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_randomsrc_probe4_b32_r32_v64_3step_20260731
+train_batch_size=32
+rollout.n=32
+trainer.total_training_steps=3
+trainer.test_freq=2000000
+trainer.final_val_enable=False
+ttrl.chunk_state_source_mode=random
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_boundaries=[0,256,512,768,1024]
+ttrl.chunk_state_min_boundary=0
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.use_dynamic_bsz=False
+```
+
+这次 smoke 的目的不是追指标，而是回到 `chunk_level_search_state_ttrl_24h_goal.md` 的主语义：先采完整 on-policy rollout，再随机截断成 search state，并用 PowerFlow distribution matching 做 next-chunk actor update。它去掉了 strict-source 版本里的 teacher-anchor 硬替换和 score floor。
+
+运行稳定性：
+
+```text
+jsonl_rows=96
+step1: real_states=32 pad_states=0 boundary_zero_ratio=0.188 actor/powerflow_loss=0.784
+step2: real_states=32 pad_states=0 boundary_zero_ratio=0.188 actor/powerflow_loss=0.982
+step3: real_states=32 pad_states=0 boundary_zero_ratio=0.188 actor/powerflow_loss=1.273
+Final validation skipped
+```
+
+目标信号诊断：
+
+```text
+step1: selected_original_acc_mean=0.094 positive_ratio=0.205 informative_ratio=0.531 state_all_negative_ratio=0.469 state_mixed_ratio=0.500
+step2: selected_original_acc_mean=0.000 positive_ratio=0.138 informative_ratio=0.469 state_all_negative_ratio=0.531 state_mixed_ratio=0.438
+step3: selected_original_acc_mean=0.125 positive_ratio=0.085 informative_ratio=0.344 state_all_negative_ratio=0.656 state_mixed_ratio=0.344
+```
+
+耗时拆分：
+
+```text
+step1: gen=51.234s chunk_state_probe=6.790s chunk_state_score=10.809s update_actor=8.868s
+step2: gen=23.427s chunk_state_probe=7.187s chunk_state_score=10.938s update_actor=8.456s
+step3: gen=22.812s chunk_state_probe=6.977s chunk_state_score=11.023s update_actor=8.726s
+```
+
+结论：
+
+- 工程链路正确：3 step 都完成，chunk actor update 走的是 PowerFlow loss，不是 GRPO 或 weighted NLL。
+- 但完全 random source 的监督信号太稀疏：`state_all_negative_ratio` 从 0.469 升到 0.656，`positive_ratio` 从 0.205 降到 0.085。继续放大到 20 step 很可能只是用大量全负 state 做退化更新。
+- 下一版应保持 no-teacher-anchor 和 PowerFlow loss，但把 source selection 改成 successful full rollout source：`ttrl.chunk_state_source_mode=success`、`ttrl.chunk_state_teacher_anchor_enable=False`。这样仍然从完整 rollout 构造 chunk state，不做 teacher 硬替换，但会提高 probe target 的正信号密度。
