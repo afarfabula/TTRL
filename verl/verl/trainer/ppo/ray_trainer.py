@@ -1092,6 +1092,7 @@ class RayPPOTrainer:
         source_locals = []
         state_boundaries = []
         source_response_lengths = []
+        state_loss_weights = []
         skipped_short_sources = 0
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
@@ -1161,12 +1162,30 @@ class RayPPOTrainer:
                 source_locals.append(source_local)
                 state_boundaries.append(boundary)
                 source_response_lengths.append(valid_response_len)
+                state_loss_weights.append(1.0)
 
         if not state_input_ids:
             raise RuntimeError(
                 "chunk-state source selection produced no valid states; "
                 f"min_required_response_len={min_required_response_len}, boundaries={boundaries}"
             )
+
+        real_state_count = len(state_input_ids)
+        data_parallel_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        pad_state_count = (
+            data_parallel_size - (real_state_count % data_parallel_size)
+            if real_state_count % data_parallel_size > 0
+            else 0
+        )
+        for _ in range(pad_state_count):
+            state_input_ids.append(state_input_ids[-1].clone())
+            state_attention_masks.append(state_attention_masks[-1].clone())
+            source_indices.append(source_indices[-1])
+            source_prompt_indices.append(source_prompt_indices[-1])
+            source_locals.append(source_locals[-1])
+            state_boundaries.append(state_boundaries[-1])
+            source_response_lengths.append(source_response_lengths[-1])
+            state_loss_weights.append(0.0)
 
         input_ids = torch.stack(state_input_ids, dim=0)
         attention_mask = torch.stack(state_attention_masks, dim=0)
@@ -1187,6 +1206,13 @@ class RayPPOTrainer:
         state_non_tensor["chunk_state_source_local"] = np.asarray(source_locals, dtype=np.int64)
         state_non_tensor["chunk_state_boundary"] = np.asarray(state_boundaries, dtype=np.int64)
         state_non_tensor["chunk_state_source_response_len"] = np.asarray(source_response_lengths, dtype=np.int64)
+        state_non_tensor["chunk_state_loss_weight"] = np.asarray(state_loss_weights, dtype=np.float32)
+        state_non_tensor["chunk_state_real_state_count"] = np.asarray(
+            [real_state_count] * len(source_indices), dtype=np.int64
+        )
+        state_non_tensor["chunk_state_pad_state_count"] = np.asarray(
+            [pad_state_count] * len(source_indices), dtype=np.int64
+        )
         state_non_tensor["chunk_state_skipped_short_sources"] = np.asarray(
             [skipped_short_sources] * len(source_indices), dtype=np.int64
         )
@@ -1223,6 +1249,18 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
             dtype=torch.float32,
         )
+        real_state_count = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_real_state_count", np.asarray([num_states])),
+            dtype=torch.float32,
+        )
+        pad_state_count = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_pad_state_count", np.asarray([0])),
+            dtype=torch.float32,
+        )
+        loss_weights = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_loss_weight", np.ones(num_states, dtype=np.float32)),
+            dtype=torch.float32,
+        )
         metrics.update(
             {
                 "chunk_state_diag/boundary_mean": boundaries.mean().item(),
@@ -1230,6 +1268,9 @@ class RayPPOTrainer:
                 "chunk_state_diag/boundary_max": boundaries.max().item(),
                 "chunk_state_diag/boundary_zero_ratio": (boundaries == 0).float().mean().item(),
                 "chunk_state_diag/skipped_short_sources": skipped_short_sources.max().item(),
+                "chunk_state_diag/real_state_count": real_state_count.max().item(),
+                "chunk_state_diag/pad_state_count": pad_state_count.max().item(),
+                "chunk_state_diag/loss_weight_mean": loss_weights.mean().item(),
                 "chunk_state_diag/source_response_len_mean": source_response_lens.mean().item(),
                 "chunk_state_diag/probe_score_std": score_matrix.std(unbiased=False).item(),
                 "chunk_state_diag/state_probe_mean_max": score_matrix.mean(dim=-1).max().item(),
@@ -1309,6 +1350,18 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
             dtype=np.int64,
         )
+        loss_weights = np.asarray(
+            state_prompts.non_tensor_batch.get("chunk_state_loss_weight", np.ones(len(state_prompts), dtype=np.float32)),
+            dtype=np.float32,
+        )
+        real_state_count = np.asarray(
+            state_prompts.non_tensor_batch.get("chunk_state_real_state_count", np.asarray([len(state_prompts)])),
+            dtype=np.int64,
+        )
+        pad_state_count = np.asarray(
+            state_prompts.non_tensor_batch.get("chunk_state_pad_state_count", np.asarray([0])),
+            dtype=np.int64,
+        )
         source_original = state_prompts.non_tensor_batch.get("chunk_state_source_original_correct", None)
         if source_original is not None:
             source_original = np.asarray(source_original, dtype=np.float32)
@@ -1327,6 +1380,9 @@ class RayPPOTrainer:
                     "boundary": int(boundaries[state_idx]),
                     "source_response_len": int(source_response_lens[state_idx]),
                     "skipped_short_sources": int(skipped_short_sources.max()) if skipped_short_sources.size else 0,
+                    "loss_weight": float(loss_weights[state_idx]),
+                    "real_state_count": int(real_state_count.max()) if real_state_count.size else len(state_prompts),
+                    "pad_state_count": int(pad_state_count.max()) if pad_state_count.size else 0,
                     "source_original_correct": (
                         float(source_original[state_idx]) if source_original is not None else None
                     ),
@@ -1615,6 +1671,10 @@ class RayPPOTrainer:
         weights = torch.where(weight_sums > 0, raw_weights / weight_sums.clamp(min=1e-12), uniform)
         score_max = score_matrix.max(dim=-1).values
         score_min = score_matrix.min(dim=-1).values
+        state_loss_weights = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_loss_weight", np.ones(num_states, dtype=np.float32)),
+            dtype=torch.float32,
+        )
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
         if skip_uniform:
             keep_state = informative.bool()
@@ -1638,6 +1698,8 @@ class RayPPOTrainer:
         responses = responses[keep_indices]
         response_mask = response_mask[keep_indices]
         flat_weights = weights.reshape(-1)[keep_indices]
+        flat_loss_weights = state_loss_weights.repeat_interleave(candidates)[keep_indices]
+        flat_weights = flat_weights * flat_loss_weights
         powerflow_flat_weights = flat_weights * candidates
 
         prompt_ids = kept_states.batch["input_ids"]
@@ -1678,8 +1740,21 @@ class RayPPOTrainer:
         )
         metrics = {
             "chunk_state/num_states": float(num_states),
+            "chunk_state/real_states": float(
+                np.asarray(
+                    state_prompts.non_tensor_batch.get("chunk_state_real_state_count", np.asarray([num_states])),
+                    dtype=np.int64,
+                ).max()
+            ),
+            "chunk_state/pad_states": float(
+                np.asarray(
+                    state_prompts.non_tensor_batch.get("chunk_state_pad_state_count", np.asarray([0])),
+                    dtype=np.int64,
+                ).max()
+            ),
             "chunk_state/num_candidates": float(len(chunk_output)),
             "chunk_state/num_actor_samples": float(len(actor_proto)),
+            "chunk_state/loss_weight_mean": flat_loss_weights.mean().detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
             "chunk_state/informative_ratio": informative.mean().detach().item(),
             "chunk_state/kept_state_ratio": keep_state.float().mean().detach().item(),
