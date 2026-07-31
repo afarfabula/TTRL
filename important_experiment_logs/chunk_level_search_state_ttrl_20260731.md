@@ -182,3 +182,108 @@ timing_s/update_actor=1.062
 
 - 启动 20-step pilot：`ttrl_chunk_state_powerflow_b32_r32_v64_20step_20260731.sh`。
 - 重点观察 step20 的 `val-core/math/acc/mean@16`、chunk informative ratio、PowerFlow loss、probe/ref/update_actor timing。
+
+## 2026-07-31 20-Step Pilot 结果
+
+脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_b32_r32_v64_20step_20260731.sh
+```
+
+核心配置：
+
+```text
+model=/models/Qwen2.5-Math-7B
+train_batch_size=32
+rollout.n=32
+val.n=16
+total_training_steps=20
+test_freq=20
+chunk_state_candidates=8
+chunk_state_chunk_size=256
+chunk_state_probe_max_tokens=3072
+actor.powerflow_enable=True
+actor.powerflow_use_boxed_reward=True
+actor.chunk_weighted_nll_enable=False
+actor.use_kl_loss=False
+actor dynamic batch=False
+```
+
+结论：
+
+- 8 卡 B200 正式 20-step pilot 已跑完，确认 actor update 走的是 `actor/powerflow_loss`，不是 weighted NLL，也不是 GRPO。
+- 链路工程上有效：每步 32 个 state，256 个 chunk candidates，256 个 actor samples；chunk supervision 不是全 0/全 1。
+- 指标失败：step20 `mean@16=0.471`、`maj@16=0.596`、`best@16=0.856`，明显低于当前 MV step20 gate，不应直接扩到 80 step。
+- 训练时有 SymPy verifier warning 和一次 `Timeout during comparison`，但进程没有崩溃。
+
+step20 validation：
+
+```text
+val-core/math/acc/mean@16=0.471125
+val-core/math/acc/maj@16/mean=0.595646
+val-core/math/acc/best@16/mean=0.855968
+val-aux/math/acc/maj@8/mean=0.575206
+val-aux/math/acc/best@8/mean=0.806562
+val-aux/math/format_score/mean@16=0.897250
+val-aux/math/format_score/maj@16/mean=0.877422
+```
+
+step20 chunk / PowerFlow 健康指标：
+
+```text
+chunk_state/num_states=32
+chunk_state/num_candidates=256
+chunk_state/num_actor_samples=256
+chunk_state/positive_ratio=0.250
+chunk_state/informative_ratio=0.625
+chunk_state/target_entropy=1.267
+chunk_state/weight_max=0.984
+chunk_state/weight_min=0.000
+actor/powerflow_loss=0.426
+actor/pg_loss=0.426
+actor/log_prob=-0.513
+actor/ref_log_prob=-0.513
+actor/boxed_reward/mean=0.156
+actor/boxed_reward/max=1.000
+actor/log_z=-1.781
+actor/importance_weight=0.800
+actor/grad_norm=9.537
+```
+
+step20 timing：
+
+```text
+timing_s/gen=21.266
+timing_s/chunk_state_chunks=1.474
+timing_s/chunk_state_probe=13.496
+timing_s/chunk_state_score=2.561
+timing_s/chunk_state_ref=1.886
+timing_s/update_actor=6.050
+timing_s/testing=302.242
+```
+
+训练中段观察：
+
+- 训练 step 平均约 50-55s，不含 step20 validation。
+- full rollout `gen` 通常约 22-24s，偶发到 32-34s。
+- chunk candidate generation 约 1.5s。
+- probe generation 约 13.5-14.1s。
+- chunk score 约 2.5-4.3s。
+- ref logprob 约 1.8-2.7s。
+- actor update 约 5.7-8.6s。
+
+初步诊断：
+
+- 这个 pilot 的 best@16 仍有 0.856，说明 base sampling/search 本身还有成功轨迹；mean@16/maj@16 低说明更新后的模型分布没有被有效推向正确 chunk。
+- `format_score/mean@16=0.897` 但 `acc/mean@16=0.471`，说明模型大多能输出格式化答案，但 chunk-level supervision 对数学正确性提升不足。
+- 当前 `chunk_state_probe_max_tokens=3072` 本质上仍在用较长 future probe 定义 chunk label，成本不低，同时标签可能把完整答案的噪声折回局部 chunk。
+- `actor/ref_log_prob` 与 `actor/log_prob` 在日志中几乎相同，符合第一轮 close-to-ref 的状态；如果继续训练需要观察 PowerFlow importance / CISPO 是否过早截断有效 token。
+
+下一步建议：
+
+- 先不要扩 80 step；优先做 2-3 个 20-step 诊断实验。
+- 检查 state 构造是否过多抽到很短或低价值 prefix；记录 boundary 分布和原 full rollout 正确性。
+- 把 candidate chunk 的 probe correctness、原 full rollout correctness、同 prompt majority correctness 同时落日志，确认 chunk label 是否和最终答案方向一致。
+- 尝试减少 probe horizon 或改成 top candidates full-probe，以降低噪声和成本。
+- PowerFlow loss 主线保留，但需要把 improved distribution 从 hard boxed reward 改成更稳定的 sharpened distribution / ranking distribution，而不是直接把 sparse binary probe reward 写入 chunk update。
