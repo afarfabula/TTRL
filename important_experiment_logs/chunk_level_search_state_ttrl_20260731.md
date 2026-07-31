@@ -977,3 +977,180 @@ val-aux/math/format_score/mean@16=0.895625
 - 继续做 chunk-state 前，应先加一个保护项：full-answer behavior regularization / base-policy distillation，限制局部更新不能破坏完整回答分布。
 - 另一个方向是先不更新 actor，只做 offline analysis：比较 source chunk、sampled chunk、probe success 与最终 answer type，确认 chunk score 是否真的能预测 full-answer correctness。
 - Infra 上不要继续扩大 scored-span，因为它同时更慢且更差；后续 smoke 应减少 final val 频率，并优先降低 scoring 长尾。
+
+## 2026-07-31 Chunk Score JSONL Diagnostic 设计
+
+动机：
+
+- 目前连续几条训练变体失败，不能继续盲目跑 20-step。
+- 需要先验证 `state -> K chunks -> probe score` 是否真的有可学习信号：哪些 boundary 容易 all-negative，source correctness 高是否对应更高 probe mean，probe score 分布是否有区分度。
+
+实现：
+
+- 新增默认关闭配置：
+
+```text
+ttrl.chunk_state_diag_jsonl=null
+```
+
+- 显式设置路径时，每个 state 写一行 JSONL：
+
+```text
+global_step
+state_index
+source_index / source_prompt_index / source_local
+boundary
+source_response_len
+source_original_correct
+probe_mean / probe_max / probe_min
+probe_positive_count
+probe_scores
+all_negative / all_positive / mixed
+```
+
+- 这个 dump 只记录 tensor 上已有的 score 摘要，不改变训练 loss，不改变 sampling 语义。
+
+待跑脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_diagjson_b32_r32_v64_1step_20260731.sh
+```
+
+目标：
+
+- 先跑 1-step，生成 `/tmp/ttrl_b200/chunk_state_diag/*.jsonl`。
+- 用这个文件做离线统计，决定下一步是改 state sampling、改 verifier/probe，还是加入 full-answer regularization。
+
+## 2026-07-31 Chunk Score JSONL Diagnostic 结果
+
+运行脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_diagjson_b32_r32_v64_1step_20260731.sh
+```
+
+配置要点：
+
+```text
+train_batch_size=32
+rollout.n=32
+ttrl.chunk_state_enable=True
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_actor_span=chunk
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=False
+ttrl.chunk_state_diag_jsonl=/tmp/ttrl_b200/chunk_state_diag/ttrl_chunk_state_powerflow_diagjson_b32_r32_v64_1step_20260731.jsonl
+```
+
+产物：
+
+```text
+/tmp/ttrl_b200/chunk_state_diag/ttrl_chunk_state_powerflow_diagjson_b32_r32_v64_1step_20260731.jsonl
+/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_diagjson_b32_r32_v64_1step_20260731.jsonl
+```
+
+注意：首次运行时 `DIAG_JSONL` 默认在 worker `/tmp`，CPU devbox 看不到；已经手工复制到持久目录，并把脚本默认路径改成
+`/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/${RUN_ID}.jsonl`。
+
+训练 step 指标：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.906
+chunk_state_source/prompt_original_mean=0.334
+chunk_state_source/prompt_original_pass=0.906
+chunk_state_diag/source_pseudo_acc_mean=0.844
+chunk_state_diag/source_original_acc_mean=0.906
+chunk_state_diag/state_all_negative_ratio=0.406
+chunk_state_diag/state_mixed_ratio=0.594
+chunk_state_diag/probe_mean_source_original_correct=0.237
+chunk_state_diag/probe_mean_source_original_wrong=0.000
+chunk_state_diag/jsonl_rows=32
+chunk_state/num_states=32
+chunk_state/num_candidates=256
+chunk_state/num_actor_samples=152
+chunk_state/positive_ratio=0.215
+chunk_state/informative_ratio=0.594
+chunk_state/kept_state_ratio=0.594
+chunk_state_actor_span/mode_chunk=1.000
+chunk_state_actor_span/response_len_mean=207.113
+chunk_state_actor_span/truncated_ratio=0.000
+actor/powerflow_loss=1.299
+timing_s/gen=51.312
+timing_s/chunk_state_chunks=1.567
+timing_s/chunk_state_probe=13.861
+timing_s/chunk_state_score=10.311
+timing_s/chunk_state_ref=4.921
+timing_s/update_actor=3.603
+timing_s/testing=293.007
+```
+
+这次脚本虽然设置了低频 validation，但训练结束仍触发 final validation，所以端到端显示约 6 分 22 秒；训练本体约为：
+
+```text
+gen 51.312 + chunks 1.567 + probe 13.861 + score 10.311 + ref 4.921 + update 3.603
+= 85.575s
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16=0.4595
+val-core/math/acc/maj@16/mean=0.58238
+val-core/math/acc/best@16/mean=0.853788
+```
+
+离线 JSONL 统计：
+
+```text
+rows=32
+probe_mean mean=0.21484375 min=0.0 max=0.625
+probe_max mean=0.59375 min=0.0 max=1.0
+probe_min mean=0.0 min=0.0 max=0.0
+probe_positive_count mean=1.71875 min=0 max=5
+source_original_correct=29/32 = 0.90625
+all_negative=13/32 = 0.40625
+all_positive=0/32 = 0.0
+mixed=19/32 = 0.59375
+probe_mean_correct=0.2370689655
+probe_mean_wrong=0.0
+flat_candidate_scores=256
+flat_score_mean=0.21484375
+flat_positive_ratio=0.21484375
+```
+
+按 boundary 分桶：
+
+```text
+boundary=0:
+  states=8
+  probe_mean=0.359375
+  all_negative_ratio=0.125
+  source_original_correct_ratio=1.0
+
+boundary=1..256:
+  states=14
+  probe_mean=0.1785714286
+  all_negative_ratio=0.4285714286
+  source_original_correct_ratio=0.9285714286
+
+boundary=257..768:
+  states=10
+  probe_mean=0.15
+  all_negative_ratio=0.6
+  source_original_correct_ratio=0.8
+```
+
+结论：
+
+- JSONL 诊断确认当前 `state -> chunk -> probe` 信号不是完全随机：source 原始正确时 probe mean 为 0.237，source 原始错误时为 0。
+- 但信号仍很稀疏：40.6% state 是 all-negative，且没有 all-positive；越往中后段 boundary，probe mean 越低、all-negative 越高。
+- 这解释了之前连续 PowerFlow chunk actor update 失败：actor 确实用 PowerFlow loss 更新了 chunk，但 target distribution 大量来自稀疏/局部 probe，容易把完整回答分布拉坏。
+- 目前不应该把这版直接放大到 20/80 step；下一步应该仍优先使用 PowerFlow loss 做 chunk actor update，但先改 state/probe 采样，让 PowerFlow target 更像 improved continuation distribution，而不是稀疏终局 reward 的局部投影。
+
+下一步优先级：
+
+1. 保留 PowerFlow actor loss 主线。
+2. 把 JSONL 路径默认指向持久目录或在脚本里同步到持久目录，避免 worker `/tmp` 和 devbox `/tmp` 不一致。
+3. 改 state 选择：减少 boundary=0，重点抽取 source correct 且 probe mixed 的中间 state；同时记录 source chunk 是否来自 correct final answer。
+4. 改 probe 设计：对每个 chunk candidate 做更短但更宽的 probe，优先获得 ranking/distribution，而不是只靠 0/1 稀疏 score。
+5. 再做 3-step smoke，只有 `mean@16` 不低于 0.60 且 `all_negative_ratio` 明显下降时才升 20-step。

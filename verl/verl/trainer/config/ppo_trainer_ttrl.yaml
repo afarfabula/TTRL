@@ -58,6 +58,9 @@ ttrl:
   chunk_state_min_informative_gap: 0.0
   chunk_state_skip_uniform: false
   chunk_state_diag_enable: false
+  # Optional JSONL path for per-state chunk/probe diagnostic rows. Empty means
+  # disabled. Intended for short diagnostic runs, not long training jobs.
+  chunk_state_diag_jsonl: null
   # random keeps the first pilot behavior. success prefers source rollouts that
   # are correct under original GT reward, falling back to random if none exist.
   chunk_state_source_mode: random

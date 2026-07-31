@@ -1242,6 +1242,59 @@ class RayPPOTrainer:
         )
         return metrics
 
+    def _dump_chunk_state_diag_jsonl(
+        self,
+        state_prompts: DataProto,
+        scores: torch.Tensor,
+    ) -> dict:
+        path = self.config.ttrl.get("chunk_state_diag_jsonl", None)
+        if not path:
+            return {}
+
+        candidates = int(self.config.ttrl.get("chunk_state_candidates", 8))
+        score_matrix = scores.view(len(state_prompts), candidates).float().detach().cpu()
+        boundaries = np.asarray(state_prompts.non_tensor_batch["chunk_state_boundary"], dtype=np.int64)
+        source_indices = np.asarray(state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=np.int64)
+        source_prompt_indices = np.asarray(
+            state_prompts.non_tensor_batch["chunk_state_source_prompt_index"], dtype=np.int64
+        )
+        source_locals = np.asarray(state_prompts.non_tensor_batch["chunk_state_source_local"], dtype=np.int64)
+        source_response_lens = np.asarray(
+            state_prompts.non_tensor_batch["chunk_state_source_response_len"], dtype=np.int64
+        )
+        source_original = state_prompts.non_tensor_batch.get("chunk_state_source_original_correct", None)
+        if source_original is not None:
+            source_original = np.asarray(source_original, dtype=np.float32)
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        rows = 0
+        with open(path, "a", encoding="utf-8") as f:
+            for state_idx in range(len(state_prompts)):
+                state_scores = score_matrix[state_idx]
+                row = {
+                    "global_step": int(self.global_steps),
+                    "state_index": int(state_idx),
+                    "source_index": int(source_indices[state_idx]),
+                    "source_prompt_index": int(source_prompt_indices[state_idx]),
+                    "source_local": int(source_locals[state_idx]),
+                    "boundary": int(boundaries[state_idx]),
+                    "source_response_len": int(source_response_lens[state_idx]),
+                    "source_original_correct": (
+                        float(source_original[state_idx]) if source_original is not None else None
+                    ),
+                    "probe_mean": float(state_scores.mean().item()),
+                    "probe_max": float(state_scores.max().item()),
+                    "probe_min": float(state_scores.min().item()),
+                    "probe_positive_count": int((state_scores > 0.0).sum().item()),
+                    "probe_scores": [float(x) for x in state_scores.tolist()],
+                    "all_negative": bool((state_scores <= 0.0).all().item()),
+                    "all_positive": bool((state_scores > 0.0).all().item()),
+                }
+                row["mixed"] = (not row["all_negative"]) and (not row["all_positive"])
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                rows += 1
+        return {"chunk_state_diag/jsonl_rows": float(rows)}
+
     def _combine_state_and_completion_prompts(
         self,
         state_prompts: DataProto,
@@ -1658,6 +1711,7 @@ class RayPPOTrainer:
                 scores = score_matrix.reshape(-1)
                 metrics["chunk_state_teacher_anchor/score_floor"] = anchor_score
             metrics.update(self._compute_chunk_state_diag_metrics(full_batch, state_prompts, scores))
+            metrics.update(self._dump_chunk_state_diag_jsonl(state_prompts, scores))
 
         with marked_timer("chunk_state_build_actor_batch", timing_raw, color="blue"):
             actor_batch, chunk_metrics = self._build_chunk_actor_batch(
