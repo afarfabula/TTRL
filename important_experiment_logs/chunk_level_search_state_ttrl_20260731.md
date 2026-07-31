@@ -1490,3 +1490,150 @@ probe_mean_source_wrong=0.16666666666666666
 - `source_original_correct` 与后续 probe mean 有可见分离，说明这个 target 比单 probe 更像 `P(success | state, chunk)`，更适合接 PowerFlow distribution matching。
 - 这一步只是 1-step 诊断，不看 final accuracy；后续如果扩展，应先做 3-step no-final-val gate，再决定是否升 20-step。
 - 代价是额外 probe/score 开销：1-step 中 `chunk_state_probe=7.019s`、`chunk_state_score=10.783s`。正式实验需要控制 probe samples、probe max tokens 和 state 数量，避免 target 稳定性收益被吞吐吃掉。
+
+## 2026-07-31 Probe4 Mid-State 3-Step Gate
+
+目的：
+
+- 验证 multi-probe target 在连续 PowerFlow actor update 后是否稳定。
+- 不跑 final validation，避免把 gate 时间浪费在 500 x 16 validation。
+- 仍然优先使用 PowerFlow loss 做 chunk actor update，不切到 GRPO 或 weighted NLL。
+
+脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_midstate_probe4_b32_r32_v64_3step_20260731.sh
+```
+
+关键配置：
+
+```text
+train_batch_size=32
+rollout.n=32
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_boundaries=[256,512,768]
+ttrl.chunk_state_min_boundary=256
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_teacher_anchor_enable=True
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+运行结果：
+
+```text
+log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_midstate_probe4_b32_r32_v64_3step_20260731.log
+
+jsonl:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_midstate_probe4_b32_r32_v64_3step_20260731.jsonl
+
+jsonl_rows=96
+Final validation skipped
+```
+
+逐步 stdout 指标：
+
+```text
+step 1:
+  raw_positive_ratio=0.303
+  positive_ratio=0.379
+  all_negative_ratio=0.000
+  all_positive_ratio=0.156
+  mixed_ratio=0.844
+  target_entropy=1.037
+  actor/powerflow_loss=1.443
+  actor/grad_norm=47.833
+  timing_s/gen=52.014
+  timing_s/chunk_state_probe=7.020
+  timing_s/chunk_state_score=10.730
+  timing_s/chunk_state_ref=6.130
+  timing_s/update_actor=7.909
+
+step 2:
+  raw_positive_ratio=0.231
+  positive_ratio=0.316
+  all_negative_ratio=0.000
+  all_positive_ratio=0.094
+  mixed_ratio=0.906
+  target_entropy=0.924
+  actor/powerflow_loss=0.643
+  actor/grad_norm=19.524
+  timing_s/gen=24.890
+  timing_s/chunk_state_probe=6.634
+  timing_s/chunk_state_score=11.518
+  timing_s/chunk_state_ref=2.262
+  timing_s/update_actor=7.231
+
+step 3:
+  raw_positive_ratio=0.335
+  positive_ratio=0.410
+  all_negative_ratio=0.000
+  all_positive_ratio=0.188
+  mixed_ratio=0.812
+  boundary_zero_ratio=0.031
+  target_entropy=1.068
+  actor/powerflow_loss=0.799
+  actor/grad_norm=22.770
+  timing_s/gen=22.365
+  timing_s/chunk_state_probe=6.713
+  timing_s/chunk_state_score=11.677
+  timing_s/chunk_state_ref=2.368
+  timing_s/update_actor=7.521
+```
+
+JSONL 离线统计：
+
+```text
+step 1:
+  rows=32
+  probe_mean_avg=0.37890625
+  flat_positive_ratio=0.52734375
+  all_negative=0
+  all_positive=5
+  mixed=27
+  boundary_counts={256: 14, 512: 11, 768: 7}
+  source_len_mean=1272.65625
+  source_original_correct_mean=0.90625
+  probe_mean_correct=0.40086206896551724
+  probe_mean_wrong=0.16666666666666666
+
+step 2:
+  rows=32
+  probe_mean_avg=0.31640625
+  flat_positive_ratio=0.50390625
+  all_negative=0
+  all_positive=3
+  mixed=29
+  boundary_counts={256: 16, 512: 8, 768: 8}
+  source_len_mean=1158.125
+  source_original_correct_mean=0.90625
+  probe_mean_correct=0.33620689655172414
+  probe_mean_wrong=0.125
+
+step 3:
+  rows=32
+  probe_mean_avg=0.41015625
+  flat_positive_ratio=0.58203125
+  all_negative=0
+  all_positive=6
+  mixed=26
+  boundary_counts={0: 1, 256: 13, 512: 11, 768: 7}
+  source_len_mean=1178.75
+  source_original_correct_mean=0.96875
+  probe_mean_correct=0.41935483870967744
+  probe_mean_wrong=0.125
+```
+
+结论：
+
+- Gate 通过训练稳定性检查：连续 3 步没有 shape mismatch、没有 NaN、没有 all-negative state，PowerFlow loss 和 grad norm 没有爆炸。
+- Probe4 target 的信息密度稳定：三步 `flat_positive_ratio` 在 0.50 到 0.58，state 级 `all_negative=0/32`。
+- 第 3 步出现 1 个 `boundary=0`，离线看是单个 source response 长度只有 95，说明 `chunk_state_min_boundary=256` 仍可能在极短成功轨迹上退回 0 boundary；不是整体退化，但后续 20-step 前最好把 source selection 改成严格过滤短于 256 的 source，而不是 fallback。
+- 稳态速度比 1-step 更清楚：step2/3 的 `gen` 降到 24.9s/22.4s，`update_actor` 为 7.2s/7.5s。当前新增开销主要是 rule-based scoring，`chunk_state_score` 约 11.5s，probe generation 约 6.7s。
+- 下一步不建议直接上 80-step；建议先修掉短 source fallback，再跑 20-step with validation gate，看 mean@16 是否能明显超过此前 chunk MVP 的 0.49 区间。
