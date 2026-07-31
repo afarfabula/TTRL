@@ -1347,3 +1347,146 @@ overall:
 2. 保留 mid-state gate 和 PowerFlow loss。
 3. 改 probe target：减少把单个 0/1 final reward 直接投影到 chunk 的噪声，优先做更宽/更短 probe 或 probe-majority target。
 4. 增加一个 no-final-val smoke 模式，避免 3-step 诊断每次多花约 293s validation。
+
+## 2026-07-31 Multi-Probe Target 设计
+
+动机：
+
+- Mid-state 版本已经把 `boundary_zero_ratio` 和 `all_negative_ratio` 修好，但 `mean@16=0.49475` 仍明显低于 gate。
+- 当前每个 chunk candidate 只有一次 probe，`score_j` 是单次 0/1 final correctness，对 chunk credit assignment 噪声太大。
+- 下一步保持 PowerFlow actor loss 不变，只把 `score_j` 从单次 Bernoulli 样本改成多 probe 的均值，更接近 `P(success | state, chunk)`。
+
+代码改动：
+
+```text
+ttrl.chunk_state_probe_samples: 1
+```
+
+- 默认值 1，旧实验语义不变。
+- 当 `probe_samples > 1` 时，对每个 `state+chunk` 采样多个 probe completion。
+- reward 先对每个 probe completion 做 rule-based math correctness，再 reshape 为：
+
+```text
+num_states x candidates x probe_samples
+```
+
+- 最终 chunk score 是 probe 维度均值：
+
+```text
+score_j = mean_k final_correctness(state + chunk_j + probe_{j,k})
+```
+
+- PowerFlow loss、chunk actor span、teacher anchor、chunk weights 都保持不变。
+
+同时新增：
+
+```text
+trainer.final_val_enable: True
+```
+
+- 默认开启，正式训练和历史脚本不变。
+- 诊断脚本可设为 `False`，避免最后一步强制跑 500 x 16 validation。
+
+新 smoke 脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_midstate_probe4_b32_r32_v64_1step_20260731.sh
+```
+
+关键配置：
+
+```text
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+trainer.final_val_enable=False
+trainer.total_training_steps=1
+```
+
+验收：
+
+- 1-step 能跑通，无 shape mismatch。
+- `chunk_state_probe/samples=4`。
+- `chunk_state_probe/raw_positive_ratio` 和聚合后的 `chunk_state/positive_ratio` 同时出现。
+- final validation 被跳过，节省约 293s。
+
+运行结果：
+
+```text
+script:
+  verl/run_records/ttrl_chunk_state_powerflow_midstate_probe4_b32_r32_v64_1step_20260731.sh
+
+config:
+  trainer.total_training_steps=1
+  trainer.final_val_enable=False
+  ttrl.chunk_state_probe_samples=4
+  ttrl.chunk_state_probe_max_tokens=1024
+  ttrl.chunk_state_boundaries=[256,512,768]
+  ttrl.chunk_state_min_boundary=256
+  ttrl.chunk_state_source_mode=success
+  actor.powerflow_enable=True
+  actor.powerflow_use_chunk_weights=True
+  actor.use_dynamic_bsz=False
+```
+
+stdout 关键指标：
+
+```text
+chunk_state_probe/samples=4.000
+chunk_state_probe/raw_positive_ratio=0.303
+chunk_state_diag/boundary_zero_ratio=0.000
+chunk_state_diag/state_all_negative_ratio=0.000
+chunk_state_diag/state_all_positive_ratio=0.156
+chunk_state_diag/state_mixed_ratio=0.844
+chunk_state_diag/probe_score_std=0.416
+chunk_state_diag/state_probe_mean_min=0.125
+chunk_state_diag/state_probe_mean_max=0.875
+chunk_state/num_states=32
+chunk_state/num_candidates=256
+chunk_state/positive_ratio=0.379
+chunk_state/informative_ratio=1.000
+chunk_state/target_entropy=1.037
+chunk_state_actor_span/response_len_mean=225.680
+actor/powerflow_loss=0.810
+timing_s/gen=52.030
+timing_s/chunk_state_chunks=1.685
+timing_s/chunk_state_probe=7.019
+timing_s/chunk_state_score=10.783
+timing_s/chunk_state_ref=6.157
+timing_s/update_actor=7.774
+Final validation skipped
+```
+
+JSONL 离线统计：
+
+```text
+file:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_midstate_probe4_b32_r32_v64_1step_20260731.jsonl
+
+rows=32
+probe_scores_flat_count=256
+probe_mean_avg=0.37890625
+probe_mean_min=0.125
+probe_mean_max=0.875
+probe_mean_median=0.359375
+probe_positive_count_avg=4.21875
+probe_positive_count_min=1
+probe_positive_count_max=8
+flat_positive_ratio=0.52734375
+all_negative=0
+all_positive=5
+mixed=27
+boundary_counts={256: 14, 512: 11, 768: 7}
+source_len_mean=1272.65625
+source_len_min=296
+source_len_max=3072
+source_original_correct_mean=0.90625
+probe_mean_source_correct=0.40086206896551724
+probe_mean_source_wrong=0.16666666666666666
+```
+
+结论：
+
+- Multi-probe target 按预期降低了单次 0/1 probe 的噪声：没有 all-negative state，所有 32 个 state 都 informative。
+- `source_original_correct` 与后续 probe mean 有可见分离，说明这个 target 比单 probe 更像 `P(success | state, chunk)`，更适合接 PowerFlow distribution matching。
+- 这一步只是 1-step 诊断，不看 final accuracy；后续如果扩展，应先做 3-step no-final-val gate，再决定是否升 20-step。
+- 代价是额外 probe/score 开销：1-step 中 `chunk_state_probe=7.019s`、`chunk_state_score=10.783s`。正式实验需要控制 probe samples、probe max tokens 和 state 数量，避免 target 稳定性收益被吞吐吃掉。

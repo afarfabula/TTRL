@@ -1060,6 +1060,11 @@ trainer:
   # Validation frequency (in training iterations)
   test_freq: -1
 
+  # Whether the final training step should trigger validation even when
+  # test_freq would not. Keep enabled for normal runs; short diagnostics can
+  # disable it to avoid spending minutes on final validation.
+  final_val_enable: True
+
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
 

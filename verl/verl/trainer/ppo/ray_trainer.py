@@ -1323,6 +1323,7 @@ class RayPPOTrainer:
         state_prompts: DataProto,
         chunk_output: DataProto,
         max_completion_tokens: int,
+        probe_samples: int = 1,
     ) -> DataProto:
         prompt_len = state_prompts.batch["input_ids"].shape[-1]
         response_mask = chunk_output.batch["response_mask"].bool()
@@ -1370,7 +1371,7 @@ class RayPPOTrainer:
             "pad_token_id": self.tokenizer.pad_token_id,
             "recompute_log_prob": False,
             "do_sample": True,
-            "kwargs": {"n": 1, "max_tokens": int(max_completion_tokens)},
+            "kwargs": {"n": int(probe_samples), "max_tokens": int(max_completion_tokens)},
         }
         return proto
 
@@ -1388,19 +1389,21 @@ class RayPPOTrainer:
         response_masks = []
         chunk_mask = chunk_output.batch["response_mask"].bool()
         probe_mask = probe_output.batch["response_mask"].bool()
+        probes_per_chunk = len(probe_output) // len(chunk_output)
         max_response_len = chunk_output.batch["responses"].shape[-1] + probe_output.batch["responses"].shape[-1]
 
-        for i in range(len(chunk_output)):
-            source_idx = i // candidates
+        for i in range(len(probe_output)):
+            chunk_idx = i // probes_per_chunk
+            source_idx = chunk_idx // candidates
             prompt_ids.append(state_prompts.batch["input_ids"][source_idx])
             prompt_masks.append(state_prompts.batch["attention_mask"][source_idx])
             prompt_position_ids.append(state_prompts.batch["position_ids"][source_idx])
 
-            chunk_len = int(chunk_mask[i].sum().item())
+            chunk_len = int(chunk_mask[chunk_idx].sum().item())
             probe_len = int(probe_mask[i].sum().item())
             response_ids = torch.cat(
                 [
-                    chunk_output.batch["responses"][i, :chunk_len],
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
                     probe_output.batch["responses"][i, :probe_len],
                 ],
                 dim=0,
@@ -1437,10 +1440,11 @@ class RayPPOTrainer:
                 "position_ids": position_ids,
                 "response_mask": response_masks,
             },
-            batch_size=(len(chunk_output),),
+            batch_size=(len(probe_output),),
         )
         non_tensor_batch = {
-            key: np.repeat(value, candidates, axis=0) for key, value in state_prompts.non_tensor_batch.items()
+            key: np.repeat(value, candidates * probes_per_chunk, axis=0)
+            for key, value in state_prompts.non_tensor_batch.items()
         }
         return DataProto(batch=reward_batch, non_tensor_batch=non_tensor_batch)
 
@@ -1669,6 +1673,7 @@ class RayPPOTrainer:
         candidates = int(cfg.get("chunk_state_candidates", 8))
         chunk_size = int(cfg.get("chunk_state_chunk_size", 256))
         probe_max_tokens = int(cfg.get("chunk_state_probe_max_tokens", self.config.data.max_response_length))
+        probe_samples = int(cfg.get("chunk_state_probe_samples", 1))
         max_model_len = int(self.config.actor_rollout_ref.rollout.max_model_len)
         max_prompt_len = int(self.config.data.max_prompt_length)
         source_mode = str(cfg.get("chunk_state_source_mode", "random"))
@@ -1711,6 +1716,7 @@ class RayPPOTrainer:
                 state_prompts=state_prompts,
                 chunk_output=chunk_output,
                 max_completion_tokens=probe_tokens,
+                probe_samples=probe_samples,
             )
             probe_output = self.actor_rollout_wg.generate_sequences(probe_prompts)
             probe_output.non_tensor_batch = probe_prompts.non_tensor_batch
@@ -1722,7 +1728,10 @@ class RayPPOTrainer:
         with marked_timer("chunk_state_score", timing_raw, color="yellow"):
             probe_batch = self._build_probe_reward_batch(state_prompts, chunk_output, probe_output)
             reward_tensor, _ = compute_reward(probe_batch, self.reward_fn)
-            scores = reward_tensor.sum(dim=-1).detach().cpu()
+            raw_probe_scores = reward_tensor.sum(dim=-1).detach().cpu()
+            scores = raw_probe_scores.view(len(state_prompts), candidates, probe_samples).float().mean(dim=-1).reshape(-1)
+            metrics["chunk_state_probe/samples"] = float(probe_samples)
+            metrics["chunk_state_probe/raw_positive_ratio"] = raw_probe_scores.float().mean().item()
             if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
                 anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
                 anchor_score = float(cfg.get("chunk_state_teacher_anchor_score", 1.0))
@@ -1955,7 +1964,10 @@ class RayPPOTrainer:
                         if (
                             self.val_reward_fn is not None
                             and self.config.trainer.test_freq > 0
-                            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                            and (
+                                (is_last_step and self.config.trainer.get("final_val_enable", True))
+                                or self.global_steps % self.config.trainer.test_freq == 0
+                            )
                         ):
                             with marked_timer("testing", timing_raw, color="green"):
                                 val_metrics: dict = self._validate()
@@ -1975,7 +1987,10 @@ class RayPPOTrainer:
                         logger.log(data=metrics, step=self.global_steps)
                         self.global_steps += 1
                         if is_last_step:
-                            pprint(f"Final validation metrics: {last_val_metrics}")
+                            if last_val_metrics is not None:
+                                pprint(f"Final validation metrics: {last_val_metrics}")
+                            else:
+                                pprint("Final validation skipped")
                             progress_bar.close()
                             return
                         progress_bar.update(1)
@@ -2192,7 +2207,10 @@ class RayPPOTrainer:
                     if (
                         self.val_reward_fn is not None
                         and self.config.trainer.test_freq > 0
-                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                        and (
+                            (is_last_step and self.config.trainer.get("final_val_enable", True))
+                            or self.global_steps % self.config.trainer.test_freq == 0
+                        )
                     ):
                         with marked_timer("testing", timing_raw, color="green"):
                             val_metrics: dict = self._validate()
@@ -2246,6 +2264,9 @@ class RayPPOTrainer:
                         self.rm_wg.stop_profile()
 
                 if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    if last_val_metrics is not None:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                    else:
+                        pprint("Final validation skipped")
                     progress_bar.close()
                     return

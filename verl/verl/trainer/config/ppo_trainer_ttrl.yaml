@@ -50,6 +50,7 @@ ttrl:
   chunk_state_candidates: 8
   chunk_state_chunk_size: 256
   chunk_state_probe_max_tokens: 3072
+  chunk_state_probe_samples: 1
   chunk_state_states_per_prompt: 1
   chunk_state_max_prefix_tokens: 1024
   chunk_state_boundaries: [0, 256, 512, 768, 1024]
