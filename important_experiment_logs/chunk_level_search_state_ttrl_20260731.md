@@ -431,3 +431,105 @@ val-aux/math/format_score/mean@16=0.910375
   - state_all_negative_ratio 是否下降。
   - actor/boxed_reward/max 是否稳定为 1。
   - step3/20 val 是否不再快速跌到 0.49/0.47。
+
+## 2026-07-31 Success-Conditioned 3-Step 诊断
+
+目的：
+
+- 保持 chunk actor update 主路径为 PowerFlow loss，不切到 GRPO，也不使用 weighted NLL fallback。
+- 修正上一轮随机 state source 的明显语义问题：同一 prompt 下 `pass@32` 很高，但随机选中的 source rollout original correctness 很低。
+- 优先从 original-GT correct 的 full rollout 上截取 chunk state；如果该 prompt 没有 correct rollout，再 fallback 到原来的 round-robin/random source。
+- 跳过 8 个 chunk candidates 全部 probe 失败的 state，避免 PowerFlow 在低信息量 all-negative group 上更新。
+
+脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_successdiag_b32_r32_v64_3step_20260731.sh
+```
+
+相对随机诊断新增配置：
+
+```text
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_skip_all_negative=True
+actor.powerflow_enable=True
+actor.powerflow_use_boxed_reward=True
+actor.chunk_weighted_nll_enable=False
+actor.use_kl_loss=False
+```
+
+step 指标：
+
+```text
+step1:
+selected_original_acc_mean=0.906
+prompt_original_pass=0.906
+prompt_original_mean=0.334
+state_all_negative_ratio=0.406
+state_mixed_ratio=0.594
+chunk_state/num_actor_samples=152
+chunk_state/positive_ratio=0.215
+chunk_state/kept_state_ratio=0.594
+actor/powerflow_loss=0.711
+actor/boxed_reward/max=1.000
+timing_s/chunk_state_probe=14.605
+timing_s/chunk_state_score=10.093
+timing_s/update_actor=3.578
+
+step2:
+selected_original_acc_mean=0.875
+prompt_original_pass=0.875
+prompt_original_mean=0.314
+state_all_negative_ratio=0.281
+state_mixed_ratio=0.656
+chunk_state/num_actor_samples=184
+chunk_state/positive_ratio=0.289
+chunk_state/kept_state_ratio=0.719
+actor/powerflow_loss=0.545
+actor/boxed_reward/max=1.000
+timing_s/chunk_state_probe=13.682
+timing_s/chunk_state_score=9.797
+timing_s/update_actor=4.788
+
+step3:
+selected_original_acc_mean=0.906
+prompt_original_pass=0.906
+prompt_original_mean=0.313
+state_all_negative_ratio=0.312
+state_mixed_ratio=0.688
+chunk_state/num_actor_samples=176
+chunk_state/positive_ratio=0.266
+chunk_state/kept_state_ratio=0.688
+actor/powerflow_loss=0.654
+actor/boxed_reward/max=1.000
+timing_s/chunk_state_probe=13.739
+timing_s/chunk_state_score=9.408
+timing_s/update_actor=4.829
+```
+
+step3 validation：
+
+```text
+val-core/math/acc/mean@16=0.457500
+val-core/math/acc/maj@16/mean=0.585826
+val-core/math/acc/best@16/mean=0.848662
+val-aux/math/format_score/mean@16=0.903125
+```
+
+结论：
+
+- 这次确认 actor update 仍是 `actor/powerflow_loss`，不是 weighted NLL，也不是 GRPO。
+- success-conditioned source selection 生效：selected source original correctness 从随机诊断的 0.250-0.406 提升到 0.875-0.906。
+- `skip_all_negative` 生效：actor samples 从固定 256 降到 152/184/176，update_actor 降到 3.6-4.8s，比 20-step pilot 的 5.7-8.6s 更友好。
+- `actor/boxed_reward/max` 三步都为 1，上一轮 step2 的全 0 actor reward 问题在该配置下没有复现。
+- 但 validation 没有改善，3-step `mean@16=0.4575` 仍明显低于 MV gate。这说明修复 source correctness 只是必要条件，不是充分条件。
+
+下一步判断：
+
+- 失败主因不再是“选错 source rollout”这一项；现在更像是 chunk-level target 分布本身不够可靠。
+- 当前 PowerFlow target 仍是 sparse boxed reward：只要 probe 成功就是 1，否则 0。这会把 full-answer verifier 的高方差信号直接压到局部 chunk 上，credit assignment 仍然很粗。
+- 下一轮应继续沿 PowerFlow loss 主线改 target，而不是切 GRPO：
+  - 用 per-state probe scores 构造 sharpened distribution，而不是只写 binary boxed reward。
+  - 对 success source 的 original next chunk 保留 teacher anchor，避免模型只追逐短 probe 偶然成功的 chunk。
+  - boundary 先收窄到非零中早段，例如 256/512/768，减少 `boundary_zero_ratio` 过高时退化成普通 full-answer update。
+  - `chunk_state_score` 诊断开销只在 smoke 打开；正式 20-step 应关闭重诊断或只低频采样。

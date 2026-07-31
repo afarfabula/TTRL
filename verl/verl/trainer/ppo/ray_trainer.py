@@ -1036,12 +1036,44 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
-    def _make_chunk_state_prompts(self, batch: DataProto) -> tuple[DataProto, list[int]]:
+    def _compute_original_gt_rewards(self, batch: DataProto) -> torch.Tensor:
+        original_non_tensor = dict(batch.non_tensor_batch)
+        if "reward_model" not in original_non_tensor:
+            reward_tensor, _ = compute_reward(batch, self.reward_fn)
+            return reward_tensor.sum(dim=-1).detach().cpu().float()
+
+        reward_models = []
+        has_original_gt = False
+        for reward_model in original_non_tensor["reward_model"]:
+            reward_model_copy = dict(reward_model)
+            if "original_gt" in reward_model_copy:
+                reward_model_copy["ground_truth"] = reward_model_copy["original_gt"]
+                has_original_gt = True
+            reward_models.append(reward_model_copy)
+        if not has_original_gt:
+            reward_tensor, _ = compute_reward(batch, self.reward_fn)
+            return reward_tensor.sum(dim=-1).detach().cpu().float()
+
+        original_non_tensor["reward_model"] = np.asarray(reward_models, dtype=object)
+        original_batch = DataProto(
+            batch=batch.batch,
+            non_tensor_batch=original_non_tensor,
+            meta_info=batch.meta_info,
+        )
+        reward_tensor, _ = compute_reward(original_batch, self.reward_fn)
+        return reward_tensor.sum(dim=-1).detach().cpu().float()
+
+    def _make_chunk_state_prompts(
+        self,
+        batch: DataProto,
+        source_correctness: Optional[torch.Tensor] = None,
+    ) -> tuple[DataProto, list[int]]:
         cfg = self.config.ttrl
         n = int(cfg.n_samples_per_prompt)
         states_per_prompt = int(cfg.get("chunk_state_states_per_prompt", 1))
         max_prefix_tokens = int(cfg.get("chunk_state_max_prefix_tokens", 1024))
         boundaries = [int(x) for x in cfg.get("chunk_state_boundaries", [0, 256, 512, 768, 1024])]
+        source_mode = str(cfg.get("chunk_state_source_mode", "random"))
         if not boundaries:
             boundaries = [0]
 
@@ -1059,7 +1091,16 @@ class RayPPOTrainer:
         source_response_lengths = []
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
-                source_local = (self.global_steps + prompt_idx + state_idx) % n
+                source_offset = self.global_steps + prompt_idx + state_idx
+                if source_mode == "success" and source_correctness is not None:
+                    prompt_scores = source_correctness[prompt_idx * n : (prompt_idx + 1) * n]
+                    good_locals = torch.nonzero(prompt_scores > 0.0, as_tuple=False).flatten()
+                    if good_locals.numel() > 0:
+                        source_local = int(good_locals[source_offset % good_locals.numel()].item())
+                    else:
+                        source_local = source_offset % n
+                else:
+                    source_local = source_offset % n
                 source_index = prompt_idx * n + source_local
                 valid_prompt_len = int(batch.batch["attention_mask"][source_index, :prompt_len].sum().item())
                 prompt_ids = batch.batch["prompts"][source_index, -valid_prompt_len:]
@@ -1111,6 +1152,10 @@ class RayPPOTrainer:
         state_non_tensor["chunk_state_source_local"] = np.asarray(source_locals, dtype=np.int64)
         state_non_tensor["chunk_state_boundary"] = np.asarray(state_boundaries, dtype=np.int64)
         state_non_tensor["chunk_state_source_response_len"] = np.asarray(source_response_lengths, dtype=np.int64)
+        if source_correctness is not None:
+            state_non_tensor["chunk_state_source_original_correct"] = (
+                source_correctness[np.asarray(source_indices, dtype=np.int64)].numpy().astype(np.float32)
+            )
         state_proto = DataProto(batch=state_batch, non_tensor_batch=state_non_tensor)
         state_proto.meta_info = {
             "eos_token_id": self.tokenizer.eos_token_id,
@@ -1160,30 +1205,7 @@ class RayPPOTrainer:
         pseudo_reward_tensor, _ = compute_reward(full_batch, self.reward_fn)
         pseudo_rewards = pseudo_reward_tensor.sum(dim=-1).detach().cpu().float()
 
-        original_non_tensor = dict(full_batch.non_tensor_batch)
-        if "reward_model" in original_non_tensor:
-            reward_models = []
-            has_original_gt = False
-            for reward_model in original_non_tensor["reward_model"]:
-                reward_model_copy = dict(reward_model)
-                if "original_gt" in reward_model_copy:
-                    reward_model_copy["ground_truth"] = reward_model_copy["original_gt"]
-                    has_original_gt = True
-                reward_models.append(reward_model_copy)
-            original_non_tensor["reward_model"] = np.asarray(reward_models, dtype=object)
-        else:
-            has_original_gt = False
-
-        if has_original_gt:
-            original_batch = DataProto(
-                batch=full_batch.batch,
-                non_tensor_batch=original_non_tensor,
-                meta_info=full_batch.meta_info,
-            )
-            original_reward_tensor, _ = compute_reward(original_batch, self.reward_fn)
-            original_rewards = original_reward_tensor.sum(dim=-1).detach().cpu().float()
-        else:
-            original_rewards = pseudo_rewards
+        original_rewards = self._compute_original_gt_rewards(full_batch)
 
         source_indices = torch.as_tensor(state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=torch.long)
         source_prompt_indices = torch.as_tensor(
@@ -1365,17 +1387,22 @@ class RayPPOTrainer:
         alpha = float(cfg.get("chunk_state_alpha", 2.0))
         eps = float(cfg.get("chunk_state_eps", 0.05))
         skip_uniform = bool(cfg.get("chunk_state_skip_uniform", False))
+        skip_all_negative = bool(cfg.get("chunk_state_skip_all_negative", False))
 
         score_matrix = scores.view(num_states, candidates).float()
         raw_weights = torch.pow(score_matrix + eps, alpha)
         weight_sums = raw_weights.sum(dim=-1, keepdim=True)
         uniform = torch.full_like(raw_weights, 1.0 / candidates)
         weights = torch.where(weight_sums > 0, raw_weights / weight_sums.clamp(min=1e-12), uniform)
-        informative = ((score_matrix.max(dim=-1).values - score_matrix.min(dim=-1).values) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
+        score_max = score_matrix.max(dim=-1).values
+        score_min = score_matrix.min(dim=-1).values
+        informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
         if skip_uniform:
             keep_state = informative.bool()
         else:
             keep_state = torch.ones(num_states, dtype=torch.bool)
+        if skip_all_negative:
+            keep_state &= score_max > 0.0
         keep_indices = []
         for state_idx in range(num_states):
             if keep_state[state_idx]:
@@ -1431,6 +1458,7 @@ class RayPPOTrainer:
             "chunk_state/num_actor_samples": float(len(actor_proto)),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
             "chunk_state/informative_ratio": informative.mean().detach().item(),
+            "chunk_state/kept_state_ratio": keep_state.float().mean().detach().item(),
             "chunk_state/target_entropy": (-(weights * torch.log(weights.clamp(min=1e-12))).sum(dim=-1).mean()).detach().item(),
             "chunk_state/weight_max": weights.max().detach().item(),
             "chunk_state/weight_min": weights.min().detach().item(),
@@ -1444,9 +1472,27 @@ class RayPPOTrainer:
         probe_max_tokens = int(cfg.get("chunk_state_probe_max_tokens", self.config.data.max_response_length))
         max_model_len = int(self.config.actor_rollout_ref.rollout.max_model_len)
         max_prompt_len = int(self.config.data.max_prompt_length)
+        source_mode = str(cfg.get("chunk_state_source_mode", "random"))
+        source_correctness = None
+        if source_mode == "success" or bool(cfg.get("chunk_state_diag_enable", False)):
+            source_correctness = self._compute_original_gt_rewards(full_batch)
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
-            state_prompts, _ = self._make_chunk_state_prompts(full_batch)
+            state_prompts, _ = self._make_chunk_state_prompts(full_batch, source_correctness=source_correctness)
+            if source_correctness is not None:
+                n = int(cfg.n_samples_per_prompt)
+                prompt_count = len(full_batch) // n
+                original_prompt = source_correctness.view(prompt_count, n)
+                source_indices = torch.as_tensor(
+                    state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=torch.long
+                )
+                metrics["chunk_state_source/selected_original_acc_mean"] = source_correctness[
+                    source_indices
+                ].float().mean().item()
+                metrics["chunk_state_source/prompt_original_pass"] = (
+                    original_prompt.max(dim=-1).values > 0.0
+                ).float().mean().item()
+                metrics["chunk_state_source/prompt_original_mean"] = original_prompt.mean(dim=-1).mean().item()
 
         with marked_timer("chunk_state_chunks", timing_raw, color="red"):
             chunk_prompts = deepcopy(state_prompts)
