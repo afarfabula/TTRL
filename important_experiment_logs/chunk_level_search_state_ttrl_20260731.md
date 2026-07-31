@@ -533,3 +533,150 @@ val-aux/math/format_score/mean@16=0.903125
   - 对 success source 的 original next chunk 保留 teacher anchor，避免模型只追逐短 probe 偶然成功的 chunk。
   - boundary 先收窄到非零中早段，例如 256/512/768，减少 `boundary_zero_ratio` 过高时退化成普通 full-answer update。
   - `chunk_state_score` 诊断开销只在 smoke 打开；正式 20-step 应关闭重诊断或只低频采样。
+
+## 2026-07-31 Weighted PowerFlow Target 设计
+
+动机：
+
+- 用户明确要求 chunk actor update 优先使用 PowerFlow loss。
+- success-conditioned 诊断说明 source selection 已明显改善，但 sparse boxed reward 仍然不能让 validation 变好。
+- 因此下一版不切 GRPO，不切 weighted NLL，而是在 PowerFlow residual 上引入 per-state search-improved target distribution。
+
+实现思路：
+
+```text
+q_j = normalize((score_j + eps) ** alpha)
+w_j = q_j * K
+L = mean_j stopgrad(w_j) * delta_j^2
+```
+
+其中 `delta_j` 仍然是 PowerFlow trajectory-balance residual：
+
+```text
+delta_j = logZ(s) + avg_log pi_theta(c_j | s)
+          - beta * (avg_log pi_ref(c_j | s) + (boxed_reward_j - 1) / 2)
+```
+
+设计约束：
+
+- `actor.powerflow_enable=True` 仍是主路径。
+- `actor.chunk_weighted_nll_enable=False`，weighted NLL 仍只作为 fallback / ablation。
+- 新开关 `actor.powerflow_use_chunk_weights=True` 显式启用，不影响普通 PowerFlow/TTRL runs。
+- `chunk_weights=q_j` 保留给 weighted NLL fallback；新增 `powerflow_chunk_weights=q_j*K` 给 PowerFlow，保证 uniform target 时 loss scale 近似不变。
+- 配套记录 `actor/powerflow_weight/*` 和 `chunk_state/powerflow_weight_*`，确认训练是否实际使用 sharpened target。
+
+待跑 smoke：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_weighted_successdiag_b32_r32_v64_3step_20260731.sh
+```
+
+gate：
+
+- 3-step 必须出现 `actor/powerflow_weight/max > 1`，否则说明 sharpened distribution 没进入 PowerFlow loss。
+- `actor/powerflow_loss` 不为 NaN，`update_actor` 不明显劣化。
+- 如果 smoke 正常，再开 20-step weighted-success pilot；若 step20 仍明显低于 MV gate，下一刀才考虑 teacher anchor / 非零 boundary ablation。
+
+## 2026-07-31 Weighted Success 3-Step Smoke 结果
+
+脚本：
+
+```text
+verl/run_records/ttrl_chunk_state_powerflow_weighted_successdiag_b32_r32_v64_3step_20260731.sh
+```
+
+配置确认：
+
+```text
+actor.powerflow_enable=True
+actor.powerflow_use_boxed_reward=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_skip_all_negative=True
+```
+
+实现/infra 修复：
+
+- 第一次启动失败在 Ray AF_UNIX socket path 过长：`/tmp/cspfweightedsuccessdiagb32r32v64s3/.../plasma_store` 超过 107 bytes。
+- 已把 weighted smoke 默认 runtime dir 改为 `/tmp/cpw3`，并把 successdiag 默认 runtime dir 改为 `/tmp/cps3`，避免后续同类问题。
+- 静态检查已通过：
+  - `python -m py_compile verl/workers/actor/dp_actor.py verl/trainer/ppo/ray_trainer.py`
+  - `bash -n run_records/ttrl_chunk_state_powerflow_weighted_successdiag_b32_r32_v64_3step_20260731.sh`
+  - `git diff --check`
+
+step 指标：
+
+```text
+step1:
+selected_original_acc_mean=0.906
+state_all_negative_ratio=0.406
+chunk_state/num_actor_samples=152
+chunk_state/positive_ratio=0.215
+chunk_state/powerflow_weight_mean=1.000
+chunk_state/powerflow_weight_max=7.875
+actor/powerflow_weight/max=3.973
+actor/powerflow_loss=0.259
+timing_s/gen=51.876
+timing_s/chunk_state_probe=13.846
+timing_s/chunk_state_score=10.203
+timing_s/chunk_state_ref=6.896
+timing_s/update_actor=4.658
+
+step2:
+selected_original_acc_mean=0.938
+state_all_negative_ratio=0.406
+chunk_state/num_actor_samples=152
+chunk_state/positive_ratio=0.238
+chunk_state/powerflow_weight_mean=1.000
+chunk_state/powerflow_weight_max=7.875
+actor/powerflow_weight/max=7.875
+actor/powerflow_loss=1.107
+timing_s/gen=22.860
+timing_s/chunk_state_probe=13.702
+timing_s/chunk_state_score=10.302
+timing_s/chunk_state_ref=1.208
+timing_s/update_actor=3.674
+
+step3:
+selected_original_acc_mean=0.938
+state_all_negative_ratio=0.312
+chunk_state/num_actor_samples=176
+chunk_state/positive_ratio=0.219
+chunk_state/powerflow_weight_mean=1.000
+chunk_state/powerflow_weight_max=7.875
+actor/powerflow_weight/max=7.875
+actor/powerflow_loss=1.573
+timing_s/gen=23.438
+timing_s/chunk_state_probe=13.753
+timing_s/chunk_state_score=8.869
+timing_s/chunk_state_ref=1.531
+timing_s/update_actor=4.719
+```
+
+step3 validation：
+
+```text
+val-core/math/acc/mean@16=0.459875
+val-core/math/acc/maj@16/mean=0.588092
+val-core/math/acc/best@16/mean=0.848188
+val-aux/math/format_score/mean@16=0.900125
+timing_s/testing=297.709
+```
+
+结论：
+
+- Weighted PowerFlow target 路径已真实生效：trainer 侧 `chunk_state/powerflow_weight_max=7.875`，actor 侧 `actor/powerflow_weight/max=7.875`。
+- actor update 正常，loss 非 NaN，update_actor 约 3.7-4.7s，未比 successdiag 明显劣化。
+- 3-step validation 仍未改善，和 successdiag 基本同档：mean@16 约 0.46，maj@16 约 0.59。
+- `actor/powerflow_weight/mean` 是按 micro-batch reduce 后的均值，step3 显示 0.673 不代表全 batch 权重均值偏移；全 batch 指标看 `chunk_state/powerflow_weight_mean=1.000`。
+- 当前最明显的工程瓶颈仍是 probe/scoring：`chunk_state_probe` 约 13.7s，诊断版 `chunk_state_score` 约 8.9-10.3s，最终 validation 约 298s。
+
+下一步：
+
+- 不再继续扩这个 3-step 诊断配置到 80 step。
+- 如果要跑 20-step gate，应使用 weighted-success 主路径但关闭重诊断，保留轻量 target statistics。
+- 算法下一刀优先 teacher anchor / nonzero boundary：
+  - success source 的 original next chunk 加入 PowerFlow target 或作为 anchor weight。
+  - boundary 先试 `[256,512,768]`，避免 boundary=0 退化成普通 full-answer sampling。
+  - 只低频打开 full original-GT diagnostic，避免每步多算 full rollout reward。

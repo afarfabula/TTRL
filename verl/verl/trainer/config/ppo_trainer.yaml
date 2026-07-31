@@ -242,6 +242,10 @@ actor_rollout_ref:
     # experiments this should stay false.
     powerflow_use_boxed_reward: false
 
+    # If true, weight the PowerFlow residual by a search-improved candidate
+    # distribution supplied in `powerflow_chunk_weights`.
+    powerflow_use_chunk_weights: false
+
     # If true, use current log probabilities as old log probabilities in the
     # PowerFlow update. This is mainly useful for debugging.
     powerflow_on_policy: false

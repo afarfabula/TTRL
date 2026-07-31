@@ -346,6 +346,7 @@ class DataParallelPPOActor(BasePPOActor):
         response_mask,
         log_z,
         boxed_reward=None,
+        chunk_weights=None,
         rollout_log_probs=None,
         use_boxed_reward=False,
     ):
@@ -378,7 +379,10 @@ class DataParallelPPOActor(BasePPOActor):
             1 - self.config.get("clip_ratio_low", 0.2),
             1 + self.config.get("clip_ratio_high", 0.28),
         )
-        avg_loss = torch.mean(imp_w * (delta**2))
+        loss_weights = torch.ones_like(delta)
+        if chunk_weights is not None:
+            loss_weights = chunk_weights.to(delta.dtype).view_as(delta)
+        avg_loss = torch.mean(loss_weights * imp_w * (delta**2))
 
         ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
         ref_kl = verl_F.masked_mean(-(log_prob - ref_log_prob), response_mask)
@@ -396,6 +400,9 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/boxed_reward/mean": sequence_boxed_reward.mean().detach().item(),
             "actor/boxed_reward/min": sequence_boxed_reward.min().detach().item(),
             "actor/boxed_reward/max": sequence_boxed_reward.max().detach().item(),
+            "actor/powerflow_weight/mean": loss_weights.mean().detach().item(),
+            "actor/powerflow_weight/min": loss_weights.min().detach().item(),
+            "actor/powerflow_weight/max": loss_weights.max().detach().item(),
             "actor/log_z": log_z.mean().detach().item(),
             "actor/importance_weight": imp_w.mean().detach().item(),
             "actor/ppo_kl": ppo_kl.detach().item(),
@@ -536,6 +543,8 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.get("powerflow_enable", False):
             select_keys.append("boxed_reward")
             select_keys.append("ref_log_prob")
+            if self.config.get("powerflow_use_chunk_weights", False):
+                select_keys.append("powerflow_chunk_weights")
             if "rollout_log_probs" in data.batch:
                 select_keys.append("rollout_log_probs")
         if (
@@ -678,6 +687,11 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob = log_prob.detach()
                         ref_log_prob = data["ref_log_prob"]
                         boxed_reward = data["boxed_reward"] if "boxed_reward" in data_keys else None
+                        powerflow_chunk_weights = (
+                            data["powerflow_chunk_weights"]
+                            if self.config.get("powerflow_use_chunk_weights", False)
+                            else None
+                        )
                         policy_loss, powerflow_metrics = self.compute_powerflow(
                             log_prob=log_prob,
                             ref_log_prob=ref_log_prob,
@@ -685,6 +699,7 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                             log_z=log_z,
                             boxed_reward=boxed_reward,
+                            chunk_weights=powerflow_chunk_weights,
                             rollout_log_probs=data["rollout_log_probs"] if "rollout_log_probs" in data_keys else None,
                             use_boxed_reward=self.config.get("powerflow_use_boxed_reward", False),
                         )

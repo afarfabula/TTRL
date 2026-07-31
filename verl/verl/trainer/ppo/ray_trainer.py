@@ -1414,6 +1414,7 @@ class RayPPOTrainer:
         kept_states = repeated_state_prompts[keep_indices]
         kept_chunks = chunk_output[keep_indices]
         flat_weights = weights.reshape(-1)[keep_indices]
+        powerflow_flat_weights = flat_weights * candidates
 
         prompt_ids = kept_states.batch["input_ids"]
         prompt_mask = kept_states.batch["attention_mask"]
@@ -1436,6 +1437,7 @@ class RayPPOTrainer:
                 "old_log_probs": torch.zeros_like(responses, dtype=torch.float32),
                 "advantages": torch.zeros_like(responses, dtype=torch.float32),
                 "chunk_weights": flat_weights.to(dtype=torch.float32),
+                "powerflow_chunk_weights": powerflow_flat_weights.to(dtype=torch.float32),
                 "boxed_reward": torch.zeros_like(responses, dtype=torch.float32),
             },
             batch_size=(len(keep_indices),),
@@ -1462,6 +1464,9 @@ class RayPPOTrainer:
             "chunk_state/target_entropy": (-(weights * torch.log(weights.clamp(min=1e-12))).sum(dim=-1).mean()).detach().item(),
             "chunk_state/weight_max": weights.max().detach().item(),
             "chunk_state/weight_min": weights.min().detach().item(),
+            "chunk_state/powerflow_weight_mean": powerflow_flat_weights.mean().detach().item(),
+            "chunk_state/powerflow_weight_max": powerflow_flat_weights.max().detach().item(),
+            "chunk_state/powerflow_weight_min": powerflow_flat_weights.min().detach().item(),
         }
         return actor_proto, metrics
 
