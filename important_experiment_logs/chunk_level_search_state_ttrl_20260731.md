@@ -1880,3 +1880,74 @@ step3: gen=30.547s chunk_state_probe=6.842s chunk_state_score=11.039s update_act
 - 这个版本通过 3-step smoke gate。相比 random source，正信号和 mixed-state 比例明显更健康，`state_all_negative_ratio` 稳定在 0.219 到 0.375，而不是持续升高到 0.656。
 - 它仍然符合当前主线：先完整 on-policy rollout，再构造 chunk search state，用 PowerFlow distribution matching 更新 next-chunk actor；没有切回 GRPO，也没有用 weighted NLL 替代。
 - 可以进入 20-step gate，观察 final validation 是否至少摆脱 strict teacher-anchor 版本的 `mean@16=0.399875` 失败区间，并评估是否有机会接近/超过 20-step MV baseline。
+
+## 2026-07-31 Success Source + No Teacher Anchor PowerFlow 20-step Gate
+
+Run:
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_successsrc_noanchor_probe4_b32_r32_v64_20step_20260731
+train_batch_size=32
+rollout.n=32
+trainer.total_training_steps=20
+trainer.test_freq=20
+trainer.final_val_enable=True
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_boundaries=[0,256,512,768,1024]
+ttrl.chunk_state_min_boundary=0
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+actor.use_dynamic_bsz=False
+```
+
+运行命令：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_successsrc_noanchor_probe4_b32_r32_v64_20step_20260731 TOTAL_TRAINING_STEPS=20 TEST_FREQ=20 FINAL_VAL_ENABLE=True DIAG_JSONL=/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_successsrc_noanchor_probe4_b32_r32_v64_20step_20260731.jsonl bash /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_randomsrc_probe4_b32_r32_v64_20step_20260731.sh ttrl.chunk_state_source_mode=success ttrl.chunk_state_teacher_anchor_enable=False ttrl.chunk_state_min_boundary=0 2>&1 | tee /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_successsrc_noanchor_probe4_b32_r32_v64_20step_20260731.log
+```
+
+最终 validation:
+
+```text
+val-core/math/acc/mean@16=0.4335
+val-core/math/acc/maj@16/mean=0.55015
+val-core/math/acc/best@16/mean=0.8437740000000001
+val-aux/math/format_score/mean@16=0.88925
+val-aux/math/format_score/maj@16/mean=0.86167
+timing_s/testing=298.499
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.906
+chunk_state_probe/raw_positive_ratio=0.276
+chunk_state_diag/state_all_positive_ratio=0.219
+chunk_state_diag/state_all_negative_ratio=0.438
+chunk_state_diag/state_mixed_ratio=0.344
+chunk_state/positive_ratio=0.276
+chunk_state/informative_ratio=0.562
+actor/pg_loss=0.755
+actor/powerflow_loss=0.755
+actor/grad_norm=9.603
+jsonl_rows=640
+```
+
+耗时：
+
+```text
+step20: gen=31.038s chunk_state_probe=6.933s chunk_state_score=12.073s update_actor=7.783s testing=298.499s
+steady step after warmup: roughly 58-62s/step
+```
+
+结论：
+
+- 工程链路稳定，20 step 训练和 final validation 均完成；诊断 JSONL 为 640 行，符合 20 step x 32 state。
+- actor update 明确走 PowerFlow chunk loss：`actor/powerflow_loss` 与 `actor/pg_loss` 对齐，且 `actor.chunk_weighted_nll_enable=False`。这不是 GRPO，也不是 weighted NLL。
+- 这个 gate 指标失败：`mean@16=0.4335`、`maj@16=0.55015`，远低于 20-step MV baseline 和 PowerFlow 原 repo 轨迹。不能直接扩到 80 step。
+- 主要问题不是 loss 没接上，而是 target construction 仍然太弱：即使 source 是 successful rollout，chunk probe 在 step20 仍有 `state_all_negative_ratio=0.438`，并且 positive ratio 只有 0.276。当前 chunk target 很容易把模型推向“局部看起来可行但终局不稳”的 next-chunk 分布。
+- 下一轮必须继续以 PowerFlow distribution matching 为主 loss，但重做 target：优先考虑对每个 state 保留原 successful source chunk 作为 support candidate，并用 probe-improved distribution 做软重加权，而不是只依赖重采样 chunk；同时减少全负 state 的更新权重，避免错误地把无信息 state 当成有效训练信号。
