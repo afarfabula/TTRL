@@ -119,6 +119,11 @@ ttrl:
   # search-state improvement target, not a short-probe majority teacher.
   chunk_state_answer_support_score: mass
   chunk_state_answer_support_min_mass: 0.0
+  # answer_source_consistency scores a candidate by whether its future probe
+  # returns to the selected source rollout's final answer. This keeps each
+  # chunk state tied to its own full-trajectory answer instead of any answer in
+  # the global prompt support.
+  chunk_state_answer_source_consistency_enable: false
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.

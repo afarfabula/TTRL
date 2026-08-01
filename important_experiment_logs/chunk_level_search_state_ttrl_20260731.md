@@ -5257,3 +5257,99 @@ support_massavg_src20: mean@16 = 0.453625, maj@16 = 0.586292, best@16 = 0.850910
 - 可选方向一：从 full 32 rollout 选高置信 majority-consistent source，然后只在 source 轨迹的中后段截取 state，target 使用 source answer 的 conditional likelihood / rank，而不是 probe answer 是否落入 global support。
 - 可选方向二：参考 chunked search inference 的 beam/prune 语义，用同一 state 下的 continuation tree 做 listwise preference，先保证 chunk choice 能预测 full-answer correctness，再接 PowerFlow distribution matching。
 - 可选方向三：先做离线诊断集，统计 chunk boundary、probe horizon、OOV、source correctness 到 final acc 的相关性，避免继续用 20-step training gate 盲试 target。
+
+## 2026-08-01 Source-Answer Consistency 3-Step Smoke
+
+目的：
+
+- 回应上一节失败结论中的“source answer conditional target”方向：不再奖励任意 full-group support answer，而是把每个 chunk state 绑定到被选中的 majority-consistent source rollout 的最终 answer。
+- 对 `state + next_chunk + probe` 抽取 final answer，并只在它与该 state 的 `chunk_state_source_answer` 等价时给分；source answer 来自同组 full rollout，不使用 GT 选择 target。
+- 继续使用 PowerFlow chunk actor update、source chunk candidate 注入、candidate/target guard 和固定 batch；不启用 actor dynamic batch。
+
+代码改动：
+
+```text
+新增 _score_chunk_state_answer_source_consistency
+新增 ttrl.chunk_state_score_mode=answer_source_consistency 分支
+该 mode 自动触发 full-rollout answer metadata 计算
+新增 chunk_state_score/mode_answer_source_consistency 指标
+默认关闭，不影响既有实验
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_source_consistency_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_score_mode=answer_source_consistency
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_use_distribution_score=False
+ttrl.chunk_state_target_guard_use_mass_gain=False
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_target_guard_candidate_max_boxed_count=1
+ttrl.chunk_state_target_guard_candidate_assistant_marker=True
+```
+
+产物：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_source_consistency_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_source_consistency_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_source_consistency_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 平均：
+
+```text
+source_answer_mass_mean = 0.396
+valid_source_ratio = 0.938
+answer_coverage_mean = 0.740
+raw_positive_ratio = 0.419
+label_consistent_ratio = 0.585
+state_positive_ratio = 0.709
+kept_candidate_ratio = 0.403
+distribution_oov_probe_ratio = 0.524
+repeated_boxed_probe_ratio = 0.103
+candidate_repeated_boxed_probe_ratio = 0.038
+positive_ratio_after_guard = 0.330
+kept_state_ratio = 0.521
+powerflow_weight_max = 7.787
+boxed_reward_weighted_mean = 0.860
+actor_powerflow_loss = 0.504
+actor_grad_norm = 16.327
+timing_s/gen = 32.439
+timing_s/chunk_state_probe = 6.682
+timing_s/chunk_state_score = 11.351
+timing_s/chunk_state_ref = 3.143
+timing_s/update_actor = 5.839
+```
+
+Step 3：
+
+```text
+raw_positive_ratio = 0.394
+score_mean_after_guard = 0.304
+kept_candidate_ratio = 0.387
+distribution_oov_probe_ratio = 0.535
+candidate_repeated_boxed_probe_ratio = 0.086
+kept_state_ratio = 0.500
+powerflow_weight_max = 7.787
+actor_powerflow_loss = 0.426
+actor_grad_norm = 17.472
+timing_s/gen = 22.569
+timing_s/chunk_state_score = 12.284
+timing_s/update_actor = 5.587
+```
+
+结论：
+
+- smoke 工程通过：8x B200、Ray/FSDP/vLLM、source metadata、source chunk injection、PowerFlow update 都正常；`chunk_state_score/mode_answer_source_consistency=1.0`，final validation 按预期跳过。
+- 该 target 显著提高了 chunk supervision 密度：raw positive 从 support-mass 的约 0.19 提到约 0.42，guard 后 positive 约 0.33，state_positive_ratio 约 0.71；说明把 state 绑定到 source final answer 能提供更强的局部信号。
+- 但不建议原样扩 20 step：`powerflow_weight_max=7.787` 三步固定偏尖，`distribution_oov_probe_ratio` 仍约 0.52，step3 candidate repeated boxed ratio 升到 0.086。按前面多次 gate 经验，这类尖权重 + OOV/重复风险很容易在 20 step 退化。
+- 下一步若继续该方向，应先做温度/权重裁剪或 listwise smoothing：例如限制 `powerflow_weight_max`，或把 source-answer consistency 与 full answer mass 混合成 soft target，而不是 hard 0/1 consistency 直接进 PowerFlow。
