@@ -2235,3 +2235,56 @@ timing_s/update_actor=7.5-8.3s steady range
 - 具体可先做两个 gate：
   1. 只训练 vote/probe 有足够信息量的 state，例如 `max_score - mean_score` 或 positive count 达阈值。
   2. target 不是单条 successful source chunk，而是同一 state 下多 candidate 的 search-improved distribution。
+
+## 2026-08-01 Voteinfo PowerFlow 3-step Smoke
+
+本轮改动目标：
+
+- 取消 `source_chunk` 注入，避免把单条 successful source chunk 当成 hard teacher。
+- 取消 `teacher_anchor`，不做 score floor。
+- `source_mode=random`，state 来自真实 on-policy full rollout。
+- 对同一 state 下 `K=8` 个 next chunk 做 `probe_samples=4`，用 probe score 形成 PowerFlow target。
+- 开启 `skip_uniform=True` 和 `skip_all_negative=True`，只训练有正负/强弱差异的 state。
+- actor update 仍然是 PowerFlow distribution matching，不切 GRPO，不切 weighted NLL。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_voteinfo_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_voteinfo_probe4_b32_r32_v64_3step_20260801.jsonl
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_voteinfo_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl_rows=96
+worker=1024321, 8x NVIDIA B200
+```
+
+三步关键信号：
+
+```text
+step1: all_negative=0.469 all_positive=0.031 mixed=0.500 kept_state_ratio=0.531 positive_ratio=0.205 powerflow_loss=0.059 grad_norm=10.337
+step2: all_negative=0.562 all_positive=0.031 mixed=0.406 kept_state_ratio=0.438 positive_ratio=0.131 powerflow_loss=0.000 grad_norm=4.623
+step3: all_negative=0.562 all_positive=0.000 mixed=0.438 kept_state_ratio=0.438 positive_ratio=0.108 powerflow_loss=0.053 grad_norm=5.293
+```
+
+三步耗时：
+
+```text
+step1: gen=51.330s chunk_state_chunks=1.593s chunk_state_probe=6.785s chunk_state_score=11.291s chunk_state_ref=6.484s update_actor=8.727s
+step2: gen=23.371s chunk_state_chunks=1.486s chunk_state_probe=6.969s chunk_state_score=10.984s chunk_state_ref=2.684s update_actor=8.477s
+step3: gen=23.389s chunk_state_chunks=1.479s chunk_state_probe=7.097s chunk_state_score=11.468s chunk_state_ref=2.694s update_actor=8.559s
+```
+
+实现观察：
+
+- smoke 跑通，无 NaN，无 shape/Ray/FSDP 崩溃。
+- 这版 target 更接近 TTRL 原文的多输出 reward/distribution 语义：每个 chunk state 的目标来自同一 state 下多个 candidate 的 probe distribution，而不是单条 source chunk。
+- 有效 state 比例约 `0.438-0.531`，说明 strict information gate 生效，但仍保留了足够训练样本。
+- `source_original_correct_ratio` 只有 `0.062-0.156`，这是随机 source state 的预期结果；这版不依赖 source rollout 正确性，而依赖同一 state 下 chunk candidates 的相对 probe 表现。
+- step2 actor 聚合指标显示 `powerflow_loss=0`、`actor/powerflow_weight/mean=0`，但 chunk batch 侧 `powerflow_weight_mean=0.438` 非零；这可能是 actor 微批指标只保留了最后一个全零微批，需要后续核查指标聚合，不应直接解读为整步完全没训练。
+- parser timeout 仍然明显，是后续 infra 必修项；但本 smoke 先验证训练语义链路。
+
+结论：
+
+- 可以启动 20-step gate。通过标准仍然是 step20 `mean@16` 接近 MV baseline；如果继续大幅低于 baseline，下一步应增强 target reliability，而不是回退到 source chunk teacher。
