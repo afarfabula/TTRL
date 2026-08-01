@@ -7708,3 +7708,72 @@ update_actor: 2.020s -> 1.319s
   - 第二阶段 probe horizon / completion policy 要和第一阶段不同，例如更长 continuation 或 fewer but deeper completion。
   - top-k 选择不能只看当前 `transport_affinity`，还应引入 full rollout answer support margin / coverage uncertainty，优先给高不确定但可学习 state 加深。
   - scorer 需要区分 base evidence 与 extra evidence，允许 top-k 的 extra evidence 更新 target，而非简单平均后让 base evidence 稀释。
+
+### staged v1 extra_override：短 probe 主导 target 的反证
+
+动机：
+
+- fixedmerge 会把 base probe 和 extra probe 混在一起，可能让第一阶段 short-horizon evidence 稀释第二阶段信号。
+- 因此新增 `chunk_state_staged_probe_merge_mode=extra_override`：被 top-k 选中的 candidate 最终只用 extra probes 作为 scorer evidence，未选中的 candidate 保持 base probes。
+- 这个 smoke 只检验“让 top-k 由 extra evidence 主导”是否能改善 target 质量。
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_extraoverride_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_extraoverride_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_extraoverride_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_extraoverride_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.jsonl
+```
+
+关键结果：
+
+```text
+base support_coverage_mean = 0.564
+base candidate_oov_tv_mean = 0.704
+base transport_gain_mean = -0.127
+base state_keep_ratio = 0.292
+
+final support_coverage_mean = 0.551
+final candidate_oov_tv_mean = 0.711
+final transport_gain_mean = -0.135
+final state_top_margin_mean = 0.013
+final state_keep_ratio = 0.167
+label_consistent_ratio = 0.766
+num_actor_samples = 16
+pruned_sample_ratio = 0.917
+powerflow_weight_mean = 1.000
+actor/powerflow_loss = 0.132
+
+chunk_state_probe = 15.793s
+chunk_state_staged_probe_extra = 13.237s
+chunk_state_score = 9.953s
+chunk_state_ref = 3.955s
+update_actor = 1.044s
+gen = 43.567s
+diag_rows = 24
+```
+
+与 fixedmerge 对比：
+
+```text
+support_coverage_mean: 0.557 -> 0.551
+candidate_oov_tv_mean: 0.704 -> 0.711
+transport_gain_mean: -0.127 -> -0.135
+state_keep_ratio: 0.208 -> 0.167
+num_actor_samples: 24 -> 16
+update_actor: 1.319s -> 1.044s
+```
+
+结论：
+
+- extra_override 没有解决 target 质量问题，反而让 support coverage、OOV、transport gain 和 state_keep_ratio 都变差。
+- 它证明 actor update 已经不是主矛盾：在 hardfilter + clip4 + actor span chunk 下，`update_actor` 已经可以压到 1.0s 左右。
+- 主矛盾仍然是 target 定义：当前 staged top-k 仍由同一套 short-horizon probe/local answer evidence 起步，后续 extra probe 只是对 noisy local signal 做再确认，不能把 chunk target 变成真正的 search-improvement target。
+- 因此后续应明确放弃这个约束：chunk 的好坏不应要求在短 horizon、局部 answer hit、source consistency 这一级被判清楚。
+
+下一步算法约束：
+
+- full rollout group 先定义 prompt-level answer support distribution、majority/pass/coverage 和 state value；chunk target 必须服务于这个 group-level support/value。
+- source chunk 只保留为 prior / drift guard，不能作为主要 teacher，也不能把 source consistency 变成硬监督。
+- candidate score 要从 raw short-probe correctness 改成相对 full group support 的 future quality improvement，例如 support mass gain、top answer margin、transport/KL improvement 或 longer-horizon pass gain。
+- 对低信息 state 直接跳过或降权：all-negative、support coverage 低、OOV 高、top mass 太平、malformed/repeated boxed 或 marker 污染。
+- PowerFlow loss 骨架可以保留，但 target 应是 per-state sharpened distribution `q_j ∝ exp(alpha * score_j) * prior_j`，其中 `score_j` 来自 full-rollout support/value improvement，而不是局部短 probe 命中。

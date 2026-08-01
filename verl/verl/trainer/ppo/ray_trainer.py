@@ -1934,8 +1934,13 @@ class RayPPOTrainer:
         selected_chunk_indices: list[int],
         base_probe_samples: int,
         extra_probe_samples: int,
+        merge_mode: str = "repeat_base",
     ) -> DataProto:
-        total_probe_samples = int(base_probe_samples) + int(extra_probe_samples)
+        if merge_mode not in {"repeat_base", "extra_override"}:
+            raise ValueError(f"Unsupported ttrl.chunk_state_staged_probe_merge_mode={merge_mode!r}")
+        total_probe_samples = int(base_probe_samples)
+        if merge_mode == "repeat_base":
+            total_probe_samples += int(extra_probe_samples)
         selected_extra_offset = {
             int(chunk_idx): idx * int(extra_probe_samples) for idx, chunk_idx in enumerate(selected_chunk_indices)
         }
@@ -1955,18 +1960,31 @@ class RayPPOTrainer:
         rows = defaultdict(list)
         for chunk_idx in range(len(chunk_output)):
             base_start = chunk_idx * int(base_probe_samples)
+            extra_start = selected_extra_offset.get(chunk_idx, None)
+            if merge_mode == "extra_override" and extra_start is not None:
+                for offset in range(int(base_probe_samples)):
+                    rows[chunk_idx].append(("extra", extra_start + (offset % int(extra_probe_samples))))
+                continue
+
             for offset in range(int(base_probe_samples)):
                 rows[chunk_idx].append(("base", base_start + offset))
-            extra_start = selected_extra_offset.get(chunk_idx, None)
-            if extra_start is None:
-                # Keep non-top-k candidates on their first-stage evidence.
-                # Empty padding would be decoded as OOV answers and would
-                # artificially destroy the full-support transport target.
-                for offset in range(int(extra_probe_samples)):
-                    rows[chunk_idx].append(("base", base_start + (offset % int(base_probe_samples))))
-            else:
-                for offset in range(int(extra_probe_samples)):
-                    rows[chunk_idx].append(("extra", extra_start + offset))
+            if merge_mode == "repeat_base":
+                if extra_start is None:
+                    # Keep non-top-k candidates on their first-stage evidence.
+                    # Empty padding would be decoded as OOV answers and would
+                    # artificially destroy the full-support transport target.
+                    for offset in range(int(extra_probe_samples)):
+                        rows[chunk_idx].append(("base", base_start + (offset % int(base_probe_samples))))
+                else:
+                    for offset in range(int(extra_probe_samples)):
+                        rows[chunk_idx].append(("extra", extra_start + offset))
+
+        for chunk_idx in range(len(chunk_output)):
+            if len(rows[chunk_idx]) != total_probe_samples:
+                raise ValueError(
+                    f"staged probe row count mismatch for chunk {chunk_idx}: "
+                    f"{len(rows[chunk_idx])} vs {total_probe_samples}"
+                )
 
         merged_batch = {}
         for key in base_probe_output.batch.keys():
@@ -4231,6 +4249,7 @@ class RayPPOTrainer:
                 staged_topk = max(0, min(int(cfg.get("chunk_state_staged_probe_topk", 0)), candidates))
                 staged_extra_samples = max(0, int(cfg.get("chunk_state_staged_probe_extra_samples", 0)))
                 if staged_topk > 0 and staged_extra_samples > 0:
+                    staged_merge_mode = str(cfg.get("chunk_state_staged_probe_merge_mode", "repeat_base"))
                     with marked_timer("chunk_state_staged_score", timing_raw, color="yellow"):
                         base_scores, base_future_support_metrics = self._score_chunk_state_future_support_gain(
                             state_prompts=state_prompts,
@@ -4251,6 +4270,12 @@ class RayPPOTrainer:
                     metrics["chunk_state_staged_probe/selected_chunks"] = float(len(selected_chunk_indices))
                     metrics["chunk_state_staged_probe/selected_ratio"] = (
                         len(selected_chunk_indices) / max(len(chunk_output), 1)
+                    )
+                    metrics["chunk_state_staged_probe/merge_mode_repeat_base"] = float(
+                        staged_merge_mode == "repeat_base"
+                    )
+                    metrics["chunk_state_staged_probe/merge_mode_extra_override"] = float(
+                        staged_merge_mode == "extra_override"
                     )
                     for key, value in base_future_support_metrics.items():
                         metrics[f"chunk_state_staged_base/{key.split('/', 1)[-1]}"] = value
@@ -4279,8 +4304,16 @@ class RayPPOTrainer:
                         selected_chunk_indices=selected_chunk_indices,
                         base_probe_samples=probe_samples,
                         extra_probe_samples=staged_extra_samples,
+                        merge_mode=staged_merge_mode,
                     )
-                    score_probe_samples = probe_samples + staged_extra_samples
+                    if staged_merge_mode == "repeat_base":
+                        score_probe_samples = probe_samples + staged_extra_samples
+                    elif staged_merge_mode == "extra_override":
+                        score_probe_samples = probe_samples
+                    else:
+                        raise ValueError(
+                            f"Unsupported ttrl.chunk_state_staged_probe_merge_mode={staged_merge_mode!r}"
+                        )
                     metrics["chunk_state_staged_probe/score_probe_samples"] = float(score_probe_samples)
                 else:
                     metrics["chunk_state_staged_probe/enabled"] = 0.0

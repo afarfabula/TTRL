@@ -60,6 +60,10 @@ ttrl:
   chunk_state_staged_probe_topk: 2
   chunk_state_staged_probe_extra_samples: 4
   chunk_state_staged_probe_extra_max_tokens: ${ttrl.chunk_state_probe_max_tokens}
+  # repeat_base keeps first-stage probes and appends extra probes for top-k.
+  # extra_override uses extra probes as the final evidence for selected top-k
+  # candidates while non-selected candidates keep first-stage probes.
+  chunk_state_staged_probe_merge_mode: repeat_base
   chunk_state_states_per_prompt: 1
   chunk_state_max_prefix_tokens: 1024
   chunk_state_boundaries: [0, 256, 512, 768, 1024]
