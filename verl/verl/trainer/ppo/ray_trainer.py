@@ -3543,7 +3543,7 @@ class RayPPOTrainer:
         ).view(len(state_prompts), 1)
         baseline = source_mass * baseline_scale
 
-        if score_type == "mass":
+        if score_type in {"mass", "soft_mass"}:
             score_matrix = anchor_mass.clamp(min=0.0, max=1.0)
         elif score_type == "gain":
             score_matrix = (anchor_mass - baseline + gain_slack).clamp(min=0.0, max=1.0)
@@ -3552,12 +3552,17 @@ class RayPPOTrainer:
                 min=0.0,
                 max=1.0,
             )
+        elif score_type == "soft_relative_mass":
+            score_matrix = (anchor_mass / source_mass.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_support_flow_score_type={score_type!r}")
 
         label_consistent = (score_matrix > 0.0).float()
         positive_margin = (anchor_mass - baseline).max(dim=-1).values
-        keep_state = positive_margin >= min_positive_margin
+        if score_type in {"soft_mass", "soft_relative_mass"}:
+            keep_state = anchor_mass.max(dim=-1).values > 0.0
+        else:
+            keep_state = positive_margin >= min_positive_margin
         score_matrix = score_matrix * keep_state.view(-1, 1).to(dtype=score_matrix.dtype)
         label_consistent = label_consistent * keep_state.view(-1, 1).to(dtype=label_consistent.dtype)
 
@@ -3595,8 +3600,10 @@ class RayPPOTrainer:
         state_max = score_matrix.max(dim=-1).values
         metrics = {
             "chunk_state_support_flow/score_type_mass": float(score_type == "mass"),
+            "chunk_state_support_flow/score_type_soft_mass": float(score_type == "soft_mass"),
             "chunk_state_support_flow/score_type_gain": float(score_type == "gain"),
             "chunk_state_support_flow/score_type_relative_gain": float(score_type == "relative_gain"),
+            "chunk_state_support_flow/score_type_soft_relative_mass": float(score_type == "soft_relative_mass"),
             "chunk_state_support_flow/gain_slack": gain_slack,
             "chunk_state_support_flow/baseline_scale": baseline_scale,
             "chunk_state_support_flow/source_prior_weight": source_prior_weight,

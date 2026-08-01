@@ -6622,3 +6622,102 @@ step 2:
 - infra 正结果：chunk actor span 约 117-119 tokens，`update_actor` 只有 2.2-2.4s；这再次说明短 chunk actor update 不是当前主瓶颈。
 - 方法负结果：`gain = anchor_mass - source_mass + slack` 太保守。source answer mass 约 0.45-0.47，但 injected anchor 的平均 support mass 只有 0.14-0.15，导致 raw positive ratio 只有 0.7%-0.8%，target 过稀，不能扩展成长训。
 - 下一步不回到 short probe。应该把 `support_flow` 从 hard gain 改成 full-support soft target，例如直接用 support mass / relative value distribution 形成 `q_j ∝ exp(alpha * support_mass_j) * prior_j`，并继续跳过 all-negative、low coverage、flat support 的低信息 state。source chunk 只保留为 prior，不再作为主要 teacher 或 hard floor。
+
+## 2026-08-01 support_flow soft_mass smoke
+
+目的：
+
+- 按用户修正后的原则，放弃“局部短视可判定性”：不要求 chunk 在 short-horizon probe / source consistency 层面被判清楚。
+- 在 TTRL 内新增 `support_flow_score_type=soft_mass`，直接用 full rollout group 的 answer support mass 形成 PowerFlow soft target。
+- 保留 source / anchor 作为候选 prior 和 drift guard，但不再用 `anchor_mass - source_mass` 这种 hard gain floor 定义主要 teacher。
+
+代码改动：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  support_flow score_type 新增 soft_mass / soft_relative_mass
+  soft_mass: score = anchor_mass
+  soft_relative_mass: score = clamp(anchor_mass / source_mass, 0, 1)
+  soft mode 的 keep_state 只要求该 state 有非零 support anchor，不再要求 positive_margin >= threshold
+
+verl/trainer/config/ppo_trainer_ttrl.yaml:
+  记录 support_flow 的 hard gain 与 soft_mass 语义差异
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_2step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_2step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_2step_20260801.jsonl
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+ttrl.n_votes_per_prompt = 64
+actor_rollout_ref.rollout.n = 32
+trainer.total_training_steps = 2
+trainer.final_val_enable = False
+ttrl.chunk_state_score_mode = support_flow
+ttrl.chunk_state_support_flow_score_type = soft_mass
+ttrl.chunk_state_chunk_size = 128
+ttrl.chunk_state_candidates = 8
+ttrl.chunk_state_support_anchor_count = 4
+ttrl.chunk_state_label_consistent_only = True
+ttrl.chunk_state_zero_inconsistent_candidates = True
+ttrl.chunk_state_prune_zero_weight_samples = True
+ttrl.chunk_state_powerflow_weight_clip = 4.0
+actor_rollout_ref.actor.powerflow_enable = True
+actor_rollout_ref.actor.use_kl_loss = False
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+结果：
+
+```text
+step 1:
+  prompt_original_mean = 0.354
+  prompt_original_pass = 0.906
+  source_answer_mass_mean = 0.472
+  support_flow_anchor_mass_mean = 0.144
+  support_flow_score_mean = 0.144
+  support_flow_score_max_mean = 0.368
+  support_flow_raw_positive_ratio = 0.144
+  label_consistent_ratio = 0.492
+  answer_coverage_mean = 0.492
+  state_all_negative_ratio = 0.000
+  state_mixed_ratio = 1.000
+  num_actor_samples = 120
+  target_entropy = 1.192
+  gen = 39.784s
+  chunk_state_chunks = 1.085s
+  chunk_state_score = 4.523s
+  chunk_state_ref = 5.639s
+  update_actor = 4.558s
+
+step 2:
+  prompt_original_mean = 0.306
+  prompt_original_pass = 0.875
+  source_answer_mass_mean = 0.435
+  support_flow_anchor_mass_mean = 0.123
+  support_flow_score_mean = 0.123
+  support_flow_score_max_mean = 0.344
+  support_flow_raw_positive_ratio = 0.123
+  label_consistent_ratio = 0.492
+  answer_coverage_mean = 0.492
+  state_all_negative_ratio = 0.000
+  state_mixed_ratio = 1.000
+  num_actor_samples = 120
+  target_entropy = 1.171
+  gen = 11.100s
+  chunk_state_chunks = 0.931s
+  chunk_state_score = 4.652s
+  chunk_state_ref = 1.675s
+  update_actor = 4.171s
+```
+
+结论：
+
+- target-quality 正结果：相比 hard gain smoke 的 `raw_positive_ratio=0.007/0.008`、`num_actor_samples=56/64`，soft_mass 提升到 `raw_positive_ratio=0.144/0.123`、`num_actor_samples=120/120`，并且没有 all-negative state。
+- 语义上更贴合当前方法目标：teacher 由 full rollout support mass 定义，不依赖 short-horizon probe 的局部 answer hit，也不把 source answer mass 当 hard floor。
+- infra 可接受：第二步 `gen=11.1s`、`chunk_state_score=4.65s`、`update_actor=4.17s`。相比 hard gain 的 update_actor 约 2.2s 更慢一些，是因为保留了更多 actor samples，但仍远低于 full-trajectory actor update。
+- 下一步应该跑 20-step pilot 看 acc 轨迹，同时加低信息 state gate 的轻量 ablation：`min_answer_coverage` / `min_prompt_top_mass` / `min_source_answer_mass`，但不要回到 short-probe teacher。

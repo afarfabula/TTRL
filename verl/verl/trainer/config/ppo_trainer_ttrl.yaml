@@ -180,8 +180,10 @@ ttrl:
   chunk_state_support_anchor_candidate_start: 0
   chunk_state_support_anchor_min_mass: 0.03125
   # support_flow uses the same full-rollout anchor candidates but scores them
-  # as distribution improvement over the selected source answer mass. This
-  # keeps short-horizon probe hits out of the teacher definition.
+  # with prompt-level full-rollout answer support. "gain" keeps the earlier
+  # hard improvement smoke; "soft_mass" is the preferred non-short-probe
+  # target because it forms a soft support distribution instead of requiring
+  # local improvement to be decidable at the chunk boundary.
   chunk_state_support_flow_score_type: gain
   chunk_state_support_flow_gain_slack: 0.0
   chunk_state_support_flow_baseline_scale: 1.0
