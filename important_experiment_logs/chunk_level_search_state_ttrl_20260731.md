@@ -2812,3 +2812,121 @@ step3: kept_state=0.438 label_consistent=0.512 loss_weight=0.438 target_entropy=
 
 - 跑同配置 20-step final validation，若 `mean@16` 明显高于 hard gate `0.5325` 或接近 raw MV 20-step 基线，再考虑 80-step。
 - 如果 20-step 仍差，下一轮不再调权重，而改 state construction：减少 prompt-only/early state，优先从 high-pass full rollout 中截取中后段 state，提升 pseudo-label 与最终正确性的相关性。
+
+## 2026-08-01 Label-consistent Majority-completion c128 20-step Final Validation
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_label_consistent_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+train_batch_size=32
+rollout.n=32
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_probe_max_tokens=1024
+chunk_state_min_majority_ratio=0.25
+chunk_state_min_answer_coverage=0.60
+chunk_state_confidence_power=0.0
+chunk_state_label_consistent_only=True
+chunk_state_skip_all_negative=True
+chunk_state_skip_uniform=True
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.use_dynamic_bsz=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_label_consistent_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_label_consistent_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+worker=1024321, 8x NVIDIA B200
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16=0.517500
+val-core/math/acc/maj@16/mean=0.658620
+val-core/math/acc/best@16/mean=0.872798
+val-aux/math/format_score/mean@16=0.911875
+val-aux/math/format_score/maj@16/mean=0.896806
+timing_s/testing=298.511
+```
+
+20-step 训练平均：
+
+```text
+timing_s/gen=25.199
+timing_s/chunk_state_probe=6.908
+timing_s/chunk_state_score=11.647
+timing_s/chunk_state_ref=2.568
+timing_s/update_actor=7.519
+chunk_state/kept_state_ratio=0.488
+chunk_state/label_consistent_ratio=0.552
+actor/powerflow_loss=0.323
+actor/grad_norm=11.706
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.250
+chunk_state_source/prompt_original_pass=0.938
+chunk_state_source/prompt_original_mean=0.419
+chunk_state_majority_completion/majority_ratio_mean=0.358
+chunk_state_majority_completion/answer_coverage_mean=0.706
+chunk_state_majority_completion/raw_positive_ratio=0.359
+chunk_state_majority_completion/label_consistent_ratio=0.613
+chunk_state_diag/state_all_positive_ratio=0.375
+chunk_state_diag/state_all_negative_ratio=0.062
+chunk_state_diag/state_mixed_ratio=0.562
+chunk_state/kept_state_ratio=0.531
+chunk_state/target_entropy=1.448
+actor/powerflow_loss=0.029
+actor/boxed_reward/mean=0.172
+actor/grad_norm=4.687
+timing_s/gen=21.564
+timing_s/chunk_state_probe=6.831
+timing_s/chunk_state_score=10.773
+timing_s/update_actor=7.374
+```
+
+与前几轮 20-step 对比：
+
+```text
+raw majority-completion c256:
+  mean@16=0.521125 maj@16=0.662318 best@16=0.872676 format_mean@16=0.904125
+
+confidence-gated c128:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+soft-confidence c128:
+  mean@16=0.370000 maj@16=0.475650 best@16=0.810974 format_mean@16=0.871500
+
+label-consistent c128:
+  mean@16=0.517500 maj@16=0.658620 best@16=0.872798 format_mean@16=0.911875
+```
+
+结论：
+
+- label-consistent 版本完整跑完，但没有超过 hard confidence gate，也略低于 raw majority-completion。
+- 这说明仅仅把候选过滤成“与 state-level majority label 一致”还不够；当前 chunk state 的 pseudo-label 与最终正确性相关性仍弱。
+- `label_consistent_ratio` 平均 `0.552`，`kept_state_ratio` 平均 `0.488`，过滤强度是合理的；失败不是因为所有信号都被过滤掉，而是被保留的 target 仍然不够好。
+- actor update 仍稳定在 `~7.5s`，chunk actor update 的 infra 方向继续成立；端到端主要成本在 rollout generation 和 `chunk_state_score` 的 parser/scoring。
+- step19 的 `chunk_state_score=29.816s` 是 SymPy comparison timeout 拉高的典型例子；parser/scoring 是后续 infra 优化点。
+- final validation 里出现大量重复 `boxed{}` 的超长输出，说明训练已经明显产生格式退化风险；虽然 format mean 仍有 `0.911875`，但长文本重复会拖慢 validation 和日志写入。
+
+arXiv 2504.16084 对下一步的约束：
+
+- 论文里的 TTRL 把 prompt `x` 视为 state，同一 state 下采多个 outputs `{y_i}`，用 majority/aggregation 得到 consensus `y*`，再用 `r(y, y*)` 作为 reward。
+- 论文还强调 multiple outputs within a rollout 能提高 reward 对 pseudo-label 错误的鲁棒性。
+- 我们的 chunk-state 版本要保持这个语义：把 state 从 prompt 扩展成 `query + partial reasoning`，但同一个 state 下必须先做稳定 label estimation，再训练 state-conditional next-chunk improver。
+- 当前失败说明“随机 full rollout 截 prefix + 局部 completion majority”还没有形成足够可靠的 state label；下一轮应改 state construction，而不是继续调权重。
+
+下一步：
+
+- 不扩 label-consistent c128 到 80-step。
+- 做 mid-state / high-pass state construction：先采 `32` 条完整 rollout，优先从 prompt-level pass 或高 majority-ratio 的轨迹中截取中后段 state，减少 prompt-only/early/noisy state。
+- 对每个 state 仍按 2504.16084 语义采多 completion 做 label estimation，但 PowerFlow target 只蒸馏更稳定的 search-improved next-chunk distribution。
+- 保持 `actor.use_dynamic_bsz=False` 和 PowerFlow loss 主路径不变，先跑 3-step smoke，再跑 20-step gate；如果 20-step 不能明显超过 hard gate `mean@16=0.5325`，需要引入更强 verifier/probe，而不是再调 chunk 权重。
