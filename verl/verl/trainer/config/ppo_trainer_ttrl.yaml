@@ -173,16 +173,17 @@ ttrl:
   chunk_state_future_support_max_mass_coef: 0.25
   # Supported: slack_gain, positive_gain, relative_positive_gain,
   # tv_positive_gain, relative_tv_positive_gain, transport_affinity,
-  # transport_positive_gain, transport_support_gain. The transport variants
-  # compare candidate future answer distributions to the full-rollout support
-  # distribution with OOV answers counted as off-support mass, so they are not
-  # local correctness teachers. transport_support_gain additionally requires
-  # positive transport improvement over the source baseline and weights it by
-  # absolute support affinity.
+  # transport_positive_gain, transport_support_gain, plus smoothed_transport_*
+  # variants. The transport variants compare candidate future answer
+  # distributions to the full-rollout support distribution with OOV answers
+  # counted as off-support mass, so they are not local correctness teachers.
+  # smoothed_transport_* additionally uses the full-rollout support as a
+  # posterior prior so short probe noise cannot solely define the target.
   chunk_state_future_support_score_type: slack_gain
   chunk_state_future_support_gain_slack: 0.125
   chunk_state_future_support_baseline_scale: 1.0
   chunk_state_future_support_source_prior_weight: 2.0
+  chunk_state_future_support_prior_smoothing: 0.0
   chunk_state_future_support_min_positive_margin: 0.0
   # Optional state-level learnability gates for future_support_gain. Defaults
   # are neutral. These filter states whose chunk probes do not land inside the

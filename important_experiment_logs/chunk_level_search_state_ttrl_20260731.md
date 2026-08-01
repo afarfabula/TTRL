@@ -7866,3 +7866,108 @@ diag_rows = 24
 - 不再继续放松 token-prefix anchor。更合理的最小下一步是同一 source path 的 longer-horizon value estimation：保留当前 state 的 sampled chunk，但 probe 不再用短局部 answer hit 主导，而是更长 horizon / multi-stage rollout 后计算相对 full-support distribution 的 transport/value gain。
 - 如果继续做 support proposal，需要先构造真正的 shared-prefix search tree 或语义相似检索，而不是从独立 full rollouts 按相同 token boundary 直接截 continuation。
 - 因此当前最稳的后续实验是：`source-path staged long probe`，即对同一 state 的 candidate 先做 chunk，再 rollout 到更接近完整答案的 horizon，用 full-rollout group support/value 计算 `q_j ∝ exp(alpha * future_support_gain_j) * prior_j`。
+
+## 2026-08-01 smoothed full-support transport smoke
+
+背景：
+
+- 用户明确纠偏：不要再要求 chunk target 主要由 short-horizon probe 的局部命中 / source consistency 来定义。
+- 本轮实现一个更接近 full-rollout group support/value 的 score 变体：probe 只作为 candidate future distribution 的观测证据，full-rollout answer support 作为 posterior prior 平滑 candidate distribution，再计算 transport affinity / gain。
+- 这不是让 source chunk 或短 probe hit 当 teacher。source chunk 只保留为 candidate slot 0 的弱 prior / drift guard，score 仍来自 prompt-level full-rollout support distribution。
+
+实现：
+
+- 新增配置 `chunk_state_future_support_prior_smoothing`，默认 0，保持旧实验兼容。
+- 在 `future_support_gain` 中新增：
+  - `smoothed_transport_affinity`
+  - `smoothed_transport_positive_gain`
+  - `smoothed_transport_support_gain`
+- smoothed score 对每个 candidate 的 probe answer counts 加入 full-support prior：
+
+```text
+posterior(answer) = (count(answer) + smoothing * support_dist(answer)) / (probe_samples + smoothing)
+```
+
+然后用 posterior distribution 与 full support distribution 的 OOV-aware TV / transport gain 构造 PowerFlow target。
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_smoothed_transport_support_gain_masssrc_stategate_c128_probe8_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_smoothed_transport_support_gain_masssrc_stategate_c128_probe8_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_smoothed_transport_support_gain_masssrc_stategate_c128_probe8_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_smoothed_transport_support_gain_masssrc_stategate_c128_probe8_b32_r32_v64_1step_20260801.jsonl
+```
+
+配置：
+
+```text
+score_type = smoothed_transport_support_gain
+prior_smoothing = 16.0
+probe_samples = 8
+probe_max_tokens = 3072
+staged_probe_enable = false
+candidates = 8
+chunk_size = 128
+source_mode = majority_consistent
+source_chunk_enable = true
+source_prior_weight = 1.05
+min_state_coverage = 0.50
+max_state_oov = 0.50
+min_state_top_margin = 0.02
+min_candidate_coverage = 0.25
+min_candidate_mean_mass = 0.02
+```
+
+关键结果：
+
+```text
+support_coverage_mean = 0.562
+candidate_oov_tv_mean = 0.696
+transport_gain_mean = -0.119
+
+smoothed_candidate_oov_tv_mean = 0.232
+smoothed_transport_affinity_mean = 0.768
+smoothed_transport_gain_mean = 0.345
+
+score_mean = 0.240
+label_consistent_ratio = 0.766
+state_keep_ratio = 0.167
+num_actor_samples = 16
+target_entropy = 2.043
+actor/powerflow_loss = 0.237
+
+timing_s/gen = 43.509
+timing_s/chunk_state_probe = 19.844
+timing_s/chunk_state_score = 12.391
+timing_s/update_actor = 1.106
+diag_rows = 24
+```
+
+环境确认：
+
+```text
+worker = trial-302172199-trialrun-302172199-worker-0
+GPU = 8x NVIDIA B200
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+venv = /mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200
+vLLM attention_config.backend = FLASH_ATTN
+NCCL = 2.28.9+cuda13.0, NVLS enabled, isAllDirectP2p 1
+```
+
+结论：
+
+- 这轮不是算法通过。raw target 质量没有本质改善：`support_coverage_mean=0.562`、`candidate_oov_tv_mean=0.696` 仍接近之前 masssrc baseline。
+- smoothed 后的 `candidate_oov_tv` 从 0.696 降到 0.232，`smoothed_transport_gain` 变成 0.345，说明 full-support posterior prior 可以把 target 表面拉向 full support，但这主要来自 smoothing，不代表 sampled chunk 的真实 future support coverage 已经改善。
+- `state_keep_ratio=0.167`、`num_actor_samples=16` 仍偏低，和 extra_override 类似，不能升级 20-step。
+- `update_actor=1.106s` 再次确认训练更新不是主矛盾。更大的成本在 probe / score：`chunk_state_probe=19.844s`、`chunk_state_score=12.391s`。如果 target 质量不提升，继续扩大 probe 是低性价比。
+
+下一步：
+
+- 保留 smoothed support posterior 作为一个可用的 target construction building block，但不能把它当作通过 gate 的方案。
+- 下一轮应改 state/candidate 生成本身，而不是继续在同样 noisy candidate set 上加平滑：
+  - 优先选 high-support / high-pass full rollout 中更晚的 state，减少低信息 mid-state。
+  - 对同一 source path 做 multi-boundary 或 suffix-aware candidate，不再让独立 short probe 决定 teacher。
+  - 引入 state-level skip：all-negative、高 OOV、low coverage、top margin 太平的 state 直接不训。
+  - 如果继续用 smoothing，应把 smoothing 强度作为 prior，不允许它掩盖 raw coverage/OOV 的失败。
