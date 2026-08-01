@@ -6111,3 +6111,105 @@ step3:
 - `state_top_margin_mean` 在 step1/3 接近 0，说明即使 coverage/mass 看起来不差，candidate 间 target 仍然很平，PowerFlow 分布没有稳定的 search-improved direction。
 - step1/3 暴露出一个工程 bug：非零权重样本少于 8 卡时，旧 prune 逻辑不会裁剪，导致 256 个几乎全零样本进入 ref/update，`update_actor` 到 5-7s。已修复为非零样本不足 8 时重复 top nonzero 补齐到 8 个样本，并记录 `chunk_state/prune_padded_to_shards`。
 - 下一步不应继续用硬阈值筛 state。更有希望的方向是把 score 从 `mean_mass + max_mass_coef * max_mass - source_mass` 改成更直接的 transport / distribution distance improvement，例如 candidate probe answer distribution 到 prompt full-support distribution 的 KL/TV/Wasserstein-like improvement；或者把 probe horizon 加长，让 top margin 不再接近 0。
+
+## 2026-08-01 Future-Support TV-Improvement 3-Step Smoke
+
+目的：
+
+- 验证一个更接近 search-improved distribution distillation 的 score：不再直接用 raw local answer hit，而是比较 candidate probe answer empirical distribution 和 prompt full-rollout answer support distribution 的 TV distance。
+- source chunk 只作为 source answer one-hot baseline 和 target prior，不作为 score floor。
+- 这轮仍然是 3-step smoke，不做 validation；目的是判定 TV transport score 是否解决“短 probe 局部命中噪声”问题。
+
+代码改动：
+
+```text
+ttrl.chunk_state_future_support_score_type 新增：
+  tv_positive_gain
+  relative_tv_positive_gain
+
+对每个 state：
+  support_dist = prompt full-rollout answer support distribution
+  source_tv = TV(one_hot(source_answer), support_dist) = 1 - support_dist[source_answer]
+
+对每个 candidate：
+  probe_dist = candidate 后续 probe_samples 条 completion 的 empirical answer distribution
+  candidate_tv = TV(probe_dist, support_dist)
+  tv_gain = source_tv - candidate_tv
+  score = clamp(tv_gain, 0, 1)
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_tv_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_future_support_tv_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_future_support_score_type=tv_positive_gain
+ttrl.chunk_state_future_support_min_positive_margin=0.001
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_tv_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_tv_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 关键指标：
+
+```text
+step1:
+  support_coverage_mean = 0.470
+  state_oov_mean = 0.530
+  source_tv_mean = 0.595
+  candidate_tv_mean = 0.686
+  tv_gain_mean = -0.090
+  score_mean = 0.020
+  score_after_guard = 0.002
+  label_consistent_ratio = 0.133
+  num_actor_samples = 8
+  update_actor = 0.653s
+  gen = 51.358s
+
+step2:
+  support_coverage_mean = 0.566
+  state_oov_mean = 0.434
+  source_tv_mean = 0.614
+  candidate_tv_mean = 0.646
+  tv_gain_mean = -0.032
+  score_mean = 0.030
+  score_after_guard = 0.010
+  label_consistent_ratio = 0.191
+  num_actor_samples = 16
+  update_actor = 0.603s
+  gen = 23.006s
+
+step3:
+  support_coverage_mean = 0.481
+  state_oov_mean = 0.519
+  source_tv_mean = 0.613
+  candidate_tv_mean = 0.721
+  tv_gain_mean = -0.107
+  score_mean = 0.035
+  score_after_guard = 0.011
+  label_consistent_ratio = 0.164
+  num_actor_samples = 8
+  update_actor = 0.432s
+  gen = 22.379s
+```
+
+结论：
+
+- 这是一个负结果，不应扩 20 step。TV scoring 路径工程上跑通了，`NameError: answer_values` 已修复，3 step 均完成并打印指标；退出阶段的 `DataLoader worker killed` 出现在 torch dynamo atexit compile-times dump，主训练已完成并跳过 final validation。
+- 核心失败点很清楚：即使 score 改成 TV transport gain，candidate 的短 probe empirical distribution 平均仍然比 source one-hot 更远离 full-rollout support distribution。3 个 step 的 `tv_gain_mean` 都是负数：-0.090、-0.032、-0.107。
+- guard 之后训练信号仍然非常稀疏：`score_after_guard` 只有 0.002/0.010/0.011，`num_actor_samples` 只有 8/16/8。update_actor 很快不是正向证据，主要是有效 actor samples 被裁得太少。
+- 这进一步支持当前方法学判断：最该放弃的不是 PowerFlow backbone、hardfilter+clip4、或 group-level label estimation，而是“局部短视可判定性”这个训练约束。只要 candidate target 仍主要由短 horizon probe 的 empirical answer distribution 决定，它就仍然是在学习 noisy local-answer reward，而不是 search-improvement reward。
+
+下一步原则：
+
+- full rollout group 先定义 prompt-level answer support / majority / pass / coverage / trajectory value。
+- chunk/state target 不再要求在短 probe 局部 answer hit 里判清楚；probe 只作为 proposal 或弱 evidence，不能单独主导 teacher。
+- state 选择继续偏中后段、偏高质量 rollout，但 source chunk 只保留为 prior / drift guard。
+- 需要设计更长 horizon 或分阶段 future evaluation：让 score 真正回答“这个 local transition 会不会把后续 completion distribution 推向 full group 认为好的答案分布”，而不是“短 probe 是否碰巧抽中 boxed answer”。

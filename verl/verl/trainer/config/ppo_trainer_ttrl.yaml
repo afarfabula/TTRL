@@ -146,6 +146,8 @@ ttrl:
   # answer mass. The source chunk can enter as a prior, not a hard score floor.
   chunk_state_future_support_min_mass: 0.03125
   chunk_state_future_support_max_mass_coef: 0.25
+  # Supported: slack_gain, positive_gain, relative_positive_gain,
+  # tv_positive_gain, relative_tv_positive_gain.
   chunk_state_future_support_score_type: slack_gain
   chunk_state_future_support_gain_slack: 0.125
   chunk_state_future_support_baseline_scale: 1.0
