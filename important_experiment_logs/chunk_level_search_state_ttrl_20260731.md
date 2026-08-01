@@ -5463,3 +5463,88 @@ timing_s/update_actor = 5.960
   - 降低 `gain_slack` 或改成 per-state top-k smoothing，避免负 gain 也被过多保留。
   - 尝试更长 probe horizon 或少量增加 probe samples，目标是把 OOV 降到 0.40 以下。
   - 保留 source prior，但进一步限制 `powerflow_weight_max`，避免尖权重重复早期退化。
+
+## 2026-08-01 Future-Support-Gain Strict 3-Step Smoke
+
+目的：
+
+- 回应当前最重要的方向纠偏：chunk target 不能继续由 short-probe local correctness 主导，而要由 full rollout group support/value estimation 主导。
+- 本轮不新增方法名，只做 strict ablation：提高 coverage/informative gate，降低 gain slack，降低 source prior，验证能否减少 OOV 和尖权重，同时保留非零训练信号。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_strict_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_score_mode=future_support_gain
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_future_support_gain_slack=0.05
+ttrl.chunk_state_future_support_source_prior_weight=1.25
+ttrl.chunk_state_min_answer_coverage=0.50
+ttrl.chunk_state_min_informative_gap=0.02
+ttrl.chunk_state_skip_uniform=True
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_label_consistent_only=True
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_candidate_enable=True
+```
+
+产物：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_strict_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_gain_strict_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_strict_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 平均：
+
+```text
+support_coverage_mean = 0.485
+distribution_oov_probe_ratio = 0.515
+candidate_repeated_boxed_probe_ratio = 0.0067
+kept_state_ratio = 0.417
+zeroed_state_ratio = 0.583
+powerflow_weight_max = 4.018
+actor_powerflow_loss = 0.316
+probe_mean_source_original_correct = 0.0497
+probe_mean_source_original_wrong = 0.0110
+raw_gain_mean = -0.145
+score_mean = 0.045
+improved_state_ratio = 0.563
+state_all_negative_ratio = 0.364
+state_mixed_ratio = 0.541
+answer_coverage_mean = 0.485
+label_consistent_ratio = 0.378
+informative_ratio = 0.615
+chunk_actor_response_len_mean = 124.125
+```
+
+Timing：
+
+```text
+timing_s/gen = 35.273
+timing_s/chunk_state_probe = 6.702
+timing_s/chunk_state_score = 11.169
+timing_s/chunk_state_ref = 3.136
+timing_s/update_actor = 5.779
+```
+
+结论：
+
+- strict smoke 工程通过：3 step 完整结束，diag 96 行，PowerFlow chunk actor update 正常；final validation 按 smoke 配置跳过。
+- 相比 baseline future-support-gain，strict gate 确实降低了尖权重：`powerflow_weight_max` 从约 `5.315` 降到约 `4.018`，`kept_state_ratio` 从约 `0.531` 降到约 `0.417`；candidate repeated boxed 仍很低，约 `0.0067`。
+- 但这还没有达到可以扩 20 step 的质量门槛：`distribution_oov_probe_ratio` 仍约 `0.515`，`support_coverage_mean` 仍只有 `0.485`，`raw_gain_mean=-0.145`。也就是说，严格门控只是在减少坏样本和尖权重，还没有真正让大多数 candidate 的 future completion 靠近 full group support。
+- 一个关键问题是当前 coverage gate 没有把 step-level `support_coverage_mean` 推到 0.50 以上，说明保留逻辑仍会留下低覆盖 state 或依赖 source prior/guard。下一步要在 state selection 层硬跳过低覆盖/OOV-heavy state，而不是只在 target guard 层做 candidate zeroing。
+- 方向判断：future-support-gain 是当前最接近用户要求的版本，因为它已经把 full rollout support 作为 label estimation，把 source chunk 作为 prior 而非 hard floor；但下一轮必须改成更强的 high-support state/candidate selection，不能继续用 slack 保存大量负 gain。
+
+下一步建议：
+
+- 实现 per-state hard skip：如果 support coverage 低、top mass 太平、all-negative 或 OOV-heavy，整条 state 不进 actor batch。
+- candidate score 从 `mean/max support mass - source_mass + slack` 改为更明确的 future support margin，例如 top-supported answer mass gain 或 KL/transport improvement，减少负 gain 被 slack 变成正 target。
+- source prior 继续保留，但只做弱 prior；必要时加 `powerflow_weight_clip`，把 smoke 的 `powerflow_weight_max` 稳定压到 3-4 以下。
+- 下一次 gate 仍先跑 3 step，只看四个量：target nonzero ratio、OOV ratio、repeated boxed ratio、source-correct vs wrong future score；这些过线后再跑 20 step。
