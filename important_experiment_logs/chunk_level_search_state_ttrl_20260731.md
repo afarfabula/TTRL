@@ -5062,3 +5062,93 @@ validation_tail_assistant_marker_count = 375
 - 重新设计 chunk transition target：先完整 rollout 32 条形成 group answer distribution，再从正确/多数一致轨迹上截 state；对 next-chunk continuation 做后续 rollout/probe 时，只计算它把后续 completion 引向 full-group support/mass 的概率提升。
 - 优先改成 PowerFlow-style distribution matching：target 权重来自 `future completion answer mass under original group support`，并加入 length-normalized chunk likelihood / answer-support transport，而不是 raw short-probe answer score。
 - Anti-repeat guard 保留为安全 guard，但不能作为主要创新或主要监督。
+
+
+## 2026-08-01 Answer-Support MassAvg 3-Step Smoke
+
+目的：
+
+- 修正上一轮 `raw support + candidate anti-repeat` 的核心问题：target 不再由短 probe 的 hard margin 或 max prompt mass 过强决定，而是用完整 32 条 rollout 得到的 answer support distribution，对每个 chunk candidate 的后续 probe completion 计算平均 support mass。
+- 这更贴近 `2504.16084` 的 TTRL 语义：full rollout group 先形成 answer distribution / pseudo-label prior，chunk state 只学习把未来 completion 推向该 distribution 的局部 transition。
+- 继续优先 PowerFlow loss；guard 只做 malformed / repeated boxed / prompt copy / OOV 清洗，不再用 `target_guard_use_distribution_score=True` 覆盖 scorer。
+
+代码改动：
+
+```text
+新增 ttrl.chunk_state_score_mode=answer_support_mass
+新增 ttrl.chunk_state_answer_support_score={mass,gain,relative_gain}
+新增 ttrl.chunk_state_answer_support_min_mass
+默认关闭，不影响旧实验。
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support_massavg_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_score_mode=answer_support_mass
+ttrl.chunk_state_answer_support_score=mass
+ttrl.chunk_state_answer_support_min_mass=0.03125
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_use_distribution_score=False
+ttrl.chunk_state_target_guard_candidate_enable=True
+```
+
+产物：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_massavg_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_massavg_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_massavg_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 平均：
+
+```text
+source_mass_mean = 0.393
+probe_support_coverage_mean = 0.509
+mass_mean = 0.192
+max_mass_mean = 0.258
+score_mean = 0.192
+label_consistent_ratio = 0.667
+improved_state_ratio = 0.854
+kept_candidate_ratio = 0.462
+distribution_oov_probe_ratio = 0.491
+repeated_boxed_probe_ratio = 0.064
+candidate_repeated_boxed_probe_ratio = 0.008
+actor_batch_powerflow_weight_nonzero_ratio = 0.406
+powerflow_weight_max = 2.637
+target_entropy = 1.882
+actor_grad_norm = 8.148
+```
+
+Step 3：
+
+```text
+probe_support_coverage_mean = 0.547
+score_mean = 0.206
+kept_candidate_ratio = 0.508
+distribution_oov_probe_ratio = 0.453
+powerflow_weight_max = 2.218
+actor_grad_norm = 7.897
+timing_s/update_actor = 4.935s
+```
+
+Timing：
+
+```text
+step_total_est = [81.809s, 47.857s, 46.453s]
+step2_3_steady_total_est = 47.155s
+step2_3_update_actor ≈ 5s
+```
+
+结论：
+
+- smoke 健康，可以作为下一轮 20-step gate 候选。
+- 相比失败的 `support_antirepeat_src20`，这版 target 明显更温和：`powerflow_weight_max` 约 2.2-3.5，而失败 gate step19/20 常见 7.x；这降低了少数短 probe 命中被过度蒸馏的风险。
+- OOV 仍偏高，约 49%，但不再通过 max mass 把单个 probe 命中放大成主监督；这更像 distribution matching。
+- 下一步建议先跑 20-step gate，final val 目标至少恢复到 MV 20-step 附近；如果仍低，再试 `chunk_state_answer_support_score=relative_gain` 或提高 `probe_samples`，但不要回到 max-mass target。

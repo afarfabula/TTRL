@@ -114,6 +114,11 @@ ttrl:
   # distribution score. This keeps target construction tied to full-rollout
   # answer support and rewards local transitions that improve answer mass.
   chunk_state_target_guard_use_mass_gain: false
+  # Score chunk candidates by the average mass of their future probe answers
+  # under the original full-rollout answer support. This is a chunk-level
+  # search-state improvement target, not a short-probe majority teacher.
+  chunk_state_answer_support_score: mass
+  chunk_state_answer_support_min_mass: 0.0
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.

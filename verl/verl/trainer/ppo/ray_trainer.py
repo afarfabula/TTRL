@@ -2183,6 +2183,129 @@ class RayPPOTrainer:
         }
         return scores, metrics
 
+    def _score_chunk_state_answer_support_mass(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        probe_output: DataProto,
+        candidates: int,
+        probe_samples: int,
+    ) -> tuple[torch.Tensor, dict]:
+        from verl.utils.reward_score.ttrl_math import extract_answer, simplify_expression_string
+
+        if len(probe_output) != len(chunk_output) * probe_samples:
+            raise ValueError(
+                f"Expected {len(chunk_output) * probe_samples} probe outputs, got {len(probe_output)}"
+            )
+        if "chunk_state_prompt_answer_mass" not in state_prompts.non_tensor_batch:
+            raise ValueError("chunk_state_score_mode='answer_support_mass' requires full-rollout answer metadata")
+
+        cfg = self.config.ttrl
+        score_type = str(cfg.get("chunk_state_answer_support_score", "mass"))
+        min_mass = float(cfg.get("chunk_state_answer_support_min_mass", 0.0))
+        prompt_mass_values = [
+            json.loads(str(value)) if str(value) else {}
+            for value in state_prompts.non_tensor_batch["chunk_state_prompt_answer_mass"]
+        ]
+        source_answer_mass = torch.as_tensor(
+            np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_answer_mass",
+                    np.zeros(len(state_prompts), dtype=np.float32),
+                ),
+                dtype=np.float32,
+            ),
+            dtype=torch.float32,
+        )
+
+        chunk_mask = chunk_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool()
+        mass_values = []
+        valid_values = []
+        for probe_idx in range(len(probe_output)):
+            chunk_idx = probe_idx // probe_samples
+            state_idx = chunk_idx // candidates
+            chunk_len = int(chunk_mask[chunk_idx].sum().item())
+            probe_len = int(probe_mask[probe_idx].sum().item())
+            response_ids = torch.cat(
+                [
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                    probe_output.batch["responses"][probe_idx, :probe_len],
+                ],
+                dim=0,
+            )
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            answer_text = "" if answer is None else str(answer).strip()
+            mass = (
+                float(prompt_mass_values[state_idx].get(answer_text, 0.0))
+                if answer_text and answer_text != "None"
+                else 0.0
+            )
+            if mass < min_mass:
+                mass = 0.0
+            mass_values.append(mass)
+            valid_values.append(1.0 if mass > 0.0 else 0.0)
+
+        mass_tensor = torch.tensor(mass_values, dtype=torch.float32).view(len(state_prompts), candidates, probe_samples)
+        valid_tensor = torch.tensor(valid_values, dtype=torch.float32).view(
+            len(state_prompts), candidates, probe_samples
+        )
+        mass_matrix = mass_tensor.mean(dim=-1)
+        source_mass = source_answer_mass.view(len(state_prompts), 1)
+        if score_type == "mass":
+            score_matrix = mass_matrix
+        elif score_type == "gain":
+            score_matrix = (mass_matrix - source_mass).clamp(min=0.0)
+        elif score_type == "relative_gain":
+            score_matrix = ((mass_matrix - source_mass) / (1.0 - source_mass).clamp(min=1e-6)).clamp(
+                min=0.0,
+                max=1.0,
+            )
+        else:
+            raise ValueError(f"Unsupported ttrl.chunk_state_answer_support_score={score_type!r}")
+
+        scores = score_matrix.reshape(-1)
+        label_consistent = (score_matrix > 0.0).to(dtype=torch.float32)
+        answer_coverage_arr = valid_tensor.mean(dim=(1, 2)).detach().cpu().numpy().astype(np.float32)
+        source_mass_arr = source_answer_mass.detach().cpu().numpy().astype(np.float32)
+        max_mass = mass_matrix.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+        mean_mass = mass_matrix.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        improved_state = (score_matrix.max(dim=-1).values > 0.0).float().detach().cpu().numpy().astype(np.float32)
+
+        state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = source_mass_arr
+        state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = answer_coverage_arr
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
+            np.float32
+        )
+        metrics = {
+            "chunk_state_answer_support_mass/group_size": float(candidates * probe_samples),
+            "chunk_state_answer_support_mass/score_type_mass": float(score_type == "mass"),
+            "chunk_state_answer_support_mass/score_type_gain": float(score_type == "gain"),
+            "chunk_state_answer_support_mass/score_type_relative_gain": float(score_type == "relative_gain"),
+            "chunk_state_answer_support_mass/min_mass": min_mass,
+            "chunk_state_answer_support_mass/source_mass_mean": float(source_mass_arr.mean())
+            if len(source_mass_arr)
+            else 0.0,
+            "chunk_state_answer_support_mass/probe_support_coverage_mean": float(answer_coverage_arr.mean())
+            if len(answer_coverage_arr)
+            else 0.0,
+            "chunk_state_answer_support_mass/mass_mean": float(mean_mass.mean()) if len(mean_mass) else 0.0,
+            "chunk_state_answer_support_mass/max_mass_mean": float(max_mass.mean()) if len(max_mass) else 0.0,
+            "chunk_state_answer_support_mass/score_mean": score_matrix.mean().item()
+            if len(score_matrix)
+            else 0.0,
+            "chunk_state_answer_support_mass/label_consistent_ratio": label_consistent.mean().item()
+            if len(label_consistent)
+            else 0.0,
+            "chunk_state_answer_support_mass/improved_state_ratio": float(improved_state.mean())
+            if len(improved_state)
+            else 0.0,
+        }
+        return scores, metrics
+
     def _score_chunk_state_answer_distribution(
         self,
         state_prompts: DataProto,
@@ -2878,7 +3001,7 @@ class RayPPOTrainer:
                 source_majority_ratios,
                 source_majority_labels,
             ) = self._compute_full_rollout_majority_consistency(full_batch)
-        if bool(cfg.get("chunk_state_target_guard_enable", False)):
+        if bool(cfg.get("chunk_state_target_guard_enable", False)) or score_mode in {"answer_support_mass"}:
             source_answer_metadata = self._compute_full_rollout_answer_metadata(full_batch)
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
@@ -3015,6 +3138,18 @@ class RayPPOTrainer:
                 metrics["chunk_state_probe/raw_positive_ratio"] = value_margin_metrics[
                     "chunk_state_answer_value_margin/score_mean"
                 ]
+            elif score_mode == "answer_support_mass":
+                scores, support_mass_metrics = self._score_chunk_state_answer_support_mass(
+                    state_prompts=state_prompts,
+                    chunk_output=chunk_output,
+                    probe_output=probe_output,
+                    candidates=candidates,
+                    probe_samples=probe_samples,
+                )
+                metrics.update(support_mass_metrics)
+                metrics["chunk_state_probe/raw_positive_ratio"] = support_mass_metrics[
+                    "chunk_state_answer_support_mass/score_mean"
+                ]
             else:
                 raise ValueError(f"Unsupported ttrl.chunk_state_score_mode={score_mode!r}")
             metrics["chunk_state_score/mode_majority_completion"] = float(score_mode == "majority_completion")
@@ -3022,6 +3157,7 @@ class RayPPOTrainer:
             metrics["chunk_state_score/mode_answer_distribution"] = float(score_mode == "answer_distribution")
             metrics["chunk_state_score/mode_answer_value_gain"] = float(score_mode == "answer_value_gain")
             metrics["chunk_state_score/mode_answer_value_margin"] = float(score_mode == "answer_value_margin")
+            metrics["chunk_state_score/mode_answer_support_mass"] = float(score_mode == "answer_support_mass")
             metrics["chunk_state_probe/samples"] = float(probe_samples)
             if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
                 anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
