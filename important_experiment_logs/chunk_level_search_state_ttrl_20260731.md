@@ -8143,3 +8143,91 @@ diag_rows = 16
   - candidate target 使用 per-state softened full-support distribution，source chunk 只作为 prior，不作为 hard teacher。
   - 对低信息 state 直接跳过：all-negative、高 OOV、support coverage 低、top margin 太平。
 - 下一轮 smoke gate 不看 smoothed 指标单独变好，仍以 raw `support_coverage_mean`、`candidate_oov_tv_mean`、`transport_gain_mean`、`state_keep_ratio`、`num_actor_samples` 为准。
+
+## 2026-08-01 high-support mid-state soft-affinity c16 softgate smoke
+
+背景：
+
+- 上一轮 `highsupport_mid_transport_affinity` 的 raw coverage 有改善，但 state gate 只留下 2/16 个 state，最终只有 8 个 actor samples。
+- 本轮只验证一个工程/统计假设：在不回到 local-hit teacher 的前提下，把候选宽度从 8 扩到 16，并去掉 top-margin hard gate，是否能解决可训练样本太少的问题。
+- 仍使用 full-rollout support 的 `transport_affinity` 作为 soft target，不开启 `label_consistent_only` / `zero_inconsistent_candidates`。
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c16_softgate_c128_probe4_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c16_softgate_c128_probe4_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c16_softgate_c128_probe4_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c16_softgate_c128_probe4_b32_r32_v64_1step_20260801.jsonl
+```
+
+配置：
+
+```text
+score_type = transport_affinity
+prior_smoothing = 0.0
+source_mode = majority_consistent
+source_select_by_mass = true
+min_prompt_top_mass = 0.35
+min_source_answer_mass = 0.40
+boundary_mode = mid
+mid_boundary_min_ratio = 0.25
+mid_boundary_max_ratio = 0.70
+probe_samples = 4
+candidates = 16
+chunk_size = 128
+label_consistent_only = false
+zero_inconsistent_candidates = false
+skip_all_negative = false
+min_state_coverage = 0.50
+max_state_oov = 0.50
+min_state_top_margin = 0.0
+```
+
+关键结果：
+
+```text
+source_mass_mean = 0.520
+prompt_top_mass_mean = 0.520
+source_original_acc_mean = 1.000
+source_pseudo_acc_mean = 0.938
+
+real_state_count = 11
+pad_state_count = 5
+skipped_support_sources = 21
+majority_consistent_fallbacks = 11
+boundary_mean = 592
+boundary_min = 256
+boundary_max = 1024
+
+support_coverage_mean = 0.581
+candidate_oov_tv_mean = 0.659
+transport_affinity_mean = 0.341
+transport_gain_mean = -0.179
+state_top_margin_mean = 0.005
+learnable_state_keep_ratio = 0.750
+state_keep_ratio = 0.750
+
+num_actor_samples = 112
+zeroed_state_ratio = 0.562
+target_entropy = 2.652
+actor/powerflow_loss = 0.417
+chunk_state_probe = 16.534s
+chunk_state_score = 12.078s
+chunk_state_ref = 5.464s
+update_actor = 4.475s
+diag_rows = 16
+```
+
+结论：
+
+- c16 + softgate 解决了上一轮最直接的样本稀疏问题：`state_keep_ratio` 从 0.125 提到 0.750，`num_actor_samples` 从 8 提到 112。
+- 但它没有解决核心 target 质量问题：`support_coverage_mean=0.581` 低于上一轮 0.598，`candidate_oov_tv_mean=0.659` 仍很高，`transport_gain_mean=-0.179` 仍为负。
+- 所以单纯扩大 candidate 宽度、放松 gate 只能让 PowerFlow 有东西可训，不能证明这些 chunk transition 是 search improvement。
+- 成本也开始上升：`update_actor=4.475s` 可接受，但 `probe+score+ref` 已约 34s；如果 target 质量不改善，继续加宽度不是高性价比方向。
+
+下一步：
+
+- 不再把主要精力放在 c16/c32 或继续调 hard gate；这些只能改善样本数，不能改变 target 是否正确。
+- 下一步应改 label estimation 机制：让 full rollout group support 直接生成 per-state target distribution，例如从完整 rollout 的 answer support / future suffix support 中构造 target，再把 source chunk 只作为 prior。
+- 候选生成也需要更贴近 support：可以从 high-support rollout 的真实 suffix chunk 做 replay/proposal，或混合 on-policy resample 与 support-suffix proposal，而不是完全依赖 state-local short probe 判断候选好坏。
