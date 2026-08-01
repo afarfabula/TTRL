@@ -171,3 +171,10 @@ ttrl:
   # is different from teacher_anchor: it does not force a score floor.
   chunk_state_source_chunk_enable: false
   chunk_state_source_chunk_candidate_index: 0
+  # support_anchor injects several same-prompt full-rollout next chunks as
+  # candidate anchors and scores them by the prompt-level full-rollout answer
+  # support mass. This keeps the teacher defined by full-group label
+  # estimation instead of short-horizon probe hits.
+  chunk_state_support_anchor_count: 4
+  chunk_state_support_anchor_candidate_start: 0
+  chunk_state_support_anchor_min_mass: 0.03125

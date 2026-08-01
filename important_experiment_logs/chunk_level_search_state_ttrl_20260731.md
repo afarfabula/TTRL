@@ -6213,3 +6213,124 @@ step3:
 - chunk/state target 不再要求在短 probe 局部 answer hit 里判清楚；probe 只作为 proposal 或弱 evidence，不能单独主导 teacher。
 - state 选择继续偏中后段、偏高质量 rollout，但 source chunk 只保留为 prior / drift guard。
 - 需要设计更长 horizon 或分阶段 future evaluation：让 score 真正回答“这个 local transition 会不会把后续 completion distribution 推向 full group 认为好的答案分布”，而不是“短 probe 是否碰巧抽中 boxed answer”。
+
+## 2026-08-01 support_anchor：放弃短 probe teacher 的 3-step smoke
+
+目的：
+
+- 验证最新方法学修正：chunk target 不再主要由 short-horizon probe 的局部 answer hit / source consistency 定义。
+- 用同 prompt 的 full rollout group 先估计 answer support，再把高 support 完整轨迹在当前 boundary 之后的 next chunk 注入为 anchor candidates。
+- anchor chunk 的 score 直接来自 full-group answer support mass；probe generation 在该模式下跳过。
+
+实现：
+
+```text
+score_mode = support_anchor
+每个 prompt 先 full rollout n=32
+每个 state 从同 prompt 的 full rollout 中选 support mass >= 1/32 且 boundary 后仍有 token 的轨迹
+把最多 4 个 anchor next chunk 注入 candidate 0..3
+score(candidate) = 对应完整轨迹 answer 在 full group 中的 support mass
+非 anchor / 不一致 candidate 权重置零，再走 PowerFlow weighted actor update
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_anchor_mid_c128_b32_r32_v64_3step_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_support_anchor_mid_c128_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=support_anchor
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_support_anchor_count=4
+ttrl.chunk_state_support_anchor_min_mass=0.03125
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_label_consistent_only=True
+ttrl.chunk_state_zero_inconsistent_candidates=True
+ttrl.chunk_state_prune_zero_weight_samples=True
+ttrl.chunk_state_powerflow_weight_clip=4.0
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_anchor_mid_c128_b32_r32_v64_3step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_anchor_mid_c128_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 关键指标：
+
+```text
+step1:
+  support_anchor_injected_ratio = 1.000
+  support_anchor_state_keep_ratio = 1.000
+  skipped_no_anchor_ratio = 0.000
+  support_anchor_score_mean = 0.080
+  support_anchor_score_max_mean = 0.258
+  label_consistent_ratio = 0.500
+  answer_coverage_mean = 0.500
+  positive_ratio = 0.080
+  num_actor_samples = 128
+  target_entropy = 1.121
+  chunk_state_probe/skipped_for_support_anchor = 1.000
+  gen = 51.851s
+  chunk_state_chunks = 1.085s
+  chunk_state_score = 5.850s
+  chunk_state_ref = 4.849s
+  update_actor = 3.671s
+
+step2:
+  support_anchor_injected_ratio = 1.000
+  support_anchor_state_keep_ratio = 1.000
+  skipped_no_anchor_ratio = 0.000
+  support_anchor_score_mean = 0.084
+  support_anchor_score_max_mean = 0.281
+  label_consistent_ratio = 0.500
+  answer_coverage_mean = 0.500
+  positive_ratio = 0.084
+  num_actor_samples = 128
+  target_entropy = 1.101
+  chunk_state_probe/skipped_for_support_anchor = 1.000
+  gen = 23.432s
+  chunk_state_chunks = 0.975s
+  chunk_state_score = 6.170s
+  chunk_state_ref = 0.965s
+  update_actor = 3.013s
+
+step3:
+  support_anchor_injected_ratio = 0.984
+  support_anchor_state_keep_ratio = 1.000
+  skipped_no_anchor_ratio = 0.000
+  support_anchor_score_mean = 0.079
+  support_anchor_score_max_mean = 0.230
+  label_consistent_ratio = 0.492
+  answer_coverage_mean = 0.492
+  positive_ratio = 0.079
+  num_actor_samples = 120
+  target_entropy = 1.188
+  chunk_state_probe/skipped_for_support_anchor = 1.000
+  gen = 32.391s
+  chunk_state_chunks = 1.092s
+  chunk_state_score = 5.687s
+  chunk_state_ref = 1.032s
+  update_actor = 3.242s
+```
+
+结论：
+
+- 这次 smoke 完成 3 step，`Final validation skipped`，没有训练异常。
+- 关键正向证据是 target 密度恢复：每步 32 个真实 state，`support_anchor_state_keep_ratio=1.0`，`skipped_no_anchor_ratio=0.0`，`num_actor_samples=128/128/120`。相比之前 TV / sourcegate 路线的 8/16 级别 actor samples，这说明“用 full rollout support anchor 定义 teacher”明显更健康。
+- `chunk_state_probe/skipped_for_support_anchor=1.0`，日志中没有 `timing_s/chunk_state_probe`，说明这条路径已经真正跳过 short-horizon probe generation。这里 metric 里仍有 `chunk_state_probe/raw_positive_ratio`、diag 里仍有 `probe_scores` 等历史命名，但数值实际来自 support anchor score，不是 probe rollout。
+- 训练更新不是主瓶颈：`update_actor` 稳态约 3.0-3.2s；chunk 生成约 1.0s；ref logprob 首步热启动后约 1.0s。当前额外慢点主要是 full rollout generation 和 `chunk_state_score` 里 Python/metadata 侧约 5.7-6.2s 的 support scoring/诊断开销。
+- 这条路线比“短 probe 局部命中当 teacher”更符合当前理论叙事：full rollout group 定义好什么叫好的 answer support，chunk actor update 学习把局部 transition 推向这个 support，而不是在太短 horizon 上强行判断局部 answer 是否命中。
+
+下一步：
+
+- 把 `support_anchor` 的 metric 命名从 `probe_*` 历史字段中剥离，避免后续分析误读。
+- 优化 `chunk_state_score` 的 Python 侧实现，目标把 support scoring 从约 6s 压到 1s 以内。
+- 做 20-step 小跑并带 final val，判断这种 full-group support anchor teacher 是否能在早期指标上超过复现 MV baseline；如果 20-step 正向，再扩 80-step 轨迹。
