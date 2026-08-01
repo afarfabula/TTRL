@@ -6334,3 +6334,137 @@ step3:
 - 把 `support_anchor` 的 metric 命名从 `probe_*` 历史字段中剥离，避免后续分析误读。
 - 优化 `chunk_state_score` 的 Python 侧实现，目标把 support scoring 从约 6s 压到 1s 以内。
 - 做 20-step 小跑并带 final val，判断这种 full-group support anchor teacher 是否能在早期指标上超过复现 MV baseline；如果 20-step 正向，再扩 80-step 轨迹。
+
+## 2026-08-01 support_anchor diag-off：3-step timing smoke
+
+目的：
+
+- 确认上面 3-step 中 `timing_s/chunk_state_score ~= 5.7-6.2s` 是否来自 support_anchor scorer 本身。
+- 关闭 `ttrl.chunk_state_diag_enable`，保留 support_anchor 训练语义不变。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_anchor_diagoff_mid_c128_b32_r32_v64_3step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_anchor_diagoff_mid_c128_b32_r32_v64_3step_20260801.log
+ttrl.chunk_state_diag_enable = False
+ttrl.chunk_state_diag_jsonl = ""
+```
+
+结果：
+
+```text
+step1:
+  gen = 51.334s
+  chunk_state_chunks = 1.079s
+  chunk_state_score = 0.001s
+  chunk_state_ref = 4.920s
+  update_actor = 3.666s
+  num_actor_samples = 128
+
+step2:
+  gen = 33.408s
+  chunk_state_chunks = 1.004s
+  chunk_state_score = 0.001s
+  chunk_state_ref = 0.843s
+  update_actor = 2.612s
+  num_actor_samples = 128
+
+step3:
+  gen = 22.206s
+  chunk_state_chunks = 1.022s
+  chunk_state_score = 0.001s
+  chunk_state_ref = 0.895s
+  update_actor = 2.828s
+  num_actor_samples = 128
+```
+
+结论：
+
+- `support_anchor` scorer 本身不是 6s 开销来源；之前的 `chunk_state_score` 主要是诊断路径在 timer 内重算 full rollout reward / GT reward。
+- 关掉 heavy diag 后，chunk 侧新增开销很小：score 约 1ms，chunk generation 约 1s，ref 约 0.9-1.0s，actor update 约 2.6-3.3s。
+- 当前 step time 主体仍是 full rollout generation，而不是 chunk actor update。
+
+## 2026-08-01 support_anchor diag-off：20-step + final val
+
+目的：
+
+- 在不使用 short-horizon probe teacher 的新语义下，跑 batch32 / rollout32 / 20 step，拿 MATH-TTT final val。
+- 保留 full rollout group support 定义 teacher；anchor 只来自同 prompt full rollout 的高 support completion chunk。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_anchor_diagoff_mid_c128_b32_r32_v64_20step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_anchor_diagoff_mid_c128_b32_r32_v64_20step_20260801.log
+RUN_ID = ttrl_chunk_state_powerflow_support_anchor_diagoff_mid_c128_b32_r32_v64_20step_20260801
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+actor_rollout_ref.rollout.n = 32
+actor_rollout_ref.rollout.val_kwargs.n = 16
+trainer.total_training_steps = 20
+trainer.test_freq = 20
+trainer.final_val_enable = True
+ttrl.chunk_state_score_mode = support_anchor
+ttrl.chunk_state_diag_enable = False
+ttrl.chunk_state_boundary_mode = mid
+ttrl.chunk_state_chunk_size = 128
+ttrl.chunk_state_support_anchor_count = 4
+ttrl.chunk_state_support_anchor_min_mass = 0.03125
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+补充说明：
+
+- 第一次查看日志时，`validation generation end` 后样本表输出非常大，看起来像没有 final metrics；后续 shell flush 后确认 metrics 已完整落盘。
+- 为避免以后 validation table 再污染主日志，20-step launcher 已加 `trainer.log_val_generations=0`。
+- 曾尝试启动一个 `novallog` 重跑，但在发现原 run final metrics 已 flush 后立刻中断；该中断 run 不作为实验结果。
+
+final val：
+
+```text
+val-core/math/acc/mean@16 = 0.43725
+val-core/math/acc/maj@16  = 0.558596
+val-core/math/acc/best@16 = 0.83514
+
+val-aux/math/acc/maj@8   = 0.536776
+val-aux/math/acc/best@8  = 0.780108
+val-aux/math/acc/maj@4   = 0.497388
+val-aux/math/acc/best@4  = 0.695802
+```
+
+20 step 聚合 timing：
+
+```text
+all 20 steps:
+  gen mean = 24.949s, min = 21.837s, max = 51.442s
+  chunk_state_chunks mean = 1.017s
+  chunk_state_score mean = 0.001s
+  chunk_state_ref mean = 1.158s
+  update_actor mean = 3.088s
+  testing final = 301.249s
+
+stable steps 2-19:
+  gen mean = 23.650s, min = 21.860s, max = 31.795s
+  chunk_state_chunks mean = 1.011s
+  chunk_state_ref mean = 0.965s
+  update_actor mean = 3.057s
+```
+
+target / density：
+
+```text
+num_actor_samples = 128.0 on all 20 steps
+support_anchor_state_keep_ratio = 1.0
+support_anchor_skipped_no_anchor_ratio = 0.0
+target_entropy mean = 1.187
+support_anchor_score_mean mean = 0.094
+positive_ratio mean = 0.094
+```
+
+结论：
+
+- infra 侧是正结果：放弃 short probe teacher 后，support_anchor 仍能稳定给满 128 actor samples，score 开销约 1ms，chunk actor update 约 3s。
+- 训练效果是负结果：20-step mean@16 只有 0.43725，maj@16 0.558596，明显低于我们已有 MV / PowerFlow 早期轨迹。当前 support_anchor 只把 full-support completion 的局部 chunk 注入并蒸馏，缺少真正的 search-improvement / distribution transport 信号。
+- 方法判断：这证明“不要用短 probe 局部命中定义 teacher”方向是可实现且计算友好的，但 naive support-anchor distillation 不足以提升数学准确率。下一版需要让 chunk target 对齐 full rollout group 的未来分布改善，例如 support mass gain / value margin / answer support transport，而不是只学习高 support 完整轨迹里的局部 next chunk。
