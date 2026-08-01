@@ -84,6 +84,10 @@ ttrl:
   # full-rollout answer support is too weak to define a reliable state target.
   chunk_state_min_prompt_top_mass: 0.0
   chunk_state_min_source_answer_mass: 0.0
+  # If enabled, candidate source rollouts are ranked by their answer mass under
+  # the prompt-level full-rollout support before cycling. This keeps the
+  # selected state path closer to high-support answers without hard-coding GT.
+  chunk_state_source_select_by_mass: false
   # If enabled with majority_completion scoring, build PowerFlow targets from
   # candidates whose completions match the state-level majority label. This
   # keeps the 2504.16084 label-estimation semantics separate from soft

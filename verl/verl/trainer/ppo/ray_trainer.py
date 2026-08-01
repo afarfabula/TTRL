@@ -1181,6 +1181,7 @@ class RayPPOTrainer:
         boundary_mode = str(cfg.get("chunk_state_boundary_mode", "cycle"))
         min_prompt_top_mass = float(cfg.get("chunk_state_min_prompt_top_mass", 0.0))
         min_source_answer_mass = float(cfg.get("chunk_state_min_source_answer_mass", 0.0))
+        source_select_by_mass = bool(cfg.get("chunk_state_source_select_by_mass", False))
         if (min_prompt_top_mass > 0.0 or min_source_answer_mass > 0.0) and source_answer_metadata is None:
             raise ValueError(
                 "chunk-state support source gates require full-rollout answer metadata; "
@@ -1215,6 +1216,13 @@ class RayPPOTrainer:
             if allowed.numel() == 0:
                 return allowed
             return base[torch.isin(base, allowed)]
+
+        def _rank_locals_by_mass(locals_tensor: torch.Tensor, prompt_start: int) -> torch.Tensor:
+            if not source_select_by_mass or source_answer_mass_arr is None or locals_tensor.numel() <= 1:
+                return locals_tensor
+            local_list = [int(local) for local in locals_tensor.tolist()]
+            local_list.sort(key=lambda local: (-float(source_answer_mass_arr[prompt_start + local]), local))
+            return torch.as_tensor(local_list, dtype=locals_tensor.dtype)
 
         state_input_ids = []
         state_attention_masks = []
@@ -1262,6 +1270,7 @@ class RayPPOTrainer:
                         if long_good_locals.numel() > 0:
                             good_locals = long_good_locals
                     good_locals = _intersect_locals(good_locals, mass_good_locals)
+                    good_locals = _rank_locals_by_mass(good_locals, prompt_start)
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
                     elif min_source_answer_mass > 0.0:
@@ -1283,6 +1292,7 @@ class RayPPOTrainer:
                         if long_good_locals.numel() > 0:
                             good_locals = long_good_locals
                     good_locals = _intersect_locals(good_locals, mass_good_locals)
+                    good_locals = _rank_locals_by_mass(good_locals, prompt_start)
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
                     elif min_source_answer_mass > 0.0:
@@ -1300,6 +1310,7 @@ class RayPPOTrainer:
                         majority_consistent_fallbacks += 1
                         source_local = source_offset % n
                 elif mass_good_locals is not None and mass_good_locals.numel() > 0:
+                    mass_good_locals = _rank_locals_by_mass(mass_good_locals, prompt_start)
                     source_local = int(mass_good_locals[source_offset % mass_good_locals.numel()].item())
                 elif min_source_answer_mass > 0.0:
                     skipped_support_sources += 1

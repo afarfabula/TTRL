@@ -7261,3 +7261,132 @@ state_mixed_ratio = 0.375
 - 这轮比 hard `transport_support_gain` 明显更可训练：`num_actor_samples` 从 8 回升到 56，`score_mean` 从 0.003 回升到 0.260，`state_keep_ratio` 从 0.156 到 0.250，`update_actor=2.641s` 仍然很轻。
 - 但它没有解决根因：`candidate_oov_tv_mean=0.738`、`transport_gain_mean=-0.159` 与前两轮一致，说明 candidate future distribution 仍整体不比 source 更接近 full support。这个版本只是把训练信号从“全灭”拉回“可训练”，不是一个应扩 20-step 的正结果。
 - 当前最清楚的方向是：loss / gate 已经不是主矛盾，candidate 生成和 state selection 才是。下一步应该让 candidate proposal 更接近 full-rollout support，例如从 full support 内的高质量 rollout 后续 chunk 做 contrastive candidate、或在同一 state 下用 support-conditioned resampling / staged continuation 生成候选，再用 soft affinity 做 PowerFlow matching。
+
+## 2026-08-01 Mass-Ranked Source + State-Gated Affinity 设计
+
+背景：
+
+- `transport_affinity_stategate` 说明 soft target + full-support gate 是目前最稳的诊断基线，但 `candidate_oov_tv_mean=0.738` 和 `transport_gain_mean=-0.159` 没有改善。
+- 下一步先改 state selection，而不是继续调 loss：在同一个 prompt 的 full rollout group 内，优先选择 answer mass 更高的 majority-consistent source rollout 来截取 state。这样 source prefix 更靠近 full support 主峰，但仍然不使用 GT。
+
+实现：
+
+```text
+新增配置: chunk_state_source_select_by_mass
+默认: false
+行为: 对候选 source locals 按 source_answer_mass 降序排序，再按原有 source_offset cycling 选择
+```
+
+smoke 配置：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_masssrc_stategate_c128_probe4_b32_r32_v64_1step_20260801.sh
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+score_type = transport_affinity
+source_mode = majority_consistent
+source_select_by_mass = True
+min_source_answer_mass = 0.25
+min_state_coverage = 0.50
+max_state_oov = 0.50
+min_state_top_margin = 0.02
+min_candidate_coverage = 0.25
+min_candidate_mean_mass = 0.02
+dynamic_bsz = False
+final_validation = skipped
+```
+
+Gate：
+
+- 先看 source 是否真的改善：`chunk_state_diag/source_answer_mass_mean` 应高于上一轮约 0.421，且 `skipped_support_sources` 不应导致 state 不足。
+- 再看 downstream：如果更好的 source prefix 有帮助，`candidate_oov_tv_mean` 应下降、`state_keep_ratio` 或 `num_actor_samples` 应不低于 state-gated affinity baseline。
+- 如果 source mass 改善但 candidate OOV/transport gain 不动，说明只换 source prefix 还不够，需要真正改 candidate proposal，例如支持集内后续 chunk 对比或 staged continuation。
+
+结果：
+
+```text
+run = ttrl_chunk_state_powerflow_future_support_transport_affinity_masssrc_stategate_c128_probe4_b32_r32_v64_1step_20260801
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+score_type = transport_affinity
+source_mode = majority_consistent
+source_select_by_mass = True
+min_source_answer_mass = 0.25
+dynamic_bsz = False
+final_validation = skipped
+
+source_mass_mean = 0.423
+prompt_top_mass_mean = 0.423
+support_coverage_mean = 0.564
+candidate_coverage_mean = 0.564
+candidate_quality_keep_ratio = 0.781
+state_oov_mean = 0.436
+candidate_oov_tv_mean = 0.704
+source_oov_tv_mean = 0.577
+transport_affinity_mean = 0.296
+transport_gain_mean = -0.127
+score_mean = 0.295
+label_consistent_ratio = 0.781
+state_top_margin_mean = 0.024
+learnable_state_keep_ratio = 0.292
+state_keep_ratio = 0.292
+num_actor_samples = 40
+pruned_sample_ratio = 0.792
+target_entropy = 1.979
+powerflow_weight_max = 1.683
+grad_norm = 18.901
+
+timing_s/gen = 43.523
+timing_s/chunk_state_chunks = 1.110
+timing_s/chunk_state_probe = 15.622
+timing_s/chunk_state_score = 10.730
+timing_s/chunk_state_ref = 4.463
+timing_s/update_actor = 2.020
+```
+
+与上一轮 `transport_affinity_stategate` 对比：
+
+```text
+source_answer_mass_mean: 0.421 -> 0.423
+support_coverage_mean: 0.479 -> 0.564
+candidate_oov_tv_mean: 0.738 -> 0.704
+transport_affinity_mean: 0.262 -> 0.296
+transport_gain_mean: -0.159 -> -0.127
+label_consistent_ratio: 0.645 -> 0.781
+state_keep_ratio: 0.250 -> 0.292
+num_actor_samples: 56 -> 40
+update_actor: 2.641s -> 2.020s
+```
+
+diag 聚合：
+
+```text
+jsonl_rows = 24
+real_state_count = 19
+pad_state_count = 5
+skipped_support_sources = 13
+majority_consistent_fallbacks = 13
+source_answer_mass mean = 0.423, min = 0.259, max = 0.808
+source_original_correct_ratio = 0.917
+answer_coverage mean = 0.564
+probe_mean_source_original_correct = 0.301
+probe_mean_source_original_wrong = 0.229
+state_all_positive_ratio = 0.583
+state_all_negative_ratio = 0.167
+state_mixed_ratio = 0.250
+```
+
+结论：
+
+- 这轮有小幅正向：candidate coverage、candidate OOV、transport affinity、label consistency 和 state keep 都比上一轮 soft-affinity state-gate 更好。
+- 但 `source_answer_mass_mean` 基本没有提升，且 `skipped_support_sources=13` 触发 fallback，说明单纯把 source candidates 按 answer mass 排序不是主解。它改善了采样分布的一部分，但没有让 source selection 进入一个明显更高质量的 support regime。
+- 更关键的是 `transport_gain_mean` 仍为负，`candidate_oov_tv_mean=0.704` 仍偏高。也就是说 candidate future distribution 仍整体没有比 source 更靠近 full-rollout support，当前 target 质量仍不足以扩成 20-step 主实验。
+- 接下来不应继续要求 chunk target 主要由 short-horizon probe 的局部命中、局部 source consistency 或更强 source hard gate 判清楚。主方向应改为：先由 full rollout group 定义 prompt-level support/value，再让 candidate proposal 学习把未来分布推向该 support；source chunk 只作为 prior / drift guard。可落地的下一步是做 support-conditioned candidate：在同一 state 下混入 high-support rollout continuation chunk 或 staged continuation，再用 soft transport affinity 做 PowerFlow matching。
