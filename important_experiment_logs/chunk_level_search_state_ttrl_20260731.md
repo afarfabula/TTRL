@@ -4972,3 +4972,93 @@ timing_total_est = 52.483s
 - 启动同配置 20-step gate，打开 final validation。
 - Gate 目标：至少不能复现 `support_src20b` 的 repeated boxed 退化；step20 `mean@16` 不能低于 MV 20-step 两点以上。
 - 若 20-step 指标健康，再扩 80-step pilot；若仍低，下一步优先减少 OOV：例如增大 full rollout support 样本数、用 answer-support matching 而不是 raw probe answer、或把 state boundary 限制到更稳定的中后段。
+
+
+## 2026-08-01 Raw Support + Candidate Anti-Repeat 20-Step Gate
+
+目的：
+
+- 扩展上一节健康的 3-step smoke 到 20-step gate，确认 `source_chunk + raw full-answer support target + candidate anti-repeat guard` 是否能避免 `support_src20b` 的重复 boxed 退化。
+- 继续保持 TTRL 原文 `2504.16084` 的约束：不使用 GT 选 source / target；source 和 target 语义绑定到同组 full rollout 的 answer distribution / majority prior；chunk state 只作为训练状态和局部 transition，不让短 probe 自己变成任意 teacher。
+- 用户补充的 chunk 处理参考 `https://arxiv.org/pdf/2504.16084` 后，下一轮实现需要更严格区分：full rollout group 给全局 answer support，chunk/probe 只估计 state transition 是否把质量流向该 support。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support_antirepeat_src20_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+VAL_BEFORE_TRAIN=False
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_use_distribution_score=True
+ttrl.chunk_state_target_guard_use_mass_gain=False
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_target_guard_candidate_max_boxed_count=1
+ttrl.chunk_state_target_guard_candidate_assistant_marker=True
+```
+
+产物：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_antirepeat_src20_mid_c128_probe4_b32_r32_v64_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_antirepeat_src20_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_antirepeat_src20_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 640
+```
+
+训练侧结果：
+
+```text
+main_log_steps = 19   # stdout step 指标打印到 step 19；diag 640 行显示 20 个 batch 的 chunk 诊断已写完
+avg_total_est_step2plus = 49.689s
+last_total_est = 46.782s
+avg timing_s/gen = 23.484s
+avg timing_s/chunk_state_probe = 6.556s
+avg timing_s/chunk_state_score = 11.667s
+avg timing_s/chunk_state_ref = 1.694s
+avg timing_s/update_actor = 5.259s
+avg kept_candidate_ratio = 0.431
+avg prompt_mass_mean = 0.271
+avg source_answer_mass_mean = 0.419
+avg distribution_oov_probe_ratio = 0.510
+avg repeated_boxed_probe_ratio = 0.085
+avg candidate_repeated_boxed_probe_ratio = 0.014
+avg actor_batch_powerflow_weight_nonzero_ratio = 0.432
+avg positive_ratio = 0.095
+avg source_original_acc_mean = 0.778
+avg prompt_original_pass = 0.919
+```
+
+Final validation 状态：
+
+```text
+validation_generation_started = True
+validation_generation_end = True
+final_metric_found = True
+val-core/math/acc/mean@16 = 0.525125
+val-core/math/acc/maj@16 = 0.657004
+val-core/math/acc/best@16 = 0.870802
+val-aux/math/format_score/mean@16 = 0.895796
+checkpoint_dir_found = False
+validation_tail_empty_boxed_count = 288383
+validation_tail_assistant_marker_count = 375
+```
+
+结论：
+
+- 20-step gate 失败，不能扩 80-step。
+- 训练侧没有崩：diag 640 行完整，step2+ 约 50s，chunk actor update 约 5.3s，candidate guard 后 candidate 自身重复 boxed 只有约 1.4%。
+- 失败发生在训练语义而不是 actor update 性能：final validation 已经生成结束并落出指标，但指标很差，`mean@16=0.525`、`maj@16=0.657`、`best@16=0.871`，显著低于 MV 20-step 基线；validation 输出尾部出现极大量空 `\boxed{}` 和 assistant marker 串扰，说明完整 policy 仍然发生退化。
+- 这说明 candidate-level anti-repeat guard 只是局部清洗，并没有改变 target 的根本问题：短 probe 到 full rollout answer support 的 OOV 仍约 51%，正样本比例只有约 9.5%，PowerFlow 权重会把少量局部高分 chunk 过强蒸馏，导致完整答案分布被污染。
+- 和 `2504.16084` 的 TTRL 目标相比，当前版本仍然过早把 chunk probe 结果当成局部监督；下一版需要让 chunk 的目标更像 full group answer distribution 的 state-conditioned improvement，而不是直接奖励一个短 continuation 的 boxed answer。
+
+下一步：
+
+- 停止这条路线继续扩步。
+- 重新设计 chunk transition target：先完整 rollout 32 条形成 group answer distribution，再从正确/多数一致轨迹上截 state；对 next-chunk continuation 做后续 rollout/probe 时，只计算它把后续 completion 引向 full-group support/mass 的概率提升。
+- 优先改成 PowerFlow-style distribution matching：target 权重来自 `future completion answer mass under original group support`，并加入 length-normalized chunk likelihood / answer-support transport，而不是 raw short-probe answer score。
+- Anti-repeat guard 保留为安全 guard，但不能作为主要创新或主要监督。
