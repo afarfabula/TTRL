@@ -3519,3 +3519,75 @@ answer-distribution mid-state c128:
 - 失败更像 target 语义错误：用同一 state 内 `candidate x probe` 的 answer frequency 直接做 soft score，会奖励“在短 probe 中落到高频答案”的 chunk，但这个高频答案不一定是更好的完整解题方向；`best@16=0.828208` 说明搜索空间仍有正确答案，`mean@16/maj@16` 大幅下降说明 policy 被推向了错误或格式化但不可靠的局部分布。
 - 2504.16084 的启发应该继续保留，但要更严格实现：它支持同一 state 多输出 label estimation / reward calculation，而不是把 state-local frequency 本身当最终 chunk reward。下一版需要让 chunk label estimation 和后续 search improvement 绑定，例如用候选 chunk 后的 long-horizon pass/value margin、state value gain、或 search-improved distribution 的 KL/PowerFlow target，而不是只用答案频率。
 - infra 观察：本 run 的额外成本主要是 `chunk_state_score=10.096s`，其中包含 probe generation 和答案解析；actor update 仍不是瓶颈。日志里仍有大量 SymPy warning/subprocess shutdown，说明 parser/scoring 长尾还需要优化，但这次指标失败首先是算法目标问题。
+
+## 2026-08-01 Answer-value-gain Mid-state c128 3-step Smoke
+
+动机：
+
+- answer-distribution 20-step gate 失败后，不继续调频率 target。新的目标是把 chunk reward 从“state 内答案频率”改成“该 chunk 是否让后续 probe 相对 full-rollout baseline 更容易回到 prompt-level pseudo label”。
+- 该设计继续遵循 2504.16084 的无 GT label estimation 思路：先用同一 prompt 的 32 条完整 rollout 做 prompt-level majority label 和 baseline ratio，再在 `state + chunk` 下做 probe，计算候选 chunk 的 value gain。
+- 对每个 state，baseline 是该 prompt 原始 32 条 rollout 的 majority ratio；候选 chunk 的 hit rate 是 4 条 probe 命中 prompt pseudo label 的比例；score 为 `max(0, (hit_rate - baseline) / (1 - baseline))`。因此只有相对 baseline 改善的 chunk 才拿正分。
+- actor update 仍然是 PowerFlow distribution matching，不切 GRPO、不切 weighted NLL；真实 GT 只用于 diag，不参与 chunk source/target。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  新增 _score_chunk_state_answer_value_gain
+  新增 ttrl.chunk_state_score_mode=answer_value_gain 分支
+  answer_value_gain 自动触发 full-rollout majority label/ratio 计算
+  记录 baseline_ratio/hit_rate/gain/max_gain/improved_state 等统计
+
+run_records/ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  继承 majority-consistent mid-state c128 配置
+  ttrl.chunk_state_score_mode=answer_value_gain
+  关闭 teacher_anchor 和 source_chunk 注入
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_score_mode=answer_value_gain
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_min_majority_ratio=0.20
+chunk_state_min_answer_coverage=0.60
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+answer_value_gain_baseline_ratio=0.338
+answer_value_gain_answer_coverage=0.737
+answer_value_gain_hit_rate=0.446
+answer_value_gain_gain=0.375
+answer_value_gain_max_gain=0.615
+answer_value_gain_improved_state_ratio=0.740
+answer_value_gain_label_consistent_ratio=0.531
+kept_state_ratio=0.510
+target_entropy=1.687
+powerflow_weight_max=6.838
+actor/powerflow_loss=0.098
+actor/grad_norm=7.097
+timing_s/gen=32.062
+timing_s/chunk_state_score=9.015
+timing_s/update_actor=7.303
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP/vLLM 崩溃，`chunk_state_score/mode_answer_value_gain=1.0`。
+- 训练信号不是空的：`gain_mean=0.375`、`improved_state_ratio=0.740`、`kept_state_ratio=0.510`；相对 answer-distribution 的 `kept_state_ratio=0.634` 更稀疏，但语义上更接近 chunk-level search-state improvement。
+- `target_entropy=1.687`、`powerflow_weight_max=6.838` 说明目标分布比 answer-distribution 更尖，可能带来更强更新，也可能不稳定；20-step gate 必须观察 `mean@16/maj@16` 是否比 hard confidence-gated c128 更好。
+- infra 仍然正常：8 卡 B200、vLLM `FLASH_ATTN`、FlashInfer autotune、CUDA graph capture、NCCL P2P/CUMEM/NVLS、Actor fused kernels/Triton backend 均在日志中出现；actor dynamic batch 关闭。
+- 下一步可以跑同配置 20-step gate；通过标准仍是超过 hard confidence-gated c128 的 `mean@16=0.5325`，否则继续把 value gain 从 majority-label hit rate 扩展为 long-horizon pass/value margin。
