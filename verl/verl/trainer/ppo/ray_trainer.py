@@ -1944,19 +1944,24 @@ class RayPPOTrainer:
         selected_extra_offset = {
             int(chunk_idx): idx * int(extra_probe_samples) for idx, chunk_idx in enumerate(selected_chunk_indices)
         }
-        response_shape = base_probe_output.batch["responses"].shape[1:]
-        mask_shape = base_probe_output.batch["response_mask"].shape[1:]
-        pad_response = torch.full(
-            response_shape,
-            self.tokenizer.pad_token_id,
-            dtype=base_probe_output.batch["responses"].dtype,
-            device=base_probe_output.batch["responses"].device,
-        )
-        zero_mask = torch.zeros(
-            mask_shape,
-            dtype=base_probe_output.batch["response_mask"].dtype,
-            device=base_probe_output.batch["response_mask"].device,
-        )
+
+        def _merged_item_shape(key: str) -> tuple[int, ...]:
+            base_shape = tuple(base_probe_output.batch[key].shape[1:])
+            extra_shape = tuple(extra_probe_output.batch[key].shape[1:])
+            if len(base_shape) != len(extra_shape):
+                raise ValueError(
+                    f"staged probe tensor rank mismatch for {key}: base={base_shape}, extra={extra_shape}"
+                )
+            return tuple(max(base_dim, extra_dim) for base_dim, extra_dim in zip(base_shape, extra_shape))
+
+        def _pad_item(value: torch.Tensor, shape: tuple[int, ...], pad_value: int | float) -> torch.Tensor:
+            if tuple(value.shape) == shape:
+                return value
+            padded = torch.full(shape, pad_value, dtype=value.dtype, device=value.device)
+            slices = tuple(slice(0, dim) for dim in value.shape)
+            padded[slices] = value
+            return padded
+
         rows = defaultdict(list)
         for chunk_idx in range(len(chunk_output)):
             base_start = chunk_idx * int(base_probe_samples)
@@ -1989,24 +1994,27 @@ class RayPPOTrainer:
         merged_batch = {}
         for key in base_probe_output.batch.keys():
             values = []
+            item_shape = _merged_item_shape(key)
             if key == "responses":
-                pad_value = pad_response
+                scalar_pad_value = self.tokenizer.pad_token_id
             elif key == "response_mask":
-                pad_value = zero_mask
+                scalar_pad_value = 0
             else:
-                pad_value = torch.zeros(
-                    base_probe_output.batch[key].shape[1:],
-                    dtype=base_probe_output.batch[key].dtype,
-                    device=base_probe_output.batch[key].device,
-                )
+                scalar_pad_value = 0
             for chunk_idx in range(len(chunk_output)):
                 for source, row_idx in rows[chunk_idx]:
                     if source == "base":
-                        values.append(base_probe_output.batch[key][row_idx])
+                        value = base_probe_output.batch[key][row_idx]
                     elif source == "extra":
-                        values.append(extra_probe_output.batch[key][row_idx])
+                        value = extra_probe_output.batch[key][row_idx]
                     else:
-                        values.append(pad_value)
+                        value = torch.full(
+                            item_shape,
+                            scalar_pad_value,
+                            dtype=base_probe_output.batch[key].dtype,
+                            device=base_probe_output.batch[key].device,
+                        )
+                    values.append(_pad_item(value, item_shape, scalar_pad_value))
             merged_batch[key] = torch.stack(values, dim=0)
 
         td = TensorDict(merged_batch, batch_size=(len(chunk_output) * total_probe_samples,))

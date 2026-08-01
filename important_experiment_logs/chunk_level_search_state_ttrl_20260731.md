@@ -8710,3 +8710,152 @@ timing_s/update_actor = 1.145667
 - 优先提高 candidate/proposal 的 support coverage，让 positive future-gain state 更多，而不是降低成局部短视 target。
 - 最小下一版可以保持 `future_support_gain + smoothed_transport_support_gain`，把 support-suffix proposal 的覆盖从 3 个提高到 5-7 个，或放松 state gate 后跑 3-step/20-step 对比。
 - 20-step gate 通过标准：`state_keep_ratio` 不低于约 0.4、`num_actor_samples` 不低于约 32-48、`positive_margin_mean` 保持正，再看 validation。
+
+## 2026-08-01 support5 future-gain smoke
+
+目的：
+
+- 检查“增加 full-rollout support suffix proposal 覆盖”能否提高 `future_support_gain + smoothed_transport_support_gain` 的可学习 state 数。
+- 该实验仍不把 source chunk 当 teacher；support suffix 只作为候选 proposal，最终评分仍由 candidate future answer distribution 相对 full-rollout support distribution 的 transport improvement 决定。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_smoothed_transport_support5_mid_c128_probe1024x4_b32_r32_v64_3step_20260801.sh
+run_id = ttrl_chunk_state_powerflow_futuregain_smoothed_transport_support5_mid_c128_probe1024x4_b32_r32_v64_3step_20260801
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_smoothed_transport_support5_mid_c128_probe1024x4_b32_r32_v64_3step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_smoothed_transport_support5_mid_c128_probe1024x4_b32_r32_v64_3step_20260801.jsonl
+status = completed_3_steps_no_val
+```
+
+相对 support3 baseline 的改动：
+
+```text
+support_anchor_count = 5
+support_anchor_candidate_start = 3
+其他训练语义保持一致：batch32 / rollout32 / votes64 / chunk128 / probe1024x4 / PowerFlow loss / dynamic_bsz=false
+```
+
+对比结果：
+
+```text
+metric                                            support3      support5
+improved_state_ratio                              0.729333      0.708333
+positive_margin_mean                              0.137333      0.117000
+smoothed_transport_gain_mean                      0.073333      0.016667
+smoothed_transport_affinity_mean                  0.630333      0.598667
+transport_affinity_mean                           0.260000      0.197000
+support_coverage_mean                             0.427667      0.347000
+state_oov_mean                                    0.572333      0.653000
+state_keep_ratio                                  0.292000      0.229000
+label_consistent_ratio                            0.612000      0.604333
+score_mean                                        0.094000      0.073333
+raw_gain_mean                                    -0.298667     -0.383000
+num_actor_samples                                 24.000000     16.000000
+target_entropy                                    1.928000      1.921333
+timing_s/chunk_state_score                        7.815333      8.682667
+timing_s/update_actor                             1.145667      0.869667
+Timeout during comparison                         3             5
+Timeout during parsing                            0             94
+Traceback / OOM                                   0 / 0         0 / 0
+```
+
+结论：
+
+- support5 不通过 20-step gate。它没有提高 full-support future improvement，反而降低了 support coverage、state keep ratio、actor samples 和 transport gain。
+- 这说明“继续增加 support/source 侧候选约束”不是当前主线，尤其在 parsing timeout 增多时会让 future distribution estimation 更脏。
+- 该结果和最新方法判断一致：最该放弃的是“局部短视可判定性”和更强 source hard constraint，不是 PowerFlow loss 或 chunk actor update。
+
+下一步：
+
+- 回到 support3 future-gain 作为当前 baseline。
+- 设计 staged full-support target：先用 full-rollout support transport 对候选 chunk 粗排序，再对 top-k chunk 做更长/更多 future probe；probe 只用于估计 future distribution，最终 target 仍由 full-rollout group support/value 主导。
+- source chunk 继续只作为 neutral prior / drift guard，不作为主要 teacher，不再扩大 support anchor 数量。
+
+## 2026-08-01 staged full-support smoke
+
+目的：
+
+- 验证 staged full-support target 是否能减少“短 horizon 局部判定”噪声。
+- 设计为先用便宜 base probe 对所有 chunk 候选做 full-support transport 粗排序，再只对 top-k 候选追加更长 future probe。
+- 目标仍是 `smoothed_transport_support_gain`；probe 只估计 candidate future answer distribution，不直接提供 local answer teacher。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_staged_fullsupport_mid_c128_probe512x2_extra1536x6_b32_r32_v64_3step_20260801.sh
+failed_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_staged_fullsupport_mid_c128_probe512x2_extra1536x6_b32_r32_v64_3step_20260801.log
+rerun_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_staged_fullsupport_mid_c128_probe512x2_extra1536x6_b32_r32_v64_3step_20260801_rerun1.log
+rerun_diag = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_staged_fullsupport_mid_c128_probe512x2_extra1536x6_b32_r32_v64_3step_20260801_rerun1.jsonl
+status = rerun1_completed_3_steps_no_val
+```
+
+工程修复：
+
+```text
+first failure = RuntimeError: stack expects each tensor to be equal size, but got [512] and [1536]
+root cause = staged merge assumed base probe and extra probe response tensors have identical sequence length
+fix = _merge_chunk_state_staged_probe_output now pads base/extra batch tensors to the merged max shape before torch.stack
+```
+
+配置：
+
+```text
+base_probe = 512 tokens x 2 samples
+staged_topk = 2 chunks per state
+extra_probe = 1536 tokens x 6 samples
+score_probe_samples = 8 after repeat_base merge
+support_anchor_count = 3
+source_prior_weight = 0.5
+prior_smoothing = 6.0
+dynamic_bsz = false
+```
+
+对比结果：
+
+```text
+metric                                            support3      staged_rerun1
+improved_state_ratio                              0.729333      0.875000
+positive_margin_mean                              0.137333      0.104333
+smoothed_transport_gain_mean                      0.073333      0.015000
+smoothed_transport_affinity_mean                  0.630333      0.560667
+transport_affinity_mean                           0.260000      0.231333
+support_coverage_mean                             0.427667      0.372667
+state_oov_mean                                    0.572333      0.627333
+state_keep_ratio                                  0.292000      0.208333
+label_consistent_ratio                            0.612000      0.598667
+score_mean                                        0.094000      0.055667
+raw_gain_mean                                    -0.298667     -0.310667
+num_actor_samples                                 24.000000     18.666667
+target_entropy                                    1.928000      1.832667
+timing_s/chunk_state_probe                        5.266333      2.646667
+timing_s/chunk_state_staged_probe_extra           n/a           6.856333
+timing_s/chunk_state_score                        7.815333      10.912000
+timing_s/update_actor                             1.145667      0.958333
+Timeout during comparison                         3             3
+Timeout during parsing                            0             0
+Traceback / OOM                                   0 / 0         0 / 0
+```
+
+额外诊断：
+
+```text
+staged_base/positive_margin_mean = 0.277667
+staged_base/smoothed_transport_gain_mean = 0.264667
+staged_base/state_keep_ratio = 0.291667
+staged_base/support_coverage_mean = 0.412667
+```
+
+结论：
+
+- staged 机制工程上已打通，但方法上不扩 20-step。
+- base 粗筛指标显著好于最终 long-probe 指标，说明 `512x2 + smoothing=6` 产生了过乐观的 first-stage signal；它不能作为可靠 target。
+- 最终 target 的关键指标低于 support3：`smoothed_transport_gain_mean` 从 0.073 降到 0.015，`state_keep_ratio` 从 0.292 降到 0.208，actor samples 从 24 降到 18.7。
+- 这再次说明不能让短 horizon 粗筛主导 target，即便它名义上使用了 full-support transport。
+
+下一步：
+
+- 不扩 staged 到 20-step。
+- 不再让 short base probe 先决定 teacher 候选。
+- 下一版改为全候选 longer-horizon future distribution estimation：保持所有 candidates 都用同一 probe horizon，先验证 `probe1536x4` 或 `probe2048x4` 是否提高 support coverage / state_keep_ratio / transport gain。
+- 如果全候选长 probe 仍不提升，再考虑改 target 公式，而不是继续堆 staged gate。
