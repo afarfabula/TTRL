@@ -2617,3 +2617,43 @@ confidence-gated c128 20-step:
 - 做 2504.16084 风格的 soft multi-output label estimation：保留全部 informative state，只用 `majority_ratio`、`answer_coverage`、候选得分分布调整 PowerFlow target sharpness/weight。
 - 优先取消 hard `min_answer_coverage=0.60`，改成软置信权重；目标是恢复足够训练信号，同时避免 raw majority-completion 的低置信噪声。
 - 继续使用 PowerFlow loss 作为 chunk actor update 主路径，GRPO 暂不作为主实验。
+
+## 2026-08-01 Soft-confidence Majority-completion c128 3-step Smoke
+
+动机：
+
+- hard confidence gate 的 20-step 只小幅好于 raw majority-completion，核心问题是过早丢掉大量 state。
+- 按 arXiv 2504.16084 的语义，同一个 state 下多输出应先用于 label/reward estimation，再通过置信度调节学习强度；不应把低 coverage state 全部 hard skip。
+- 因此这轮保留 c128、majority-completion、probe4、PowerFlow loss，只取消 hard gate：
+  - `chunk_state_min_majority_ratio=0.0`
+  - `chunk_state_min_answer_coverage=0.0`
+  - `chunk_state_confidence_power=0.5`
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_soft_conf_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_soft_conf_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_soft_conf_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+worker=1024321, 8x NVIDIA B200
+```
+
+三步关键信号：
+
+```text
+step1: kept_state=0.969 loss_weight=0.483 majority_ratio=0.364 answer_coverage=0.706 powerflow_loss=0.386 grad_norm=9.195 gen=52.106s chunk_state_score=11.604s update_actor=7.677s
+step2: kept_state=0.938 loss_weight=0.338 majority_ratio=0.217 answer_coverage=0.608 powerflow_loss=0.104 grad_norm=6.089 gen=23.148s chunk_state_score=10.812s update_actor=7.438s
+step3: kept_state=0.969 loss_weight=0.422 majority_ratio=0.321 answer_coverage=0.666 powerflow_loss=0.192 grad_norm=2.020 gen=26.209s chunk_state_score=10.743s update_actor=7.626s
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP 崩溃。
+- 与 hard gate c128 相比，soft-confidence 保留 `93.8%-96.9%` state，而不是 `18.8%-62.5%`；训练信号明显更连续。
+- `loss_weight_mean=0.338-0.483`，没有塌到 hard gate step12 的 `0.119`。
+- `update_actor~7.4-7.7s`，仍保留 c128 对 actor update 的收益。
+- 这版比 hard gate 更适合作为 2504.16084 风格 multi-output label estimation 的最小可行实验，下一步跑 20-step final validation。
