@@ -7390,3 +7390,109 @@ state_mixed_ratio = 0.250
 - 但 `source_answer_mass_mean` 基本没有提升，且 `skipped_support_sources=13` 触发 fallback，说明单纯把 source candidates 按 answer mass 排序不是主解。它改善了采样分布的一部分，但没有让 source selection 进入一个明显更高质量的 support regime。
 - 更关键的是 `transport_gain_mean` 仍为负，`candidate_oov_tv_mean=0.704` 仍偏高。也就是说 candidate future distribution 仍整体没有比 source 更靠近 full-rollout support，当前 target 质量仍不足以扩成 20-step 主实验。
 - 接下来不应继续要求 chunk target 主要由 short-horizon probe 的局部命中、局部 source consistency 或更强 source hard gate 判清楚。主方向应改为：先由 full rollout group 定义 prompt-level support/value，再让 candidate proposal 学习把未来分布推向该 support；source chunk 只作为 prior / drift guard。可落地的下一步是做 support-conditioned candidate：在同一 state 下混入 high-support rollout continuation chunk 或 staged continuation，再用 soft transport affinity 做 PowerFlow matching。
+
+## 2026-08-01 Support-Proposal + Transport Affinity 1-step smoke
+
+背景：
+
+- `mass-ranked source` 说明只改 source selection 不够，candidate future distribution 仍然 OOV 高、transport gain 为负。
+- 这轮做一个最小 candidate proposal 实验：保留 `future_support_gain + transport_affinity` 作为 target scorer，但在 candidate slots 中注入同 prompt full-rollout support 内的 high-mass continuation chunk。这样不把 anchor mass 直接当 teacher，只让它作为 proposal 进入后续 transport scoring。
+- 目的不是回到 `support_anchor/support_flow`，而是验证“更靠近 full support 的 candidate proposal 是否能改善 transport target 质量”。
+
+实现：
+
+```text
+新增配置: chunk_state_support_anchor_enable
+默认: false
+语义: 在 support_anchor/support_flow 以外也允许注入 support anchors；注入只改变 candidate proposal，active scorer 仍定义 target。
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_supportprop_c128_probe4_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_transport_affinity_supportprop_c128_probe4_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_transport_affinity_supportprop_c128_probe4_b32_r32_v64_1step_20260801.jsonl
+```
+
+配置：
+
+```text
+score_mode = future_support_gain
+score_type = transport_affinity
+source_mode = majority_consistent
+source_select_by_mass = True
+source_chunk_candidate_index = 0
+support_anchor_enable = True
+support_anchor_count = 4
+support_anchor_candidate_start = 1
+support_anchor_min_mass = 0.03125
+candidates = 8
+probe_samples = 4
+probe_max_tokens = 3072
+dynamic_bsz = False
+final_validation = skipped
+```
+
+结果：
+
+```text
+support_anchor_injected_ratio = 1.000
+support_anchor_state_keep_ratio = 1.000
+support_anchor_anchor_mass_mean = 0.187
+support_anchor_anchor_mass_max = 0.808
+support_anchor_anchor_len_mean = 116.052
+
+source_mass_mean = 0.423
+support_coverage_mean = 0.456
+candidate_coverage_mean = 0.456
+candidate_quality_keep_ratio = 0.641
+state_oov_mean = 0.544
+candidate_oov_tv_mean = 0.761
+source_oov_tv_mean = 0.577
+transport_affinity_mean = 0.239
+transport_gain_mean = -0.184
+score_mean = 0.236
+label_consistent_ratio = 0.641
+state_top_margin_mean = 0.019
+state_keep_ratio = 0.125
+num_actor_samples = 16
+pruned_sample_ratio = 0.917
+target_entropy = 1.615
+update_actor = 1.079s
+
+timing_s/gen = 43.408
+timing_s/chunk_state_chunks = 0.984
+timing_s/chunk_state_probe = 15.735
+timing_s/chunk_state_score = 11.707
+timing_s/chunk_state_ref = 3.955
+timing_s/update_actor = 1.079
+```
+
+与 `mass-ranked source + state-gated affinity` 对比：
+
+```text
+support_coverage_mean: 0.564 -> 0.456
+candidate_oov_tv_mean: 0.704 -> 0.761
+transport_affinity_mean: 0.296 -> 0.239
+transport_gain_mean: -0.127 -> -0.184
+label_consistent_ratio: 0.781 -> 0.641
+state_keep_ratio: 0.292 -> 0.125
+num_actor_samples: 40 -> 16
+update_actor: 2.020s -> 1.079s
+```
+
+diag 聚合：
+
+```text
+jsonl_rows = 24
+source_answer_mass mean = 0.423, min = 0.259, max = 0.808
+answer_coverage mean = 0.456, min = 0.031, max = 0.781
+future_support_state_mean_mass mean = 0.168
+future_support_state_max_mass mean = 0.365
+future_support_state_top_margin mean = 0.019
+probe_mean mean = 0.236
+future_support_keep mean = 0.125
+```
+
+结论：
+
+- 这是一个明确负结果。support anchor 注入本身成功，`injected_ratio=1.0`，但 candidate future distribution 没有靠近 full support，反而 `candidate_oov_tv_mean` 上升、`transport_gain_mean` 更负、`state_keep_ratio` 和 actor samples 明显下降。
+- 直接把同 prompt 高 support rollout 的后续 chunk 拼到当前 state 后面并不等价于一个 state-compatible local action。原因大概率是这些 continuation chunk 依赖各自原始前文，和当前 state prefix 不匹配；它们虽然来自高 support 完整轨迹，但在当前 state 上不是自然下一步。
+- 这个结果进一步收窄下一步方向：candidate proposal 不能是无条件 high-support continuation copy。需要做 state-compatible proposal，例如从当前 state 继续做 staged long-horizon resampling、用 high-support trajectory 只提供 answer/value target 而不是直接提供 chunk token，或者先做 prefix alignment / nearest-state matching 再注入 continuation。
+- 因此下一步不扩 20-step。应设计 `state-compatible staged proposal`：同一 state 先生成 candidate chunk，再对这些 candidate 做更长 horizon future support estimation；或在 full rollout group 中只选择与当前 state prefix 语义/文本接近的 continuation 作为 anchor。

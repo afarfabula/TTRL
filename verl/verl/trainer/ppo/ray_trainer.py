@@ -3994,7 +3994,8 @@ class RayPPOTrainer:
                 source_majority_ratios,
                 source_majority_labels,
             ) = self._compute_full_rollout_majority_consistency(full_batch)
-        if bool(cfg.get("chunk_state_target_guard_enable", False)) or score_mode in {
+        support_anchor_enable = bool(cfg.get("chunk_state_support_anchor_enable", False))
+        if bool(cfg.get("chunk_state_target_guard_enable", False)) or support_anchor_enable or score_mode in {
             "answer_support_mass",
             "answer_source_consistency",
             "future_support_gain",
@@ -4047,10 +4048,11 @@ class RayPPOTrainer:
             chunk_output = self._repeat_non_tensor_like(state_prompts, chunk_output, candidates)
             if bool(cfg.get("chunk_state_source_chunk_enable", False)):
                 metrics.update(self._apply_chunk_state_source_chunk(full_batch, state_prompts, chunk_output))
-            if score_mode in {"support_anchor", "support_flow"}:
+            if support_anchor_enable or score_mode in {"support_anchor", "support_flow"}:
                 if source_answer_metadata is None:
                     raise ValueError(
-                        f"chunk_state_score_mode={score_mode!r} requires full-rollout answer metadata"
+                        "chunk-state support anchors require full-rollout answer metadata; "
+                        f"score_mode={score_mode!r}"
                     )
                 metrics.update(
                     self._apply_chunk_state_support_anchors(

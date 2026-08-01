@@ -186,6 +186,9 @@ ttrl:
   # candidate anchors and scores them by the prompt-level full-rollout answer
   # support mass. This keeps the teacher defined by full-group label
   # estimation instead of short-horizon probe hits.
+  # When enabled outside support_anchor/support_flow scoring, these anchors are
+  # only candidate proposals; the active scorer still defines the target.
+  chunk_state_support_anchor_enable: false
   chunk_state_support_anchor_count: 4
   chunk_state_support_anchor_candidate_start: 0
   chunk_state_support_anchor_min_mass: 0.03125
