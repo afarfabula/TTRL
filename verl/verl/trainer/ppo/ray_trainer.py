@@ -2475,6 +2475,7 @@ class RayPPOTrainer:
         )
         responses = responses[keep_indices]
         response_mask = response_mask[keep_indices]
+        flat_boxed_rewards = score_matrix.reshape(-1)[keep_indices].to(dtype=torch.float32)
         flat_weights = weights.reshape(-1)[keep_indices]
         flat_loss_weights = effective_state_loss_weights.repeat_interleave(candidates)[keep_indices]
         flat_weights = flat_weights * flat_loss_weights
@@ -2498,6 +2499,7 @@ class RayPPOTrainer:
                 kept_states = kept_states[balanced_order.tolist()]
                 responses = responses[balanced_order]
                 response_mask = response_mask[balanced_order]
+                flat_boxed_rewards = flat_boxed_rewards[balanced_order]
                 flat_weights = flat_weights[balanced_order]
                 flat_loss_weights = flat_loss_weights[balanced_order]
                 powerflow_flat_weights = powerflow_flat_weights[balanced_order]
@@ -2530,9 +2532,7 @@ class RayPPOTrainer:
             batch_size=(len(keep_indices),),
         )
         response_lengths = response_mask.sum(dim=-1).clamp(min=1).long()
-        actor_batch["boxed_reward"][torch.arange(len(keep_indices)), response_lengths - 1] = score_matrix.reshape(-1)[
-            keep_indices
-        ].to(dtype=torch.float32)
+        actor_batch["boxed_reward"][torch.arange(len(keep_indices)), response_lengths - 1] = flat_boxed_rewards
         actor_proto = DataProto(
             batch=actor_batch,
             non_tensor_batch=kept_states.non_tensor_batch,
@@ -2575,6 +2575,11 @@ class RayPPOTrainer:
             "chunk_state/powerflow_weight_mean": powerflow_flat_weights.mean().detach().item(),
             "chunk_state/powerflow_weight_max": powerflow_flat_weights.max().detach().item(),
             "chunk_state/powerflow_weight_min": powerflow_flat_weights.min().detach().item(),
+            "chunk_state/boxed_reward_mean": flat_boxed_rewards.mean().detach().item(),
+            "chunk_state/boxed_reward_weighted_mean": (
+                (flat_boxed_rewards * powerflow_flat_weights).sum()
+                / powerflow_flat_weights.sum().clamp(min=1e-12)
+            ).detach().item(),
             "chunk_state/actor_batch_powerflow_weight_nonzero_ratio": (powerflow_flat_weights > 0.0).float().mean().detach().item(),
             "chunk_state/actor_batch_powerflow_weight_shard0_mean": powerflow_weight_shards[0].mean().detach().item(),
             "chunk_state/actor_batch_powerflow_weight_shard0_nonzero_ratio": (powerflow_weight_shards[0] > 0.0).float().mean().detach().item(),

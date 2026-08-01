@@ -4275,3 +4275,68 @@ anchored standard:  mean@16=0.501, maj@16=0.624, best@16=0.858, format_mean=0.90
   - 对 next-chunk candidates 的 PowerFlow target 做 answer-consistency residual：只允许局部 probe 目标在不破坏 source majority answer 的条件下增益。
   - 对重复 boxed / 空 boxed / prompt-copy 引入 hard negative 或 format-collapse penalty，避免 format_score 看似高但 mean/maj 低。
   - 评估是否将 chunk state 从随机 mid 边界改成 answer-prefix-aware 边界，减少在无意义位置更新。
+
+## 2026-08-01 Boxed Reward Alignment Fix
+
+问题：
+
+- 在 `_build_chunk_actor_batch` 中，`responses`、`target_weights`、`powerflow_chunk_weights` 会先经过 `keep_indices`，再为了避免 FSDP shard 权重清零做 balanced reorder。
+- 但 `boxed_reward` 仍然从原始 `score_matrix.reshape(-1)[keep_indices]` 直接写入，没有跟随 balanced reorder。
+- 这会导致 standard PowerFlow 中的 reward residual 和实际 next-chunk 样本错位；`target-only` 不受影响，但 anchored standard 会被污染。
+
+修复：
+
+- 新增 `flat_boxed_rewards = score_matrix.reshape(-1)[keep_indices]`。
+- 如果触发 balanced reorder，`flat_boxed_rewards` 与 `responses/weights/powerflow_chunk_weights` 使用同一个 `balanced_order` 重排。
+- `actor_batch["boxed_reward"]` 改为使用重排后的 `flat_boxed_rewards`。
+- 新增 trainer 侧诊断指标：
+  - `chunk_state/boxed_reward_mean`
+  - `chunk_state/boxed_reward_weighted_mean`
+
+3-step smoke：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_anchor_boxfix3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_score=0.5
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+```
+
+关键指标：
+
+```text
+step1:
+  chunk_state/boxed_reward_mean=0.139
+  chunk_state/boxed_reward_weighted_mean=0.561
+  actor/boxed_reward/mean=0.301
+  actor/powerflow_loss=0.199
+  zero_shard_ratio=0.000
+  timing_s/gen=51.099, chunk_state_score=9.116, chunk_state_ref=5.689, update_actor=6.156
+
+step2:
+  chunk_state/boxed_reward_mean=0.120
+  chunk_state/boxed_reward_weighted_mean=0.492
+  actor/boxed_reward/mean=0.300
+  actor/powerflow_loss=0.074
+  zero_shard_ratio=0.000
+  timing_s/gen=22.520, chunk_state_score=9.087, chunk_state_ref=1.930, update_actor=5.859
+
+step3:
+  chunk_state/boxed_reward_mean=0.147
+  chunk_state/boxed_reward_weighted_mean=0.593
+  actor/boxed_reward/mean=0.282
+  actor/powerflow_loss=0.034
+  zero_shard_ratio=0.000
+  timing_s/gen=23.298, chunk_state_score=8.802, chunk_state_ref=1.935, update_actor=6.008
+```
+
+结论：
+
+- 修复后 actor 侧 `boxed_reward/mean` 不再像修复前 anchored 3-step 那样偏低到 `0.031-0.131` 的错位形态，step1 对比也从修复前 `actor/boxed_reward/mean=0.131` 变成 `0.301`。
+- 三步 `actor/powerflow_loss` 均非零，`zero_shard_ratio=0.000`，说明 reward alignment 修复没有破坏 balanced shard 逻辑。
+- 下一步必须重新跑 20-step validation gate。此前 anchored standard 20-step 的失败结论是在 reward/sample 错位条件下得到的，不能作为修复后版本的最终判断。
+- 方法设计继续遵守 TTRL 原文 arXiv 2504.16084 的拆分：同一 state 下多样本先做 label/distribution estimation，再做 reward/target calculation；短 probe hit-rate 只能作为局部 target 的证据之一，不能直接替代最终 answer label。
