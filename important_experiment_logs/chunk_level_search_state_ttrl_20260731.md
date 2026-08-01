@@ -4045,3 +4045,82 @@ arXiv 2504.16084 对当前设计的约束：
 - 该文是 TTRL 原文，核心是无 GT 场景下先做 label estimation，再把估计出的 label/reward 用于 RL 更新。
 - 对 chunk-level search-state TTRL 来说，不能把短 probe hit-rate 直接当成终极监督；更稳的表述应该是：对同一 `query + prefix` state 的 multiple next-chunk candidates 先估计局部 improved continuation distribution，再用 PowerFlow target 做 actor update。
 - 当前 `answer_value_margin + top2 + target_only PowerFlow` 路径已经按这个拆分执行：probe/search 负责 label/distribution estimation，PowerFlow target 负责 reward/target calculation 和参数更新。
+
+## 2026-08-01 Target-Only Chunk PowerFlow 20-Step Gate
+
+误启动记录：
+
+- `RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_balance20_mid_c128_probe4_b32_r32_v64_20260801`
+- 这次从 devbox master 普通 shell 启动，不在 GPU worker 内，Ray 看到 `Total available GPUs 0 is less than total desired GPUs 8` 后退出。
+- 该 run 没有训练，不计入有效实验结果；日志仍保留用于排查启动位置问题。
+
+有效运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_balance20b_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_value_margin=0.125
+ttrl.chunk_state_value_topk=2
+ttrl.chunk_state_format_guard=True
+ttrl.chunk_state_label_consistent_only=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+训练侧统计：
+
+```text
+diag_jsonl_rows=640
+chunk_state/kept_state_ratio avg=0.392 first=0.469 last=0.500 min=0.219 max=0.500
+chunk_state/powerflow_weight_mean avg=0.392 first=0.469 last=0.500 min=0.219 max=0.500
+chunk_state/actor_batch_powerflow_weight_zero_shard_ratio avg=0.000 min=0.000 max=0.000
+chunk_state/positive_ratio avg=0.0817 min=0.049 max=0.119
+chunk_state/target_entropy avg=1.307 min=1.047 max=1.514
+actor/powerflow_loss avg=0.186 first=0.354 last=0.074 min=0.008 max=0.473
+actor/powerflow_weight/nonzero_ratio avg=0.392 first=0.469 last=0.500 min=0.219 max=0.500
+actor/log_z avg=-0.491 first=-1.090 last=-0.231 min=-1.090 max=-0.147
+actor/grad_norm avg=9.904 first=22.397 last=6.448 min=1.572 max=25.017
+timing_s/gen avg=25.476 first=51.246 last=21.296 min=21.296 max=51.246
+timing_s/chunk_state_score avg=9.784 min=8.535 max=11.749
+timing_s/chunk_state_ref avg=1.916 first=5.742 last=1.590 min=1.462 max=5.742
+timing_s/update_actor avg=5.283 first=6.138 last=4.832 min=4.334 max=6.138
+timing_s/testing=301.278
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16 = 0.427
+val-core/math/acc/maj@16/mean = 0.552
+val-core/math/acc/best@16/mean = 0.836
+val-aux/math/format_score/mean@16 = 0.888
+val-aux/math/format_score/maj@16/mean = 0.856
+```
+
+结论：
+
+- infra gate 通过：20 个训练 step 中 `actor_batch_powerflow_weight_zero_shard_ratio` 始终为 `0.000`，说明 shard-balanced actor batch reorder 在长一点的 gate 中也稳定。
+- 性能分解可接受但不够快：稳态 `gen` 约 `21-25s`，`chunk_state_score` 约 `9-12s`，`chunk_state_ref` 约 `1.5-1.9s`，`update_actor` 约 `4.3-5.8s`；第 20 步 validation 约 `301s`。
+- 训练语义失败：20-step final `mean@16=0.427`、`maj@16=0.552`，明显低于 MV/TTRL baseline。虽然 `best@16=0.836` 还保留一部分搜索上限，但 mean/majority 已经严重塌陷。
+- 失败形态很明确：`actor/powerflow_loss` 从 step1 的 `0.354` 衰减到 step20 的 `0.074`，最低到 `0.008`；`actor/log_z` 从 `-1.090` 往 `-0.231` 靠近。当前 target-only chunk PowerFlow 容易把局部分布学成弱更新/退化更新，不能扩 80-step。
+
+下一步判断：
+
+- 不继续扩 `answer_value_margin + top2 + target_only`。
+- 保留已经验证的 infra 修复：shard-balanced reorder 是必要且正确的。
+- 方法侧要回到 2504.16084 的拆分原则，重新设计 label estimation 和 target calculation：
+  - 不能只依赖短 probe 的局部 positive hit-rate。
+  - 需要把 full-rollout majority label / original answer distribution 作为全局 anchor，避免 chunk target 把模型推向空 boxed 或局部格式吸引子。
+  - 下一版优先尝试 `anchored PowerFlow target`：局部 chunk target 只对能保持 source full-answer label 或提升 full-answer consistency 的 candidate 加权，同时加入原始 full rollout answer 分布的保守 anchor，而不是 target-only。
