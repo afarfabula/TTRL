@@ -8604,3 +8604,109 @@ infra 证据：
 - 下一版不要继续在 absolute/relative support replay 之间调参。
 - 需要实现真正的 future/value-gain target：对候选 chunk 后的 longer-horizon 或 staged continuation 估计其 future answer distribution，再用相对 full-rollout support 的 mass gain / top-mass margin / transport improvement 定义 `q_j`。
 - short probe 如果使用，只能作为多阶段估计器的一部分，不能单独决定 teacher。
+
+## 2026-08-01 future-gain smoothed transport smoke
+
+目的：
+
+- 按最新方法纠偏，停止在 `soft_mass` / `soft_relative_mass` 这种 support replay 上继续调参。
+- 使用已有 `future_support_gain` 路径，让 target 来自 `state + candidate chunk + longer-horizon probe` 的 future answer distribution 相对 full-rollout support 的 transport improvement。
+- probe 在这里不是局部 teacher，而是估计 future distribution 的工具；target 由 full-rollout support distribution 主导。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_smoothed_transport_mid_c128_probe1024x4_b32_r32_v64_3step_20260801.sh
+run_id = ttrl_chunk_state_powerflow_futuregain_smoothed_transport_mid_c128_probe1024x4_b32_r32_v64_3step_20260801
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_smoothed_transport_mid_c128_probe1024x4_b32_r32_v64_3step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_smoothed_transport_mid_c128_probe1024x4_b32_r32_v64_3step_20260801.jsonl
+status = completed_3_steps_no_val
+```
+
+配置：
+
+```text
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+train_batch_size = 32
+rollout.n = 32
+N_VOTES_PER_PROMPT = 64
+total_training_steps = 3
+test_freq = -1
+score_mode = future_support_gain
+future_support_score_type = smoothed_transport_support_gain
+future_support_prior_smoothing = 4.0
+future_support_min_state_coverage = 0.125
+future_support_max_state_oov = 0.875
+future_support_min_state_mean_mass = 0.015
+future_support_min_state_max_mass = 0.03125
+future_support_min_state_top_margin = 0.001
+probe_samples = 4
+probe_max_tokens = 1024
+support_anchor_count = 3
+support_anchor_candidate_start = 5
+chunk_size = 128
+candidates = 8
+dynamic_bsz = false
+PowerFlow loss = enabled
+KL loss = disabled
+```
+
+运行确认：
+
+```text
+score_type_smoothed_transport_support_gain = 1.000
+chunk_state_score/mode_future_support_gain = 1.000
+chunk_state_probe/samples = 4.000
+Traceback = 0
+OOM = 0
+Timeout during comparison = 3
+Final validation skipped = expected
+```
+
+3-step 均值：
+
+```text
+chunk_state_future_support_gain/improved_state_ratio = 0.729333
+chunk_state_future_support_gain/positive_margin_mean = 0.137333
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.073333
+chunk_state_future_support_gain/smoothed_transport_affinity_mean = 0.630333
+chunk_state_future_support_gain/transport_affinity_mean = 0.260000
+
+chunk_state_future_support_gain/support_coverage_mean = 0.427667
+chunk_state_future_support_gain/state_oov_mean = 0.572333
+chunk_state_future_support_gain/state_keep_ratio = 0.292000
+chunk_state_future_support_gain/learnable_state_keep_ratio = 0.292000
+chunk_state_future_support_gain/label_consistent_ratio = 0.612000
+chunk_state_future_support_gain/score_mean = 0.094000
+chunk_state_future_support_gain/raw_gain_mean = -0.298667
+
+chunk_state/num_actor_samples = 24.000000
+chunk_state/answer_coverage_mean = 0.427667
+chunk_state/positive_ratio = 0.094000
+chunk_state/target_entropy = 1.928000
+chunk_state/kept_state_ratio = 0.292000
+
+actor/powerflow_loss = 0.285667
+actor/grad_norm = 6.264000
+timing_s/gen = 34.521333
+timing_s/chunk_state_probe = 5.266333
+timing_s/chunk_state_score = 7.815333
+timing_s/chunk_state_ref = 1.645000
+timing_s/update_actor = 1.145667
+```
+
+结论：
+
+- 这是目前最符合方法目标的一版：3 个 step 都有正的 future-support improvement signal，`positive_margin_mean` 从 support replay 的负值转为正值。
+- target 仍然依赖 full-rollout support distribution；probe 只是估计 candidate 后的 future distribution，不是 short-horizon local hit teacher。
+- 主要问题是信号稀疏：`state_keep_ratio=0.292`、`num_actor_samples=24`，20-step 直接扩可能训练过弱。
+- 但方向上优于 `soft_mass` / `soft_relative_mass`，后两者只是 support replay，不能证明 transition improvement。
+- actor update 很快，均值约 1.15s；额外开销主要在 probe 和 score，均值合计约 13s，工程上可接受作为 pilot。
+
+下一步：
+
+- 不回退到 support replay 或 source hard teacher。
+- 优先提高 candidate/proposal 的 support coverage，让 positive future-gain state 更多，而不是降低成局部短视 target。
+- 最小下一版可以保持 `future_support_gain + smoothed_transport_support_gain`，把 support-suffix proposal 的覆盖从 3 个提高到 5-7 个，或放松 state gate 后跑 3-step/20-step 对比。
+- 20-step gate 通过标准：`state_keep_ratio` 不低于约 0.4、`num_actor_samples` 不低于约 32-48、`positive_margin_mean` 保持正，再看 validation。
