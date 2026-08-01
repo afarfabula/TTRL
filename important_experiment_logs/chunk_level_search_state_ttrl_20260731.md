@@ -4199,3 +4199,79 @@ timing_s/update_actor: [6.215, 5.441, 6.047], avg=5.901
 
 - 启动同配置 20-step validation gate。
 - 若 20-step `mean@16/maj@16` 仍明显低于 MV baseline，则不要继续扩 80-step；优先调整 anchor target 的 score/floor 或 chunk label estimation，而不是再调 infra 参数。
+
+## 2026-08-01 Anchored Standard Chunk PowerFlow 20-Step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_anchor_standard20_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_value_margin=0.125
+ttrl.chunk_state_value_topk=2
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_score=0.5
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16 = 0.501
+val-core/math/acc/maj@16/mean = 0.624
+val-core/math/acc/best@16/mean = 0.858
+val-aux/math/format_score/mean@16 = 0.9045
+val-aux/math/format_score/maj@16/mean = 0.882708
+timing_s/testing = 299.221
+diag_jsonl_rows = 640
+```
+
+训练侧摘要：
+
+```text
+chunk_state_source_chunk/injected_ratio: all 1.000
+chunk_state_teacher_anchor/replaced_ratio: all 1.000
+chunk_state/actor_batch_powerflow_weight_zero_shard_ratio: all 0.000
+chunk_state/kept_state_ratio: roughly 0.34-0.69, step20=0.594
+actor/powerflow_loss: nonzero throughout, examples step1=0.105, step10=0.264, step11=0.046, step15=0.045, step20=0.084
+timing_s/gen steady: about 21-24s after warmup
+timing_s/chunk_state_score steady: about 8-12s, with occasional SymPy timeout spikes
+timing_s/update_actor steady: about 4.7-5.5s
+```
+
+对比 target-only 20-step：
+
+```text
+target-only:        mean@16=0.427, maj@16=0.552, best@16=0.836, format_mean=0.888
+anchored standard:  mean@16=0.501, maj@16=0.624, best@16=0.858, format_mean=0.9045
+```
+
+结论：
+
+- Anchored standard 明显好于 target-only，说明 source chunk / teacher anchor / boxed residual 确实缓解了 target-only 的局部 target 退化。
+- 但该版本仍没有接近 MV/TTRL 20-step baseline，不能扩 80-step。按当前 20-step 指标，它仍是失败 gate。
+- 失败不是 infra 问题：20 步 `zero_shard_ratio=0.000`，anchor 全程注入，final validation 正常完成。
+- 主要问题仍在训练语义：chunk-level improved distribution 的估计太弱，且 teacher anchor score floor=0.5 只提供保守锚点，没有足够约束模型保持 full-answer majority distribution；validation 样本中已经出现重复 boxed/题面复读现象。
+
+下一版方向：
+
+- 不继续扩 `target-only` 或当前 `teacher_anchor_score=0.5` 的 anchored standard。
+- 优先改 target construction，而不是调 infra：
+  - 把 full-rollout answer distribution 作为显式 source/teacher 分布，而不只是 candidate 0 score floor。
+  - 对 next-chunk candidates 的 PowerFlow target 做 answer-consistency residual：只允许局部 probe 目标在不破坏 source majority answer 的条件下增益。
+  - 对重复 boxed / 空 boxed / prompt-copy 引入 hard negative 或 format-collapse penalty，避免 format_score 看似高但 mean/maj 低。
+  - 评估是否将 chunk state 从随机 mid 边界改成 answer-prefix-aware 边界，减少在无意义位置更新。
