@@ -6938,3 +6938,114 @@ all_positive = 0.297
 - 但这不是可扩 20-step 的正结果：OOV-aware transport 仍然显示 candidate future distribution 离 full-rollout support 很远，step2 `candidate_oov_tv_mean=0.756`、`transport_affinity_mean=0.244`、`transport_gain_mean=-0.212`。也就是说，大多数 chunk 的后续 completion 仍没有比 source baseline 更接近 full support。
 - `state_top_margin_mean` 约 0.05，比之前接近 0 的 state-gate 略好，但区分度仍弱；`answer_coverage` 均值只有 0.366，说明主要问题仍是 state/probe distribution，而不是 loss 或 actor update。
 - 下一步不应扩 20 step。更合理的路线是把 transport affinity 作为 target 诊断指标，转向 staged / longer-horizon state selection：先从 full rollout group 选 coverage 高、top-mass margin 高的 prompt/state，再对 candidate 做分阶段 probe 或 beam-style continuation，使 candidate future distribution 真正进入 support 后再做 PowerFlow matching。
+
+## 2026-08-01 Transport Affinity Long-Context Probe 1-Step 设计
+
+目的：
+
+- 修正上一轮 `transport_affinity_mid_c128_probe4_long` 的一个重要观测偏差：launcher 中 `MAX_RESPONSE_LENGTH=1024`，导致 vLLM `max_model_len=2048`，trainer 内部实际 probe tokens 被 `max_model_len - max_prompt_len` 裁到约 1024；所以 `probe_max_tokens=2048` 并没有真正形成 2k+ future horizon。
+- 本轮只做 1-step smoke，把 `MAX_RESPONSE_LENGTH=3072`、`max_model_len=4096`、`probe_max_tokens=3072` 打开，验证真实 long-horizon probe 是否能把 candidate future distribution 拉进 full-rollout support。
+- 继续使用 `transport_affinity`，不引入 GT，不回到 short-probe local correctness teacher。
+
+运行计划：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_longctx_c128_probe4_b32_r32_v64_1step_20260801.sh
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+actor_rollout_ref.rollout.n = 32
+MAX_RESPONSE_LENGTH = 3072
+actor_rollout_ref.rollout.max_model_len = 4096
+ROLLOUT_MAX_NUM_BATCHED_TOKENS = 65536
+GPU_MEMORY_UTILIZATION = 0.86
+trainer.total_training_steps = 1
+trainer.final_val_enable = False
+ttrl.chunk_state_score_mode = future_support_gain
+ttrl.chunk_state_future_support_score_type = transport_affinity
+ttrl.chunk_state_probe_samples = 4
+ttrl.chunk_state_probe_max_tokens = 3072
+ttrl.chunk_state_chunk_size = 128
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+Gate：
+
+- 如果真实 long-horizon 后 `support_coverage_mean` 仍低于约 0.50、`candidate_oov_tv_mean` 仍高于约 0.65、`transport_gain_mean` 仍为负，则说明问题不只是 probe horizon，而是 state/candidate distribution 本身没有走向 full support。
+- 如果 coverage / transport affinity 明显改善，再考虑同配置跑 2-3 step；否则记录为负结果，不扩 20 step。
+
+结果：
+
+第一次启动失败：
+
+```text
+run = ttrl_chunk_state_powerflow_future_support_transport_affinity_longctx_c128_probe4_b32_r32_v64_1step_20260801
+status = failed before training
+error = validate_socket_filename failed: AF_UNIX path length cannot exceed 107 bytes
+bad path = /tmp/cfsg_transport_affinity_longctx_1step/ray/ray/session_.../sockets/plasma_store
+resolution = 将 TTRL_RUNTIME_DIR 缩短为 /tmp/cfsglc1，并改为直接调用 8GPU launcher，避免父脚本重复 Hydra override
+```
+
+rerun1 完整跑完 1 step：
+
+```text
+run = ttrl_chunk_state_powerflow_future_support_transport_affinity_longctx_c128_probe4_b32_r32_v64_1step_20260801_rerun1
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+max_model_len = 4096
+dynamic_bsz = False
+final_validation = skipped
+
+support_coverage_mean = 0.479
+candidate_coverage_mean = 0.479
+state_oov_mean = 0.521
+candidate_oov_tv_mean = 0.738
+source_oov_tv_mean = 0.579
+transport_affinity_mean = 0.262
+transport_gain_mean = -0.159
+tv_gain_mean = -0.112
+state_top_margin_mean = 0.029
+label_consistent_ratio = 0.703
+future_support_keep_ratio = 0.906
+num_actor_samples = 176
+target_entropy = 1.653
+powerflow_weight_max = 3.150
+grad_norm = 33.139
+
+timing_s/gen = 43.381
+timing_s/chunk_state_chunks = 1.063
+timing_s/chunk_state_probe = 17.195
+timing_s/chunk_state_score = 11.363
+timing_s/chunk_state_ref = 6.182
+timing_s/update_actor = 6.688
+```
+
+diag 聚合：
+
+```text
+jsonl_rows = 32
+answer_coverage mean = 0.479, min = 0.000, max = 0.969
+probe_mean mean = 0.262, min = 0.000, max = 0.668
+probe_max mean = 0.364, min = 0.000, max = 0.750
+source_answer_mass mean = 0.421, min = 0.048, max = 0.808
+source_original_correct mean = 0.844
+future_support_keep mean = 0.906
+future_support_state_top_margin mean = 0.029
+boundary mean = 552, min = 0, max = 1024
+source_response_len mean = 1257.5, min = 227, max = 3072
+state_all_positive_ratio = 0.531
+state_all_negative_ratio = 0.094
+state_mixed_ratio = 0.375
+```
+
+结论：
+
+- 工程链路通过：8x B200、Qwen2.5-Math-7B、MATH-TTT、`FLASH_ATTN`、CUDA graph capture、FlashInfer autotune、NCCL 单机 P2P/CUMEM/NVLS channels 都正常；`use_dynamic_bsz=False`；Ray AF_UNIX path 问题由短 runtime dir 解决。
+- 真实 long-horizon probe 没有通过方法 gate。`support_coverage_mean=0.479` 低于 0.50，`candidate_oov_tv_mean=0.738` 高于 0.65，`transport_gain_mean=-0.159` 仍为负。也就是说，单纯把 probe horizon 从约 1k 拉到 3k，并没有让 candidate future distribution 比 source baseline 更接近 full-rollout support。
+- 这支持当前核心判断：最该放弃的是“局部短视可判定性”约束，而不是 PowerFlow loss、hardfilter/clip4 或 full-group label-estimation 原则。继续让 chunk target 主要由 short-horizon local answer hit / source consistency / 局部 probe 命中来定义，会把 noisy local-answer reward 当成 search-improvement target。
+- 下一步目标应改为 full-rollout group 主导 target：先由完整 32/64 rollout 定义 prompt-level support、majority/pass/coverage/value；state 优先来自高 coverage、高 top-mass margin、majority-consistent 的中后段；candidate score 计算为对该 full support 的 future distribution transport improvement。source chunk 只保留为 prior / drift guard，不再作为主要 teacher 或 hard floor。
+- 在 target 质量没有改善前，不扩这个 longctx transport 配置到 20 step。
