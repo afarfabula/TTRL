@@ -2416,6 +2416,142 @@ class RayPPOTrainer:
         }
         return scores, metrics
 
+    def _score_chunk_state_future_support_gain(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        probe_output: DataProto,
+        candidates: int,
+        probe_samples: int,
+    ) -> tuple[torch.Tensor, dict]:
+        from verl.utils.reward_score.ttrl_math import extract_answer, simplify_expression_string
+
+        if len(probe_output) != len(chunk_output) * probe_samples:
+            raise ValueError(
+                f"Expected {len(chunk_output) * probe_samples} probe outputs, got {len(probe_output)}"
+            )
+        if "chunk_state_prompt_answer_mass" not in state_prompts.non_tensor_batch:
+            raise ValueError("chunk_state_score_mode='future_support_gain' requires full-rollout answer metadata")
+
+        cfg = self.config.ttrl
+        min_mass = float(cfg.get("chunk_state_future_support_min_mass", 0.0))
+        max_mass_coef = float(cfg.get("chunk_state_future_support_max_mass_coef", 0.25))
+        gain_slack = float(cfg.get("chunk_state_future_support_gain_slack", 0.125))
+        baseline_scale = float(cfg.get("chunk_state_future_support_baseline_scale", 1.0))
+        source_prior_weight = float(cfg.get("chunk_state_future_support_source_prior_weight", 1.0))
+        source_prior_idx = int(cfg.get("chunk_state_source_chunk_candidate_index", 0))
+        prompt_mass_values = [
+            json.loads(str(value)) if str(value) else {}
+            for value in state_prompts.non_tensor_batch["chunk_state_prompt_answer_mass"]
+        ]
+        source_answer_mass = torch.as_tensor(
+            np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_answer_mass",
+                    np.zeros(len(state_prompts), dtype=np.float32),
+                ),
+                dtype=np.float32,
+            ),
+            dtype=torch.float32,
+        )
+        prompt_top_mass = torch.tensor(
+            [max((float(v) for v in mass_map.values()), default=0.0) for mass_map in prompt_mass_values],
+            dtype=torch.float32,
+        )
+
+        chunk_mask = chunk_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool()
+        mass_values = []
+        valid_values = []
+        for probe_idx in range(len(probe_output)):
+            chunk_idx = probe_idx // probe_samples
+            state_idx = chunk_idx // candidates
+            chunk_len = int(chunk_mask[chunk_idx].sum().item())
+            probe_len = int(probe_mask[probe_idx].sum().item())
+            response_ids = torch.cat(
+                [
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                    probe_output.batch["responses"][probe_idx, :probe_len],
+                ],
+                dim=0,
+            )
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            answer_text = "" if answer is None else str(answer).strip()
+            mass = (
+                float(prompt_mass_values[state_idx].get(answer_text, 0.0))
+                if answer_text and answer_text != "None"
+                else 0.0
+            )
+            if mass < min_mass:
+                mass = 0.0
+            mass_values.append(mass)
+            valid_values.append(1.0 if mass > 0.0 else 0.0)
+
+        mass_tensor = torch.tensor(mass_values, dtype=torch.float32).view(len(state_prompts), candidates, probe_samples)
+        valid_tensor = torch.tensor(valid_values, dtype=torch.float32).view(
+            len(state_prompts), candidates, probe_samples
+        )
+        mean_mass = mass_tensor.mean(dim=-1)
+        max_mass = mass_tensor.max(dim=-1).values
+        future_value = mean_mass + max_mass_coef * max_mass
+        source_baseline = (source_answer_mass * baseline_scale).view(len(state_prompts), 1)
+        raw_gain = future_value - source_baseline
+        score_matrix = (raw_gain + gain_slack).clamp(min=0.0, max=1.0)
+        scores = score_matrix.reshape(-1)
+        label_consistent = (score_matrix > 0.0).to(dtype=torch.float32)
+
+        prior = torch.ones_like(score_matrix)
+        if source_prior_weight > 0.0 and 0 <= source_prior_idx < candidates:
+            prior[:, source_prior_idx] = source_prior_weight
+        state_prompts.non_tensor_batch["chunk_state_target_prior"] = prior.cpu().numpy().astype(np.float32)
+
+        support_coverage = valid_tensor.mean(dim=(1, 2)).detach().cpu().numpy().astype(np.float32)
+        mean_mass_arr = mean_mass.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        max_mass_arr = max_mass.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+        gain_arr = raw_gain.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        source_mass_arr = source_answer_mass.detach().cpu().numpy().astype(np.float32)
+        prompt_top_mass_arr = prompt_top_mass.detach().cpu().numpy().astype(np.float32)
+        improved_state = (raw_gain.max(dim=-1).values > 0.0).float().detach().cpu().numpy().astype(np.float32)
+
+        state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = prompt_top_mass_arr
+        state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = support_coverage
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
+            np.float32
+        )
+        metrics = {
+            "chunk_state_future_support_gain/group_size": float(candidates * probe_samples),
+            "chunk_state_future_support_gain/min_mass": min_mass,
+            "chunk_state_future_support_gain/max_mass_coef": max_mass_coef,
+            "chunk_state_future_support_gain/gain_slack": gain_slack,
+            "chunk_state_future_support_gain/baseline_scale": baseline_scale,
+            "chunk_state_future_support_gain/source_prior_weight": source_prior_weight,
+            "chunk_state_future_support_gain/source_mass_mean": float(source_mass_arr.mean())
+            if len(source_mass_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/prompt_top_mass_mean": float(prompt_top_mass_arr.mean())
+            if len(prompt_top_mass_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/support_coverage_mean": float(support_coverage.mean())
+            if len(support_coverage)
+            else 0.0,
+            "chunk_state_future_support_gain/mean_mass_mean": float(mean_mass_arr.mean()) if len(mean_mass_arr) else 0.0,
+            "chunk_state_future_support_gain/max_mass_mean": float(max_mass_arr.mean()) if len(max_mass_arr) else 0.0,
+            "chunk_state_future_support_gain/raw_gain_mean": float(gain_arr.mean()) if len(gain_arr) else 0.0,
+            "chunk_state_future_support_gain/score_mean": score_matrix.mean().item()
+            if len(score_matrix)
+            else 0.0,
+            "chunk_state_future_support_gain/label_consistent_ratio": label_consistent.mean().item()
+            if len(label_consistent)
+            else 0.0,
+            "chunk_state_future_support_gain/improved_state_ratio": float(improved_state.mean())
+            if len(improved_state)
+            else 0.0,
+        }
+        return scores, metrics
+
     def _score_chunk_state_answer_distribution(
         self,
         state_prompts: DataProto,
@@ -2928,6 +3064,17 @@ class RayPPOTrainer:
         else:
             label_consistent = (score_matrix > 0.0).float()
         raw_weights = torch.pow(score_matrix + eps, alpha)
+        target_prior = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_target_prior",
+                np.ones((num_states, candidates), dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        )
+        if target_prior.shape != raw_weights.shape:
+            target_prior = target_prior.reshape(raw_weights.shape)
+        target_prior = target_prior.clamp(min=0.0)
+        raw_weights = raw_weights * target_prior
         weight_sums = raw_weights.sum(dim=-1, keepdim=True)
         uniform = torch.full_like(raw_weights, 1.0 / candidates)
         weights = torch.where(weight_sums > 0, raw_weights / weight_sums.clamp(min=1e-12), uniform)
@@ -3064,6 +3211,8 @@ class RayPPOTrainer:
             "chunk_state/informative_ratio": informative.mean().detach().item(),
             "chunk_state/kept_state_ratio": keep_state.float().mean().detach().item(),
             "chunk_state/target_entropy": (-(weights * torch.log(weights.clamp(min=1e-12))).sum(dim=-1).mean()).detach().item(),
+            "chunk_state/target_prior_mean": target_prior.mean().detach().item(),
+            "chunk_state/target_prior_max": target_prior.max().detach().item(),
             "chunk_state/weight_max": weights.max().detach().item(),
             "chunk_state/weight_min": weights.min().detach().item(),
             "chunk_state/powerflow_weight_mean": powerflow_flat_weights.mean().detach().item(),
@@ -3114,6 +3263,7 @@ class RayPPOTrainer:
         if bool(cfg.get("chunk_state_target_guard_enable", False)) or score_mode in {
             "answer_support_mass",
             "answer_source_consistency",
+            "future_support_gain",
         }:
             source_answer_metadata = self._compute_full_rollout_answer_metadata(full_batch)
 
@@ -3263,6 +3413,18 @@ class RayPPOTrainer:
                 metrics["chunk_state_probe/raw_positive_ratio"] = support_mass_metrics[
                     "chunk_state_answer_support_mass/score_mean"
                 ]
+            elif score_mode == "future_support_gain":
+                scores, future_support_metrics = self._score_chunk_state_future_support_gain(
+                    state_prompts=state_prompts,
+                    chunk_output=chunk_output,
+                    probe_output=probe_output,
+                    candidates=candidates,
+                    probe_samples=probe_samples,
+                )
+                metrics.update(future_support_metrics)
+                metrics["chunk_state_probe/raw_positive_ratio"] = future_support_metrics[
+                    "chunk_state_future_support_gain/score_mean"
+                ]
             elif score_mode == "answer_source_consistency":
                 scores, source_consistency_metrics = self._score_chunk_state_answer_source_consistency(
                     state_prompts=state_prompts,
@@ -3283,6 +3445,7 @@ class RayPPOTrainer:
             metrics["chunk_state_score/mode_answer_value_gain"] = float(score_mode == "answer_value_gain")
             metrics["chunk_state_score/mode_answer_value_margin"] = float(score_mode == "answer_value_margin")
             metrics["chunk_state_score/mode_answer_support_mass"] = float(score_mode == "answer_support_mass")
+            metrics["chunk_state_score/mode_future_support_gain"] = float(score_mode == "future_support_gain")
             metrics["chunk_state_score/mode_answer_source_consistency"] = float(
                 score_mode == "answer_source_consistency"
             )

@@ -124,6 +124,15 @@ ttrl:
   # chunk state tied to its own full-trajectory answer instead of any answer in
   # the global prompt support.
   chunk_state_answer_source_consistency_enable: false
+  # future_support_gain uses the prompt-level full-rollout answer support as
+  # label estimation, then scores a next chunk by whether longer-horizon probes
+  # move future completions toward that support relative to the selected source
+  # answer mass. The source chunk can enter as a prior, not a hard score floor.
+  chunk_state_future_support_min_mass: 0.03125
+  chunk_state_future_support_max_mass_coef: 0.25
+  chunk_state_future_support_gain_slack: 0.125
+  chunk_state_future_support_baseline_scale: 1.0
+  chunk_state_future_support_source_prior_weight: 2.0
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.

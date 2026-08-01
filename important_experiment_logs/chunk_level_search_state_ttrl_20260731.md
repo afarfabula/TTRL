@@ -5353,3 +5353,113 @@ timing_s/update_actor = 5.587
 - 该 target 显著提高了 chunk supervision 密度：raw positive 从 support-mass 的约 0.19 提到约 0.42，guard 后 positive 约 0.33，state_positive_ratio 约 0.71；说明把 state 绑定到 source final answer 能提供更强的局部信号。
 - 但不建议原样扩 20 step：`powerflow_weight_max=7.787` 三步固定偏尖，`distribution_oov_probe_ratio` 仍约 0.52，step3 candidate repeated boxed ratio 升到 0.086。按前面多次 gate 经验，这类尖权重 + OOV/重复风险很容易在 20 step 退化。
 - 下一步若继续该方向，应先做温度/权重裁剪或 listwise smoothing：例如限制 `powerflow_weight_max`，或把 source-answer consistency 与 full answer mass 混合成 soft target，而不是 hard 0/1 consistency 直接进 PowerFlow。
+
+## 2026-08-01 Future-Support-Gain 3-Step Smoke
+
+背景：
+
+- 用户明确指出当前多条 chunk gate 的主要问题是“chunk-local short probe 决定 target”，而不是 TTRL 原文 `2504.16084` 强调的 group-level label/value estimation。
+- 本轮收敛到一个更窄的版本：full rollout group 先形成 prompt-level support distribution；chunk/probe 只估计 future completion 是否相对 source answer mass 更靠近该 support。
+- source chunk 保留为 target prior，不再作为 hard teacher floor；target 是 per-state sharpened soft distribution，不是 binary correctness reward。
+
+代码改动：
+
+```text
+新增 _score_chunk_state_future_support_gain
+新增 ttrl.chunk_state_score_mode=future_support_gain
+新增 chunk_state_target_prior，actor target raw_weights 会乘以 prior 后归一化
+source chunk candidate 可作为 prior，默认不改变 candidate score / boxed reward
+新增 chunk_state_score/mode_future_support_gain
+```
+
+score 定义：
+
+```text
+prompt support: full 32 rollout answer mass map
+future_value_j = mean_probe_support_mass_j + max_mass_coef * max_probe_support_mass_j
+baseline = source_answer_mass
+score_j = clamp(future_value_j - baseline + gain_slack, 0, 1)
+q_j ∝ (score_j + eps)^alpha * prior_j
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_score_mode=future_support_gain
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_future_support_min_mass=0.03125
+ttrl.chunk_state_future_support_max_mass_coef=0.25
+ttrl.chunk_state_future_support_gain_slack=0.125
+ttrl.chunk_state_future_support_baseline_scale=1.0
+ttrl.chunk_state_future_support_source_prior_weight=2.0
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_min_answer_coverage=0.25
+ttrl.chunk_state_label_consistent_only=True
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_candidate_enable=True
+```
+
+产物：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_gain_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 平均：
+
+```text
+source_mass_mean = 0.397
+prompt_top_mass_mean = 0.398
+support_coverage_mean = 0.486
+mean_mass_mean = 0.188
+max_mass_mean = 0.316
+raw_gain_mean = -0.143
+score_mean = 0.084
+label_consistent_ratio = 0.565
+improved_state_ratio = 0.521
+kept_candidate_ratio = 0.436
+distribution_oov_probe_ratio = 0.514
+repeated_boxed_probe_ratio = 0.078
+candidate_repeated_boxed_probe_ratio = 0.005
+probe_mean_source_original_correct = 0.092
+probe_mean_source_original_wrong = 0.015
+positive_ratio_after_guard = 0.076
+kept_state_ratio = 0.531
+target_entropy = 1.816
+target_prior_mean = 1.125
+weight_max = 0.664
+powerflow_weight_max = 5.315
+boxed_reward_weighted_mean = 0.190
+actor_powerflow_loss = 0.097
+actor_grad_norm = 3.743
+```
+
+Timing：
+
+```text
+timing_s/gen = 38.646   # step1 includes warmup/JIT, step2/3 about 32s
+timing_s/chunk_state_probe = 6.756
+timing_s/chunk_state_score = 10.943
+timing_s/chunk_state_ref = 3.457
+timing_s/update_actor = 5.960
+```
+
+结论：
+
+- 工程 smoke 通过：3 step 完整，diag 96 行，final validation 按预期跳过，PowerFlow loss 非零，`chunk_state_score/mode_future_support_gain=1.0`。
+- 相比 hard `answer_source_consistency`，这版更接近用户要求的 search-improved distribution distillation：score 不再是 probe 是否打中 source answer，而是 future support value 相对 source answer mass 的 soft gain。
+- 好现象：source-correct state 的 future score 明显高于 wrong source state，`0.092 vs 0.015`，说明 target 与完整 rollout 质量有方向一致性；candidate repeated boxed 均值只有 `0.005`，比 hard source-consistency 的 `0.038` 稳。
+- 风险仍然明显：support coverage 只有 `0.486`，OOV 仍有 `0.514`，raw gain 平均为负；这说明多数 chunk/probe 还没有把 future completion 推向 full support，当前只靠 `gain_slack=0.125` 保留了一些 soft signal。
+- 不建议立刻扩 20 step。下一步应提高 state/probe 质量后再 gate：
+  - 提高 `chunk_state_min_answer_coverage` 到 0.45 或 0.50，直接跳过低覆盖 state。
+  - 降低 `gain_slack` 或改成 per-state top-k smoothing，避免负 gain 也被过多保留。
+  - 尝试更长 probe horizon 或少量增加 probe samples，目标是把 OOV 降到 0.40 以下。
+  - 保留 source prior，但进一步限制 `powerflow_weight_max`，避免尖权重重复早期退化。
