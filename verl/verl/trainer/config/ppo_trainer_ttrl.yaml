@@ -78,6 +78,11 @@ ttrl:
   chunk_state_min_majority_ratio: 0.0
   chunk_state_min_answer_coverage: 0.0
   chunk_state_confidence_power: 0.0
+  # Optional source-selection gates for support-driven chunk objectives.
+  # Defaults are neutral. When enabled, they skip prompts/source rollouts whose
+  # full-rollout answer support is too weak to define a reliable state target.
+  chunk_state_min_prompt_top_mass: 0.0
+  chunk_state_min_source_answer_mass: 0.0
   # If enabled with majority_completion scoring, build PowerFlow targets from
   # candidates whose completions match the state-level majority label. This
   # keeps the 2504.16084 label-estimation semantics separate from soft

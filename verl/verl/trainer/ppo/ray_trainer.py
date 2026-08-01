@@ -1170,6 +1170,13 @@ class RayPPOTrainer:
         min_boundary = int(cfg.get("chunk_state_min_boundary", 0))
         source_mode = str(cfg.get("chunk_state_source_mode", "random"))
         boundary_mode = str(cfg.get("chunk_state_boundary_mode", "cycle"))
+        min_prompt_top_mass = float(cfg.get("chunk_state_min_prompt_top_mass", 0.0))
+        min_source_answer_mass = float(cfg.get("chunk_state_min_source_answer_mass", 0.0))
+        if (min_prompt_top_mass > 0.0 or min_source_answer_mass > 0.0) and source_answer_metadata is None:
+            raise ValueError(
+                "chunk-state support source gates require full-rollout answer metadata; "
+                "enable a support-based score/guard path or pass source_answer_metadata"
+            )
         if not boundaries:
             boundaries = [0]
         min_required_response_len = max([b for b in boundaries if b >= min_boundary], default=min_boundary)
@@ -1179,6 +1186,26 @@ class RayPPOTrainer:
         max_prompt_length = int(self.config.data.max_prompt_length)
         pad_token_id = self.tokenizer.pad_token_id
         full_response_lens = batch.batch["response_mask"].bool().sum(dim=-1).detach().cpu()
+        source_answer_mass_arr = None
+        prompt_top_mass_arr = None
+        if source_answer_metadata is not None:
+            source_answer_mass_arr = np.asarray(source_answer_metadata["source_answer_mass"], dtype=np.float32)
+            prompt_top_mass_arr = np.asarray(
+                [
+                    max((float(v) for v in json.loads(str(value)).values()), default=0.0)
+                    if str(value)
+                    else 0.0
+                    for value in source_answer_metadata["prompt_answer_mass"]
+                ],
+                dtype=np.float32,
+            )
+
+        def _intersect_locals(base: torch.Tensor, allowed: Optional[torch.Tensor]) -> torch.Tensor:
+            if allowed is None or base.numel() == 0:
+                return base
+            if allowed.numel() == 0:
+                return allowed
+            return base[torch.isin(base, allowed)]
 
         state_input_ids = []
         state_attention_masks = []
@@ -1189,6 +1216,7 @@ class RayPPOTrainer:
         source_response_lengths = []
         state_loss_weights = []
         skipped_short_sources = 0
+        skipped_support_sources = 0
         majority_consistent_fallbacks = 0
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
@@ -1200,6 +1228,22 @@ class RayPPOTrainer:
                     prompt_response_lens >= min_required_response_len,
                     as_tuple=False,
                 ).flatten()
+                if prompt_top_mass_arr is not None and min_prompt_top_mass > 0.0:
+                    if float(prompt_top_mass_arr[prompt_idx]) < min_prompt_top_mass:
+                        skipped_support_sources += 1
+                        continue
+                mass_good_locals = None
+                if source_answer_mass_arr is not None and min_source_answer_mass > 0.0:
+                    prompt_source_masses = torch.as_tensor(
+                        source_answer_mass_arr[prompt_start:prompt_stop],
+                        dtype=torch.float32,
+                    )
+                    mass_good_locals = torch.nonzero(
+                        prompt_source_masses >= min_source_answer_mass,
+                        as_tuple=False,
+                    ).flatten()
+                    if min_required_response_len > 0 and long_locals.numel() > 0:
+                        mass_good_locals = _intersect_locals(mass_good_locals, long_locals)
                 if source_mode == "success" and source_correctness is not None:
                     prompt_scores = source_correctness[prompt_start:prompt_stop]
                     good_locals = torch.nonzero(prompt_scores > 0.0, as_tuple=False).flatten()
@@ -1208,8 +1252,12 @@ class RayPPOTrainer:
                         long_good_locals = long_locals[long_good_mask]
                         if long_good_locals.numel() > 0:
                             good_locals = long_good_locals
+                    good_locals = _intersect_locals(good_locals, mass_good_locals)
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
+                    elif min_source_answer_mass > 0.0:
+                        skipped_support_sources += 1
+                        continue
                     elif min_required_response_len > 0 and long_locals.numel() > 0:
                         source_local = int(long_locals[source_offset % long_locals.numel()].item())
                     elif min_required_response_len > 0:
@@ -1225,8 +1273,13 @@ class RayPPOTrainer:
                         long_good_locals = long_locals[long_good_mask]
                         if long_good_locals.numel() > 0:
                             good_locals = long_good_locals
+                    good_locals = _intersect_locals(good_locals, mass_good_locals)
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
+                    elif min_source_answer_mass > 0.0:
+                        majority_consistent_fallbacks += 1
+                        skipped_support_sources += 1
+                        continue
                     elif min_required_response_len > 0 and long_locals.numel() > 0:
                         majority_consistent_fallbacks += 1
                         source_local = int(long_locals[source_offset % long_locals.numel()].item())
@@ -1237,6 +1290,11 @@ class RayPPOTrainer:
                     else:
                         majority_consistent_fallbacks += 1
                         source_local = source_offset % n
+                elif mass_good_locals is not None and mass_good_locals.numel() > 0:
+                    source_local = int(mass_good_locals[source_offset % mass_good_locals.numel()].item())
+                elif min_source_answer_mass > 0.0:
+                    skipped_support_sources += 1
+                    continue
                 elif min_required_response_len > 0 and long_locals.numel() > 0:
                     source_local = int(long_locals[source_offset % long_locals.numel()].item())
                 elif min_required_response_len > 0:
@@ -1345,6 +1403,9 @@ class RayPPOTrainer:
         state_non_tensor["chunk_state_skipped_short_sources"] = np.asarray(
             [skipped_short_sources] * len(source_indices), dtype=np.int64
         )
+        state_non_tensor["chunk_state_skipped_support_sources"] = np.asarray(
+            [skipped_support_sources] * len(source_indices), dtype=np.int64
+        )
         state_non_tensor["chunk_state_majority_consistent_fallbacks"] = np.asarray(
             [majority_consistent_fallbacks] * len(source_indices), dtype=np.int64
         )
@@ -1375,6 +1436,10 @@ class RayPPOTrainer:
             )
             state_non_tensor["chunk_state_source_answer_mass"] = np.asarray(
                 [source_answer_metadata["source_answer_mass"][idx] for idx in selected_source_indices],
+                dtype=np.float32,
+            )
+            state_non_tensor["chunk_state_source_prompt_top_mass"] = np.asarray(
+                [prompt_top_mass_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
                 dtype=np.float32,
             )
             state_non_tensor["chunk_state_prompt_answer_counts"] = np.asarray(
@@ -1414,6 +1479,10 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
             dtype=torch.float32,
         )
+        skipped_support_sources = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_skipped_support_sources", np.asarray([0])),
+            dtype=torch.float32,
+        )
         majority_consistent_fallbacks = torch.as_tensor(
             state_prompts.non_tensor_batch.get("chunk_state_majority_consistent_fallbacks", np.asarray([0])),
             dtype=torch.float32,
@@ -1437,6 +1506,7 @@ class RayPPOTrainer:
                 "chunk_state_diag/boundary_max": boundaries.max().item(),
                 "chunk_state_diag/boundary_zero_ratio": (boundaries == 0).float().mean().item(),
                 "chunk_state_diag/skipped_short_sources": skipped_short_sources.max().item(),
+                "chunk_state_diag/skipped_support_sources": skipped_support_sources.max().item(),
                 "chunk_state_diag/majority_consistent_fallbacks": majority_consistent_fallbacks.max().item(),
                 "chunk_state_diag/real_state_count": real_state_count.max().item(),
                 "chunk_state_diag/pad_state_count": pad_state_count.max().item(),
@@ -1470,6 +1540,33 @@ class RayPPOTrainer:
                     else 0.0,
                     "chunk_state_diag/source_prompt_majority_ratio_mean": float(source_prompt_majority_ratio.mean())
                     if source_prompt_majority_ratio.size
+                    else 0.0,
+                }
+            )
+
+        source_answer_mass = state_prompts.non_tensor_batch.get("chunk_state_source_answer_mass", None)
+        if source_answer_mass is not None:
+            source_answer_mass = np.asarray(source_answer_mass, dtype=np.float32)
+            source_prompt_top_mass = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_prompt_top_mass",
+                    np.zeros_like(source_answer_mass),
+                ),
+                dtype=np.float32,
+            )
+            metrics.update(
+                {
+                    "chunk_state_diag/source_answer_mass_mean": float(source_answer_mass.mean())
+                    if source_answer_mass.size
+                    else 0.0,
+                    "chunk_state_diag/source_answer_mass_min": float(source_answer_mass.min())
+                    if source_answer_mass.size
+                    else 0.0,
+                    "chunk_state_diag/source_prompt_top_mass_mean": float(source_prompt_top_mass.mean())
+                    if source_prompt_top_mass.size
+                    else 0.0,
+                    "chunk_state_diag/source_prompt_top_mass_min": float(source_prompt_top_mass.min())
+                    if source_prompt_top_mass.size
                     else 0.0,
                 }
             )
@@ -1541,6 +1638,10 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
             dtype=np.int64,
         )
+        skipped_support_sources = np.asarray(
+            state_prompts.non_tensor_batch.get("chunk_state_skipped_support_sources", np.asarray([0])),
+            dtype=np.int64,
+        )
         loss_weights = np.asarray(
             state_prompts.non_tensor_batch.get("chunk_state_loss_weight", np.ones(len(state_prompts), dtype=np.float32)),
             dtype=np.float32,
@@ -1570,6 +1671,12 @@ class RayPPOTrainer:
         answer_coverage = state_prompts.non_tensor_batch.get("chunk_state_answer_coverage", None)
         if answer_coverage is not None:
             answer_coverage = np.asarray(answer_coverage, dtype=np.float32)
+        source_answer_mass = state_prompts.non_tensor_batch.get("chunk_state_source_answer_mass", None)
+        if source_answer_mass is not None:
+            source_answer_mass = np.asarray(source_answer_mass, dtype=np.float32)
+        source_prompt_top_mass = state_prompts.non_tensor_batch.get("chunk_state_source_prompt_top_mass", None)
+        if source_prompt_top_mass is not None:
+            source_prompt_top_mass = np.asarray(source_prompt_top_mass, dtype=np.float32)
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         rows = 0
@@ -1585,6 +1692,9 @@ class RayPPOTrainer:
                     "boundary": int(boundaries[state_idx]),
                     "source_response_len": int(source_response_lens[state_idx]),
                     "skipped_short_sources": int(skipped_short_sources.max()) if skipped_short_sources.size else 0,
+                    "skipped_support_sources": (
+                        int(skipped_support_sources.max()) if skipped_support_sources.size else 0
+                    ),
                     "loss_weight": float(loss_weights[state_idx]),
                     "real_state_count": int(real_state_count.max()) if real_state_count.size else len(state_prompts),
                     "pad_state_count": int(pad_state_count.max()) if pad_state_count.size else 0,
@@ -1595,6 +1705,12 @@ class RayPPOTrainer:
                         float(source_majority_consistent[state_idx])
                         if source_majority_consistent is not None
                         else None
+                    ),
+                    "source_answer_mass": (
+                        float(source_answer_mass[state_idx]) if source_answer_mass is not None else None
+                    ),
+                    "source_prompt_top_mass": (
+                        float(source_prompt_top_mass[state_idx]) if source_prompt_top_mass is not None else None
                     ),
                     "source_prompt_majority_ratio": (
                         float(source_prompt_majority_ratios[state_idx])

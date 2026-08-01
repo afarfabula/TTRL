@@ -5879,3 +5879,109 @@ step3: boundary_mean=532, source_correct=0.719, coverage=0.438, probe_mean=0.018
 - 这是一个负结果：candidate quality gate 保留了约 56%-66% candidate，但 `score_mean` 和 `label_consistent_ratio` 在过滤前后完全一致。说明当前 positive-gain target 本来就只来自 support 内 probe，简单 candidate coverage / mean-mass gate 不会进一步改善 target。
 - target 质量瓶颈仍在 state/source/probe 分布：step3 `support_coverage=0.438`、`OOV=0.562`，比 clip4 还差；这版不应扩 20 step。
 - 下一步应从 state selection 和 probe horizon 改，而不是继续加 candidate gate：例如只选 prompt full-rollout support coverage 更高、majority mass 更强的 prompt/state；或者增加/拉长 probe，使 future support mass 不再被大量 OOV/empty answer 稀释。
+
+## 2026-08-01 Future-Support-Gain Source Gate 3-Step Smoke
+
+目的：
+
+- 验证用户最新纠正里的一个关键假设：先用 full rollout group support 做 prompt/state label estimation，优先从 prompt top answer mass 和 source answer mass 更高的 majority-consistent rollout 里截中后段 state。
+- source chunk 继续只作为 prior / drift guard，不直接决定 target；target 仍由 `future_support_gain + PowerFlow distribution matching` 产生。
+- 这轮只做 3-step smoke，不做 validation；目标是看 state/source 支持过滤能不能降低 OOV、提高 support coverage，并保持有效 actor samples。
+
+代码改动：
+
+```text
+新增默认关闭配置：
+  ttrl.chunk_state_min_prompt_top_mass: 0.0
+  ttrl.chunk_state_min_source_answer_mass: 0.0
+
+在 majority-consistent source selection 内：
+  prompt_top_mass = max(full_rollout_answer_support)
+  source_answer_mass = full_rollout_answer_support[source_answer]
+  当 prompt_top_mass 或 source_answer_mass 低于阈值时跳过该 source
+
+新增日志：
+  chunk_state_future_support_gain/source_mass_mean
+  chunk_state_future_support_gain/prompt_top_mass_mean
+  chunk_state_diag/skipped_support_sources
+  chunk_state_diag/source_answer_mass_mean/min
+  chunk_state_diag/source_prompt_top_mass_mean/min
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_sourcegate_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_sourcegate_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_min_prompt_top_mass=0.35
+ttrl.chunk_state_min_source_answer_mass=0.35
+ttrl.chunk_state_powerflow_weight_clip=4.0
+ttrl.chunk_state_powerflow_weight_clip_renorm=True
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_gain_sourcegate_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_sourcegate_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 40
+```
+
+3 step 关键指标：
+
+```text
+step1:
+  selected_original_acc_mean = 1.000
+  source_mass_mean = 0.548
+  support_coverage_mean = 0.248
+  distribution_oov_probe_ratio = 0.752
+  skipped_support_sources = 18
+  real_state_count = 14
+  pad_state_count = 2
+  num_actor_samples = 8
+  powerflow_weight_max = 1.639
+  update_actor = 0.733s
+
+step2:
+  selected_original_acc_mean = 0.875
+  source_mass_mean = 0.594
+  support_coverage_mean = 0.414
+  distribution_oov_probe_ratio = 0.586
+  skipped_support_sources = 25
+  real_state_count = 7
+  pad_state_count = 1
+  num_actor_samples = 8
+  powerflow_weight_max = 1.406
+  update_actor = 0.390s
+
+step3:
+  selected_original_acc_mean = 1.000
+  source_mass_mean = 0.502
+  support_coverage_mean = 0.311
+  distribution_oov_probe_ratio = 0.689
+  skipped_support_sources = 20
+  real_state_count = 12
+  pad_state_count = 4
+  num_actor_samples = 16
+  powerflow_weight_max = 1.664
+  update_actor = 0.562s
+```
+
+diag jsonl 聚合：
+
+```text
+rows = 40
+source_answer_mass_mean = 0.539, min = 0.360, max = 0.793
+source_prompt_top_mass_mean = 0.539, min = 0.360, max = 0.793
+loss_weight_mean = 0.825, min = 0.0, max = 1.0
+boundary_mean = 790.4, min = 384, max = 1024
+```
+
+结论：
+
+- 这是一个负结果，不应扩 20 step。source gate 确实把 selected source 变得更“可信”：`selected_original_acc_mean` 在 step1/3 为 1.0，`source_mass_mean` 约 0.50-0.59，说明 prompt/source support gate 生效了。
+- 但它没有解决 chunk target 的核心问题，反而明显削弱训练信号：`support_coverage_mean` 只有 0.25-0.41，`OOV` 高达 0.59-0.75，`num_actor_samples` 只有 8/8/16。actor update 变快主要是因为样本被裁掉了，不是有效 infra 提速。
+- 这说明“full rollout support 更强的 source”不等价于“中间 state 更可学习”。强筛 source 会偏向高置信完整轨迹，但这些 state 的 chunk continuation 仍然大量落在 full group support 之外，short probe 仍不足以构造稳定的 search-improved distribution。
+- 下一步不要继续加 source mass gate。更合理的方向是：先用 full group 建 prompt-level support，再对 state 本身做可学习性过滤，例如 future support coverage、candidate OOV/malformed、top answer mass margin、source continuation transport/KL improvement；同时考虑更长 horizon 或多阶段 probe，让 score 真正表示“靠近 full-rollout group 认为好的答案分布”的未来质量提升。
