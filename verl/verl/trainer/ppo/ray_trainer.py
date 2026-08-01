@@ -1063,7 +1063,7 @@ class RayPPOTrainer:
         reward_tensor, _ = compute_reward(original_batch, self.reward_fn)
         return reward_tensor.sum(dim=-1).detach().cpu().float()
 
-    def _compute_full_rollout_majority_consistency(self, batch: DataProto) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute_full_rollout_majority_consistency(self, batch: DataProto) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
         from verl.trainer.ppo.ttrl_utils import _batch_majority_vote
         from verl.utils.reward_score.ttrl_math import extract_answer, grade, simplify_expression_string
 
@@ -1105,6 +1105,7 @@ class RayPPOTrainer:
         return (
             torch.tensor(consistency, dtype=torch.float32),
             torch.tensor(majority_ratios, dtype=torch.float32),
+            list(majority_labels),
         )
 
     def _make_chunk_state_prompts(
@@ -1113,6 +1114,7 @@ class RayPPOTrainer:
         source_correctness: Optional[torch.Tensor] = None,
         source_majority_consistent: Optional[torch.Tensor] = None,
         source_majority_ratios: Optional[torch.Tensor] = None,
+        source_majority_labels: Optional[list[str]] = None,
     ) -> tuple[DataProto, list[int]]:
         cfg = self.config.ttrl
         n = int(cfg.n_samples_per_prompt)
@@ -1312,6 +1314,11 @@ class RayPPOTrainer:
             selected_prompt_indices = np.asarray(source_prompt_indices, dtype=np.int64)
             state_non_tensor["chunk_state_source_prompt_majority_ratio"] = (
                 source_majority_ratios[selected_prompt_indices].numpy().astype(np.float32)
+            )
+        if source_majority_labels is not None:
+            state_non_tensor["chunk_state_prompt_majority_label"] = np.asarray(
+                [source_majority_labels[prompt_idx] for prompt_idx in source_prompt_indices],
+                dtype=object,
             )
         state_proto = DataProto(batch=state_batch, non_tensor_batch=state_non_tensor)
         state_proto.meta_info = {
@@ -1769,6 +1776,106 @@ class RayPPOTrainer:
         }
         return scores, metrics
 
+    def _score_chunk_state_answer_consensus(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        probe_output: DataProto,
+        candidates: int,
+        probe_samples: int,
+    ) -> tuple[torch.Tensor, dict]:
+        from verl.utils.reward_score.ttrl_math import extract_answer, grade, simplify_expression_string
+
+        if len(probe_output) != len(chunk_output) * probe_samples:
+            raise ValueError(
+                f"Expected {len(chunk_output) * probe_samples} probe outputs, got {len(probe_output)}"
+            )
+        if "chunk_state_prompt_majority_label" not in state_prompts.non_tensor_batch:
+            raise ValueError("chunk_state_score_mode='answer_consensus' requires prompt-level majority labels")
+
+        state_labels = [str(x) for x in state_prompts.non_tensor_batch["chunk_state_prompt_majority_label"]]
+        chunk_mask = chunk_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool()
+        probe_scores = []
+        answer_coverage = []
+        state_positive_counts = [0 for _ in range(len(state_prompts))]
+        state_answer_counts = [0 for _ in range(len(state_prompts))]
+        for probe_idx in range(len(probe_output)):
+            chunk_idx = probe_idx // probe_samples
+            state_idx = chunk_idx // candidates
+            chunk_len = int(chunk_mask[chunk_idx].sum().item())
+            probe_len = int(probe_mask[probe_idx].sum().item())
+            response_ids = torch.cat(
+                [
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                    probe_output.batch["responses"][probe_idx, :probe_len],
+                ],
+                dim=0,
+            )
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            label = state_labels[state_idx]
+            has_answer = answer is not None and answer != "None"
+            has_label = label != "None"
+            if has_answer:
+                state_answer_counts[state_idx] += 1
+            if not has_answer or not has_label:
+                score = 0.0
+            elif answer == label:
+                score = 1.0
+            else:
+                score = 1.0 if grade(answer, label) else 0.0
+            state_positive_counts[state_idx] += int(score > 0.0)
+            probe_scores.append(score)
+
+        group_size = candidates * probe_samples
+        raw_probe_scores = torch.tensor(probe_scores, dtype=torch.float32)
+        score_matrix = raw_probe_scores.view(len(state_prompts), candidates, probe_samples).mean(dim=-1)
+        scores = score_matrix.reshape(-1)
+        label_consistent = (score_matrix > 0.0).to(dtype=torch.float32)
+        majority_ratios_arr = np.asarray(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_source_prompt_majority_ratio",
+                np.ones(len(state_prompts), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        answer_coverage_arr = np.asarray(
+            [count / max(group_size, 1) for count in state_answer_counts],
+            dtype=np.float32,
+        )
+        state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = majority_ratios_arr
+        state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = answer_coverage_arr
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
+            np.float32
+        )
+        metrics = {
+            "chunk_state_answer_consensus/group_size": float(group_size),
+            "chunk_state_answer_consensus/majority_ratio_mean": float(majority_ratios_arr.mean())
+            if len(majority_ratios_arr)
+            else 0.0,
+            "chunk_state_answer_consensus/majority_ratio_min": float(majority_ratios_arr.min())
+            if len(majority_ratios_arr)
+            else 0.0,
+            "chunk_state_answer_consensus/answer_coverage_mean": float(answer_coverage_arr.mean())
+            if len(answer_coverage_arr)
+            else 0.0,
+            "chunk_state_answer_consensus/raw_positive_ratio": raw_probe_scores.mean().item()
+            if len(raw_probe_scores)
+            else 0.0,
+            "chunk_state_answer_consensus/label_consistent_ratio": label_consistent.mean().item()
+            if len(label_consistent)
+            else 0.0,
+            "chunk_state_answer_consensus/state_positive_ratio": float(
+                np.mean([count > 0 for count in state_positive_counts])
+            )
+            if state_positive_counts
+            else 0.0,
+        }
+        return scores, metrics
+
     def _repeat_non_tensor_like(self, source: DataProto, target: DataProto, repeat_times: int) -> DataProto:
         if len(target) == len(source) * repeat_times:
             target.non_tensor_batch = {
@@ -2102,12 +2209,15 @@ class RayPPOTrainer:
         source_correctness = None
         source_majority_consistent = None
         source_majority_ratios = None
+        source_majority_labels = None
         if source_mode in {"success"} or bool(cfg.get("chunk_state_diag_enable", False)):
             source_correctness = self._compute_original_gt_rewards(full_batch)
-        if source_mode == "majority_consistent":
-            source_majority_consistent, source_majority_ratios = self._compute_full_rollout_majority_consistency(
-                full_batch
-            )
+        if source_mode == "majority_consistent" or str(cfg.get("chunk_state_score_mode", "")) == "answer_consensus":
+            (
+                source_majority_consistent,
+                source_majority_ratios,
+                source_majority_labels,
+            ) = self._compute_full_rollout_majority_consistency(full_batch)
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
             state_prompts, _ = self._make_chunk_state_prompts(
@@ -2115,6 +2225,7 @@ class RayPPOTrainer:
                 source_correctness=source_correctness,
                 source_majority_consistent=source_majority_consistent,
                 source_majority_ratios=source_majority_ratios,
+                source_majority_labels=source_majority_labels,
             )
             if source_correctness is not None:
                 n = int(cfg.n_samples_per_prompt)
@@ -2193,9 +2304,22 @@ class RayPPOTrainer:
                 metrics["chunk_state_probe/raw_positive_ratio"] = majority_metrics[
                     "chunk_state_majority_completion/raw_positive_ratio"
                 ]
+            elif score_mode == "answer_consensus":
+                scores, consensus_metrics = self._score_chunk_state_answer_consensus(
+                    state_prompts=state_prompts,
+                    chunk_output=chunk_output,
+                    probe_output=probe_output,
+                    candidates=candidates,
+                    probe_samples=probe_samples,
+                )
+                metrics.update(consensus_metrics)
+                metrics["chunk_state_probe/raw_positive_ratio"] = consensus_metrics[
+                    "chunk_state_answer_consensus/raw_positive_ratio"
+                ]
             else:
                 raise ValueError(f"Unsupported ttrl.chunk_state_score_mode={score_mode!r}")
             metrics["chunk_state_score/mode_majority_completion"] = float(score_mode == "majority_completion")
+            metrics["chunk_state_score/mode_answer_consensus"] = float(score_mode == "answer_consensus")
             metrics["chunk_state_probe/samples"] = float(probe_samples)
             if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
                 anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))

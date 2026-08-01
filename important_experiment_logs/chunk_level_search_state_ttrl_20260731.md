@@ -3218,3 +3218,70 @@ teacher-anchor mid-state c128:
 - 失败说明 naive future chunk anchor 只能减少局部 target 噪声，不能保证 chunk-level improved distribution 指向最终正确性。
 - 下一步不应继续调 PowerFlow 权重或直接扩 80-step；应参考 arXiv 2504.16084 的 state-level 多输出 label estimation / reward calculation / online self-improvement 思路，把 `query + partial reasoning` state 下的 candidate scoring 改成更强的 answer-level verifier 或 longer-horizon probe 聚合。
 - infra 侧当前端到端主要由 full rollout `~25.2s`、chunk probe `~6.7s`、math parser/scoring `~10.9s`、actor update `~7.4s` 构成；SymPy warning/timeout 仍是 chunk search 实验的主要工程噪声源。
+
+## 2026-08-01 Answer-consensus Mid-state c128 3-step Smoke
+
+动机：
+
+- 用户补充参考 arXiv 2504.16084。该文的关键处理是：给定同一 state，采多个输出，先做 label estimation，再用 rule/verifier 对每个输出计算 reward；即便 label accuracy 不高，逐样本 reward 仍可能因为 scattered wrong answers / lucky hit 而保持可用。
+- 当前 majority-completion chunk scoring 的问题是只用 `chunk + probe` 的局部 completion majority，teacher-anchor 只能把 source future chunk 放进候选，但仍不能保证 improved distribution 指向最终正确性。
+- 本轮新增 `chunk_state_score_mode=answer_consensus`：复用 full rollout 的 prompt-level majority label，给每个 `state + next_chunk + probe` completion 做 answer-level rule reward。训练 loss 仍然是 PowerFlow，不切 GRPO。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  _compute_full_rollout_majority_consistency 额外返回 prompt-level majority labels
+  _make_chunk_state_prompts 将对应 prompt consensus label 写入 chunk_state_prompt_majority_label
+  新增 _score_chunk_state_answer_consensus
+  在 chunk_state_score_mode 分支接入 answer_consensus
+
+run_records/ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  复用 majority-consistent mid-state c128 配置
+  ttrl.chunk_state_score_mode=answer_consensus
+  关闭 teacher_anchor 和 source_chunk 注入，先只验证 scoring 语义
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_score_mode=answer_consensus
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_min_majority_ratio=0.25
+chunk_state_min_answer_coverage=0.60
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+answer_consensus_majority_ratio=0.331
+answer_consensus_answer_coverage=0.755
+answer_consensus_raw_positive_ratio=0.396
+answer_consensus_label_consistent_ratio=0.586
+answer_consensus_state_positive_ratio=0.750
+kept_state_ratio=0.375
+target_entropy=1.756
+actor/powerflow_loss=0.109
+actor/grad_norm=4.252
+timing_s/gen=32.730
+timing_s/chunk_state_score=8.935
+timing_s/update_actor=7.801
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP/vLLM 崩溃，`chunk_state_score/mode_answer_consensus=1.0`。
+- 新 scoring 确实产生 answer-level reward：`raw_positive_ratio=0.396`，`state_positive_ratio=0.750`。
+- 但沿用旧的 `min_majority_ratio=0.25` 后只保留 `37.5%` state，训练信号偏稀；这和 arXiv 2504.16084 的分析相冲突，因为它强调 majority label 低精度时逐样本 reward 仍可能有用，不应过度用 majority ratio gate 丢掉样本。
+- 下一步跑 20-step gate 前应放宽 `chunk_state_min_majority_ratio`，保留 answer-consensus 的 dense reward；同时继续保持 `min_answer_coverage=0.60`，避免无可解析答案的状态进入训练。
