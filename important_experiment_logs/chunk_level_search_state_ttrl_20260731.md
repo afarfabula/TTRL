@@ -2140,3 +2140,98 @@ step3: gen=22.701s chunk_state_probe=6.473s chunk_state_score=11.578s update_act
 - smoke 通过。PowerFlow chunk actor update 正常，且 all-negative state 的零权重逻辑生效。
 - step1 慢主要来自 worker/vLLM/FSDP/JIT warmup；step2/3 回到当前 chunk-state 链路的稳定区间。
 - 该版本比 sourcechunk 20-step gate 更合理，因为不会把无信息 state 当成有效 target 训练。下一步可做 20-step gate；如果 20-step 仍失败，应继续改 target construction，而不是回到 GRPO 或 weighted NLL。
+
+## 2026-08-01 Source Chunk + Skip All-negative PowerFlow 20-step Gate
+
+配置延续 3-step smoke：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_sourcechunk_skipneg_probe4_b32_r32_v64_20step_20260801
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+trainer.total_training_steps=20
+trainer.test_freq=20
+trainer.final_val_enable=True
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_source_chunk_candidate_index=0
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_skip_uniform=False
+ttrl.chunk_state_min_informative_gap=0.0
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+actor.use_dynamic_bsz=False
+```
+
+运行产物：
+
+```text
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_sourcechunk_skipneg_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_sourcechunk_skipneg_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+worker=1024321, 8x NVIDIA B200
+```
+
+最终 validation：
+
+```text
+val-core/math/acc/mean@16=0.401
+val-core/math/acc/maj@16/mean=0.506
+val-core/math/acc/best@16/mean=0.813
+val-aux/math/format_score/mean@16=0.890
+val-aux/math/format_score/maj@16/mean=0.853
+timing_s/testing=301.707
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.875
+chunk_state_source/prompt_original_pass=0.875
+chunk_state_source/prompt_original_mean=0.309
+chunk_state_source_chunk/injected_ratio=1.000
+chunk_state_source_chunk/mean_len=233.156
+chunk_state_probe/raw_positive_ratio=0.262
+chunk_state_diag/state_all_positive_ratio=0.125
+chunk_state_diag/state_all_negative_ratio=0.375
+chunk_state_diag/state_mixed_ratio=0.500
+chunk_state/zeroed_state_ratio=0.375
+chunk_state/kept_state_ratio=0.625
+chunk_state/target_entropy=1.650
+actor/powerflow_loss=0.338
+actor/grad_norm=9.563
+timing_s/gen=23-25s steady range before validation
+timing_s/chunk_state_probe=6.6-7.0s steady range
+timing_s/chunk_state_score=11-12s steady range
+timing_s/update_actor=7.5-8.3s steady range
+```
+
+结论：
+
+- 20-step gate 仍失败：`mean@16=0.401`、`maj@16=0.506`，和 TTRL/MV 对齐基线的 20-step 目标相差很大；相对上一版 sourcechunk/no-anchor `mean@16=0.390125` 只小幅改善。
+- PowerFlow chunk actor update 路径已经启用，失败不是因为误跑成 GRPO 或 weighted NLL；当前问题集中在 chunk target construction。
+- `skip_all_negative` 过滤是必要但不充分的。step20 仍有 `state_all_negative_ratio=0.375`，有效训练 state 只剩 `0.625`；同时 `raw_positive_ratio=0.262`，说明 future probe 给出的局部分布依然稀疏且噪声大。
+- validation 出现明显极长/重复输出，且 `timing_s/testing=301.707s`。这会放大 SymPy/parser timeout，也会使 chunk probe 的 target 更不稳；后续需要增加答案解析 fast path/cache，以及对异常长重复输出做监控。
+
+## TTRL 2504.16084 对 Chunk 设计的约束
+
+从 TTRL 原文方法段抽出的关键约束：
+
+- 原始 TTRL 的 state 是 prompt `x`，action 是完整输出 `y ~ pi_theta(y|x)`。
+- 每个 state 必须采多个 candidate outputs `{y_i}`，再由 majority/aggregation 得到 consensus `y*`，最后用 `r(y,y*)` 形成训练 reward。
+- 原文强调有效性来自三件事：label estimation、reward calculation、online learning。
+- 多输出 rollout 的价值不只是给一个伪标签，而是提供更稠密、更稳健的 reward signal；即使 label 不完全准，rollout 内的多个输出也能通过 negative reward / lucky hit 保留方向性。
+- Qwen2.5-Math 设置里，原文使用 `64` responses 做 voting label estimation，再 downsample `32` responses per prompt 训练。
+
+对 chunk-state 版本的含义：
+
+- chunk state 应该是 `query + generated prefix`，但它仍然必须遵守“同一个 state 下多输出估计 reward/distribution”的 TTRL 语义。
+- 当前做法把 successful source chunk 注入 support，但本质更像 hard source teacher + short probe，不足以复现 TTRL 原文的多输出稳健 reward 机制。
+- 下一版不应回退到 GRPO；仍以 PowerFlow distribution matching 为 actor update 主 loss，但 target 要改成 chunk-level vote/reward accuracy gate：对同一个 state 采多个 next chunk，用这些 chunk 的后续 rollout 聚合出更稳健的 improved distribution，再做 PowerFlow。
+- 具体可先做两个 gate：
+  1. 只训练 vote/probe 有足够信息量的 state，例如 `max_score - mean_score` 或 positive count 达阈值。
+  2. target 不是单条 successful source chunk，而是同一 state 下多 candidate 的 search-improved distribution。
