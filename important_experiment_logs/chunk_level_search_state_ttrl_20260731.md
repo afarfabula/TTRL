@@ -3984,3 +3984,64 @@ timing_s/update_actor=6.166
 - 这是一个实现/infra 修复，不改变 chunk scoring 语义，也不改变 PowerFlow loss 公式。它只保证 search-improved positive chunks 不会因为 batch ordering 被集中分配到少数 DP shard。
 - 修复后所有 shard 都有正权重，`zero_shard_ratio` 从 `0.250` 降到 `0.000`，rank0 actor loss 从 `0.000` 变为 `0.177`。
 - 下一步应跑同配置 3-step balance smoke，确认三步 `actor/powerflow_loss` 都非零；若通过，再进入 20-step validation gate。
+
+## 2026-08-01 Target-Only Chunk PowerFlow 3-Step Balance Smoke
+
+运行配置：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_balance3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_value_margin=0.125
+ttrl.chunk_state_value_topk=2
+ttrl.chunk_state_format_guard=True
+ttrl.chunk_state_label_consistent_only=True
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.powerflow_use_chunk_weights=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+关键结果：
+
+```text
+diag_jsonl_rows=96
+chunk_state/powerflow_weight_mean: [0.469, 0.437, 0.438], avg=0.448
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio: [0.469, 0.438, 0.438], avg=0.448
+chunk_state/actor_batch_powerflow_weight_shard0_mean: [0.615, 0.605, 0.567], avg=0.596
+chunk_state/actor_batch_powerflow_weight_shard0_nonzero_ratio: [0.469, 0.438, 0.438], avg=0.448
+chunk_state/actor_batch_powerflow_weight_shard_mean_low: [0.379, 0.366, 0.374], avg=0.373
+chunk_state/actor_batch_powerflow_weight_shard_mean_high: [0.615, 0.605, 0.567], avg=0.596
+chunk_state/actor_batch_powerflow_weight_zero_shard_ratio: [0.000, 0.000, 0.000], avg=0.000
+actor/powerflow_loss: [0.668, 0.654, 0.251], avg=0.524
+actor/powerflow_weight/mean: [0.615, 0.605, 0.567], avg=0.596
+actor/powerflow_weight/nonzero_ratio: [0.469, 0.438, 0.438], avg=0.448
+actor/grad_norm: [36.075, 23.063, 17.323], avg=25.487
+timing_s/gen: [51.940, 23.641, 22.254], avg=32.612
+timing_s/chunk_state_score: [9.115, 10.959, 8.638], avg=9.571
+timing_s/chunk_state_ref: [5.704, 1.818, 1.838], avg=3.120
+timing_s/update_actor: [6.100, 5.582, 5.620], avg=5.767
+```
+
+结论：
+
+- 3-step gate 通过。三步 `actor/powerflow_loss` 全部非零，且 `actor_batch_powerflow_weight_zero_shard_ratio=0.000`，说明 shard-balanced reorder 已经解决正权重样本集中到少数 DP shard 的问题。
+- 第一步 `timing_s/gen=51.940` 包含 vLLM/Triton 首次 shape JIT；step2/step3 稳态 rollout gen 约 `22-24s`，chunk scoring 约 `8.6-11.0s`，chunk ref 约 `1.8s`，actor update 约 `5.6s`。
+- 当前 20-step gate 的主要风险已经不是 actor loss 清零，而是 `answer_value_margin` 的局部 target 是否真的带来 validation 提升。下一步进入同配置 20-step validation gate。
+
+arXiv 2504.16084 对当前设计的约束：
+
+- 该文是 TTRL 原文，核心是无 GT 场景下先做 label estimation，再把估计出的 label/reward 用于 RL 更新。
+- 对 chunk-level search-state TTRL 来说，不能把短 probe hit-rate 直接当成终极监督；更稳的表述应该是：对同一 `query + prefix` state 的 multiple next-chunk candidates 先估计局部 improved continuation distribution，再用 PowerFlow target 做 actor update。
+- 当前 `answer_value_margin + top2 + target_only PowerFlow` 路径已经按这个拆分执行：probe/search 负责 label/distribution estimation，PowerFlow target 负责 reward/target calculation 和参数更新。
