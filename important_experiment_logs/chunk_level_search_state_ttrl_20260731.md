@@ -2017,3 +2017,71 @@ step3: gen=22.817s chunk_state_probe=6.673s chunk_state_score=11.130s update_act
 - 这个 smoke 通过。source chunk 100% 注入，PowerFlow loss 正常，且没有启用 teacher-anchor score floor。
 - 相比上一版 success-source/no-anchor 3-step，step3 的 `state_all_negative_ratio` 从 0.219 降到 0.188，`informative_ratio` 从 0.781 升到 0.812；step1 positive ratio 也从 0.310 升到 0.341。
 - 这说明“把成功轨迹 next chunk 纳入 support，再用 probe-improved PowerFlow 分布软更新”是更合理的 target construction。下一步进入 20-step gate，看 final validation 能否摆脱前一版 `mean@16=0.4335` 的失败区间。
+
+## 2026-07-31 Source Chunk Support + PowerFlow 20-step Gate
+
+配置延续 3-step smoke：
+
+```text
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+trainer.total_training_steps=20
+trainer.test_freq=20
+trainer.final_val_enable=True
+ttrl.chunk_state_source_mode=success
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_source_chunk_candidate_index=0
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+actor.use_dynamic_bsz=False
+```
+
+运行产物：
+
+```text
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_sourcechunk_probe4_b32_r32_v64_20step_20260731.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_sourcechunk_probe4_b32_r32_v64_20step_20260731.jsonl
+diag_jsonl_rows=640
+```
+
+最终 validation：
+
+```text
+val-core/math/acc/mean@16=0.390125
+val-core/math/acc/maj@16/mean=0.5003960000000001
+val-core/math/acc/best@16/mean=0.81548
+val-aux/math/format_score/mean@16=0.88225
+val-aux/math/format_score/maj@16/mean=0.8471900000000001
+timing_s/testing=301.412
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.906
+chunk_state_source_chunk/injected_ratio=1.000
+chunk_state_source_chunk/mean_len=227.750
+chunk_state_probe/raw_positive_ratio=0.305
+chunk_state_diag/state_all_positive_ratio=0.156
+chunk_state_diag/state_all_negative_ratio=0.281
+chunk_state_diag/state_mixed_ratio=0.562
+chunk_state/positive_ratio=0.305
+chunk_state/informative_ratio=0.719
+actor/powerflow_loss=0.563
+actor/grad_norm=12.067
+timing_s/gen=22.747
+timing_s/chunk_state_probe=6.846
+timing_s/chunk_state_score=11.798
+timing_s/update_actor=8.485
+```
+
+结论：
+
+- 这个 20-step gate 失败，且比上一版 success-source/no-anchor 20-step 还差：`mean@16` 从 `0.4335` 降到 `0.390125`，`maj@16` 从 `0.55015` 降到 `0.500396`。
+- PowerFlow loss 已经接在 chunk actor update 上；失败不是因为走成 GRPO 或 weighted NLL，而是 target construction 噪声仍然过大。
+- 单纯把 successful source next chunk 加进 support 不够。虽然注入率是 1.0，但 step20 仍有 `state_all_negative_ratio=0.281`，且 positive ratio 只有 `0.305`。
+- 下一步继续优先用 PowerFlow distribution matching，但必须先过滤或降权 all-negative / 弱信息 chunk state，避免无区分度的 probe 结果参与 actor update。
