@@ -8362,3 +8362,150 @@ all_negative_mean = 0
 - 基于这一版启动 20-step gate：每 20 step 做 val，优先看 `mean@16/maj@16/best@16` 是否至少不低于复现 MV 的 step20。
 - 20-step 过程中保留这些诊断：`answer_coverage_mean`、`support_anchor_injected_ratio`、`support_flow_positive_margin_mean`、`num_actor_samples`、`actor/grad_norm`、`timing_s/update_actor`。
 - 若 20-step 不稳，下一版不回退到 short-probe teacher，而是在 support-flow 内改 score：从 `soft_mass` 升级为 `soft_relative_mass` 或 value-margin target，并加入低信息 state skip。
+
+## 2026-08-01 support-flow suffix soft-mass 20-step gate
+
+背景：
+
+- 本轮把上一节通过 smoke 的 support-flow suffix soft-mass 配置扩到 20-step gate。
+- 第一次启动使用 `trainer.total_epochs=1`，在 batch32 的 MATH-TTT dataloader 下自然只跑到 step15，没有触发 `test_freq=20` validation。这不是模型崩溃，而是 launcher 的 epoch 上限截断。
+- 已修正 launcher：增加 `TOTAL_EPOCHS=2`，保持 `TOTAL_TRAINING_STEPS=20`、`TEST_FREQ=20`，用 `rerun1` 独立 run id 从头重跑。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801.sh
+
+first_run_id = ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801
+first_run_status = stopped_after_step15_due_to_total_epochs_1
+first_raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801.log
+first_diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801.jsonl
+
+rerun_id = ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801_rerun1
+rerun_status = completed_step20_and_validation
+rerun_raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801_rerun1.log
+rerun_diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_20step_20260801_rerun1.jsonl
+```
+
+配置确认：
+
+```text
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+train_batch_size = 32
+rollout.n = 32
+N_VOTES_PER_PROMPT = 64
+VAL_N = 16
+total_training_steps = 20
+total_epochs = 2
+test_freq = 20
+dynamic_bsz = false
+score_mode = support_flow
+support_flow_score_type = soft_mass
+support_anchor_count = 7
+source_chunk_candidate_index = 0
+chunk_size = 128
+candidates = 8
+PowerFlow loss = enabled
+KL loss = disabled
+```
+
+first run 诊断：
+
+```text
+steps_seen = 15
+validation = not_triggered
+diag_rows = 160
+Traceback = 0
+OOM = 0
+Timeout during comparison = 3
+
+step15 answer_coverage_mean = 0.805
+step15 num_actor_samples = 88
+step15 support_flow_positive_margin_mean = -0.203
+step15 update_actor = 3.424s
+```
+
+first run 结论：
+
+- `trainer.total_epochs=1` 会让 20-step gate 在一个 epoch 结束时提前退出，必须设成 `TOTAL_EPOCHS=2` 或更高。
+- 这个问题解释了为什么第一次没有 val；它不是算法崩溃，也不是 GPU/Ray 失败。
+
+rerun1 训练统计：
+
+```text
+steps_seen = 20
+diag_rows = 216
+Timeout during comparison = 10
+Traceback = 0
+OOM = 0
+progress_end = about 22min
+
+answer_coverage_mean = 0.8085
+answer_coverage_min = 0.617
+answer_coverage_max = 0.875
+
+support_anchor_injected_ratio_mean = 0.9242
+support_anchor_positive_candidate_ratio_mean = 0.8085
+support_flow_positive_margin_mean = -0.14285
+support_flow_positive_margin_min = -0.324
+support_flow_positive_margin_max = 0.000
+
+num_actor_samples_mean = 58.8
+num_actor_samples_min = 24
+num_actor_samples_max = 96
+positive_ratio_mean = 0.21555
+target_entropy_mean = 1.46365
+
+actor/powerflow_loss_mean = 0.61265
+actor/grad_norm_mean = 12.3639
+timing_s/gen_mean = 25.0949
+timing_s/chunk_state_score_mean = 6.69815
+timing_s/chunk_state_ref_mean = 1.07515
+timing_s/update_actor_mean = 2.29475
+```
+
+rerun1 validation：
+
+```text
+val-core/math/acc/mean@16 = 0.423875
+val-core/math/acc/maj@16/mean = 0.541522
+val-core/math/acc/best@16/mean = 0.835492
+val-aux/math/acc/maj@8/mean = 0.518274
+val-aux/math/acc/best@8/mean = 0.775236
+val-aux/math/format_score/maj@16/mean = 0.853730
+```
+
+20-step gate 对比：
+
+```text
+MV step20 target: mean@16 ~= 0.760, maj@16 ~= 0.820, best@16 ~= 0.901
+support-flow suffix soft-mass step20: mean@16 = 0.423875, maj@16 = 0.541522, best@16 = 0.835492
+```
+
+结论：
+
+- 20-step gate 明确失败，不能扩到 80-step。虽然 smoke 和训练过程里的 `answer_coverage_mean` 明显好于 short-probe/local-hit 方案，但 validation accuracy 大幅低于 MV gate。
+- 这说明 `soft_mass` suffix replay 只解决了“candidate 是否落在 full support 内”的表层问题，没有解决“这个 chunk transition 是否让未来分布变好”。`support_flow_positive_margin_mean=-0.14285` 是关键证据：support anchor 平均仍低于 source mass，它更像 conservative distillation / replay，而不是 search-improvement target。
+- 训练链路本身不是瓶颈：`update_actor_mean=2.29s`，`chunk_state_score_mean=6.70s`，20-step 训练和一次 val 可完整跑完。当前主矛盾仍是目标定义，不是 B200 infra。
+- verifier 有 10 次 `Timeout during comparison` 和大量 SymPy deprecation warning，但没有 Traceback/OOM；这会影响耗时和个别 reward 噪声，但不足以解释 step20 accuracy 从 MV gate 掉到 0.42。
+
+下一步：
+
+- 不继续扩这个 `soft_mass` 版本到 80-step。
+- 不回退到 short-horizon probe local-hit teacher。
+- 下一版应在 support-flow 框架内把目标从 `soft_mass` 改成真正的 improvement target：
+  - `soft_relative_mass` / relative support gain：让候选相对 source future support 有增益才高权重。
+  - value-margin target：结合 prompt support top mass、source mass、candidate mass 的 margin，而不是只看 anchor mass。
+  - skip 低信息 state：低 coverage、support 过平、positive margin 过负、source mass 过强但无可提升空间的 state 直接降权或跳过。
+  - 保留 support suffix proposal 作为 candidate proposal / prior，但不要把 support mass 本身当最终 teacher。
+
+方法纠偏：
+
+- 当前最应该放弃的不是 PowerFlow loss、hardfilter/clip4、或“无 GT、依赖 group-level label estimation”的原则，而是“局部短视可判定性”这个约束。
+- 不再要求 chunk 的好坏必须在 short horizon、局部 answer hit、source answer consistency 或几条短 probe 的偶然命中上被判清楚。
+- `hardfilter + clip4` 能把 actor update 压到约 1.0-1.5s，说明更新速度不是主矛盾；但 coverage/OOV 仍长期在约 0.5 附近，说明 target 质量没有解决。
+- `sourcegate` 这类更强 source 硬约束会把 support coverage 压低、OOV 拉高、actor samples 变少，说明继续强化 source hard teacher 不是正确方向。
+- 后续 target 必须由 full-rollout group support/value 主导：先定义 prompt-level answer support、majority/value、coverage，再让 chunk 学习哪个局部 transition 会把未来分布推向这个 support。
+- source chunk 只保留为 prior 或 drift guard，不能作为主要 teacher 或 hard floor。
+- probe 如果继续使用，也应是 longer-horizon / staged future support gain 的估计器，而不是短 probe 局部命中本身。
