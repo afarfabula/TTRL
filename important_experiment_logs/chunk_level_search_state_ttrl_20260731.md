@@ -4418,3 +4418,73 @@ boxfix anchored standard 20-step: mean@16=0.42675, maj@16=0.54592, best@16=0.845
   - 增加 hard negative：重复 boxed、空 boxed、prompt-copy、多题串联、超长 boxed spam 的 chunk candidate 权重置零或给负 residual。
   - 边界从随机 mid 改为 answer-prefix-aware / reasoning-boundary-aware，避免在题面或无语义位置做 chunk actor update。
   - 继续保持 TTRL 原文 label estimation 与 reward calculation 拆分：先从 full rollout 和 chunk probe 估计 state label/distribution，再计算 PowerFlow target。
+
+## 2026-08-01 Full-Answer Target Guard 3-Step Smoke
+
+代码改动：
+
+- 新增 `_compute_full_rollout_answer_metadata`，在 chunk scoring 前从 32 条 full rollout 提取 prompt-level answer distribution 和每条 source answer 的 mass。
+- 新增 `_apply_chunk_state_target_guard`，在 `answer_value_margin` score 和 teacher/source anchor 后执行：
+  - 空答案、重复 boxed、超长答案、明显 prompt-copy / 多题串联 candidate 置零。
+  - guard 按 probe bad ratio 过滤，默认 `bad_probe_ratio >= 0.5` 才清零 candidate，避免单个 probe 误杀。
+  - 保留 TTRL arXiv 2504.16084 的顺序：先 full rollout label/distribution estimation，再计算 chunk target。
+- `ppo_trainer_ttrl.yaml` 加入默认关闭的 guard 配置，不影响既有实验。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_anchor_guard3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+TTRL_RUNTIME_DIR=/tmp/csguard3b
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_max_boxed_count=2
+ttrl.chunk_state_target_guard_bad_probe_ratio=0.5
+ttrl.chunk_state_target_guard_min_answer_mass=0.0
+ttrl.chunk_state_target_guard_anchor=True
+```
+
+关键指标：
+
+```text
+step1:
+  target_guard kept_candidate_ratio=0.641, zeroed_candidate_ratio=0.359
+  empty_answer_probe_ratio=0.279, repeated_boxed_probe_ratio=0.078
+  score_mean_before=0.090, score_mean_after=0.085
+  kept_state_ratio=0.438, zero_shard_ratio=0.000
+  actor/powerflow_loss=0.200
+  timing_s/gen=51.167, chunk_state_score=11.357, chunk_state_ref=5.740, update_actor=6.188
+
+step2:
+  target_guard kept_candidate_ratio=0.637, zeroed_candidate_ratio=0.363
+  empty_answer_probe_ratio=0.305, repeated_boxed_probe_ratio=0.048
+  score_mean_before=0.078, score_mean_after=0.076
+  kept_state_ratio=0.562, zero_shard_ratio=0.000
+  actor/powerflow_loss=0.321
+  timing_s/gen=23.647, chunk_state_score=10.171, chunk_state_ref=1.779, update_actor=5.396
+
+step3:
+  target_guard kept_candidate_ratio=0.664, zeroed_candidate_ratio=0.336
+  empty_answer_probe_ratio=0.212, repeated_boxed_probe_ratio=0.101
+  score_mean_before=0.084, score_mean_after=0.077
+  kept_state_ratio=0.312, zero_shard_ratio=0.000
+  actor/powerflow_loss=0.125
+  timing_s/gen=22.703, chunk_state_score=8.930, chunk_state_ref=1.794, update_actor=5.339
+```
+
+infra 观察：
+
+- vLLM 配置仍为 `attention_config.backend=FLASH_ATTN`，运行中出现 FlashInfer autotune 和 CUDA graph capture。
+- NCCL 日志显示 8 卡 P2P/NVLS 可用，`Check P2P Type isAllDirectP2p 1`，`NCCL_NVLS_ENABLE=1`。
+- actor dynamic batch 仍关闭，PowerFlow loss 为 `standard`，`powerflow_use_boxed_reward=True`。
+
+结论：
+
+- 这是健康 smoke，不是有效算法结果：final validation 按计划跳过。
+- guard 没有把训练打空：`actor/powerflow_loss` 三步非零，`actor_batch_powerflow_weight_zero_shard_ratio=0.000`。
+- guard 主要清掉空答案和重复 boxed，未观察到 prompt-copy / multi-problem 触发；这说明之前 20-step validation 中的多题串联可能在更长训练后才显著出现。
+- 下一步可跑 20-step validation gate。若 20-step 仍失败，优先尝试：
+  - `chunk_state_target_guard_min_answer_mass > 0`，限制 chunk target 必须落在 full-rollout answer distribution 内。
+  - 去掉 `teacher_anchor_score` 强行 floor，只保留 source chunk injection + distribution guard。
+  - 引入 answer-boundary-aware state selection，减少 boundary=0 和无语义 mid-boundary。

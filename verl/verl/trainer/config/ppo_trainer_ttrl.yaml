@@ -94,6 +94,16 @@ ttrl:
   chunk_state_teacher_anchor_enable: false
   chunk_state_teacher_anchor_score: 1.0
   chunk_state_teacher_anchor_candidate_index: 0
+  # Optional post-scoring hard guard for chunk targets. It preserves the TTRL
+  # order of estimating a full-rollout answer distribution before calculating
+  # chunk rewards, then removes local targets with malformed answers or obvious
+  # prompt-copy / repeated-boxed artifacts.
+  chunk_state_target_guard_enable: false
+  chunk_state_target_guard_max_boxed_count: 2
+  chunk_state_target_guard_bad_probe_ratio: 0.5
+  chunk_state_target_guard_min_answer_mass: 0.0
+  chunk_state_target_guard_anchor: true
+  chunk_state_target_guard_use_distribution_score: false
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.

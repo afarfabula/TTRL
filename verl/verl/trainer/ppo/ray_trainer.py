@@ -20,8 +20,9 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1108,6 +1109,50 @@ class RayPPOTrainer:
             list(majority_labels),
         )
 
+    def _compute_full_rollout_answer_metadata(self, batch: DataProto) -> dict[str, list]:
+        from verl.utils.reward_score.ttrl_math import extract_answer, simplify_expression_string
+
+        cfg = self.config.ttrl
+        n = int(cfg.n_samples_per_prompt)
+        if len(batch) % n != 0:
+            raise ValueError(f"Expected full rollout batch length divisible by n={n}, got {len(batch)}")
+
+        response_mask = batch.batch["response_mask"].bool()
+        decoded_answers = []
+        for idx in range(len(batch)):
+            response_len = int(response_mask[idx].sum().item())
+            response_ids = batch.batch["responses"][idx, :response_len]
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            decoded_answers.append(answer if answer is not None else "None")
+
+        prompt_answer_counts = []
+        prompt_answer_mass = []
+        source_answers = []
+        source_answer_mass = []
+        for prompt_idx in range(len(batch) // n):
+            start = prompt_idx * n
+            prompt_answers = decoded_answers[start : start + n]
+            valid_answers = [answer for answer in prompt_answers if answer != "None"]
+            counts = Counter(valid_answers)
+            total = max(len(valid_answers), 1)
+            count_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            mass_map = {answer: count / total for answer, count in count_items}
+            prompt_answer_counts.append(json.dumps(count_items, ensure_ascii=True))
+            prompt_answer_mass.append(json.dumps(mass_map, ensure_ascii=True, sort_keys=True))
+            for answer in prompt_answers:
+                source_answers.append(answer)
+                source_answer_mass.append(float(mass_map.get(answer, 0.0)) if answer != "None" else 0.0)
+
+        return {
+            "source_answer": source_answers,
+            "source_answer_mass": source_answer_mass,
+            "prompt_answer_counts": prompt_answer_counts,
+            "prompt_answer_mass": prompt_answer_mass,
+        }
+
     def _make_chunk_state_prompts(
         self,
         batch: DataProto,
@@ -1115,6 +1160,7 @@ class RayPPOTrainer:
         source_majority_consistent: Optional[torch.Tensor] = None,
         source_majority_ratios: Optional[torch.Tensor] = None,
         source_majority_labels: Optional[list[str]] = None,
+        source_answer_metadata: Optional[dict[str, list]] = None,
     ) -> tuple[DataProto, list[int]]:
         cfg = self.config.ttrl
         n = int(cfg.n_samples_per_prompt)
@@ -1318,6 +1364,25 @@ class RayPPOTrainer:
         if source_majority_labels is not None:
             state_non_tensor["chunk_state_prompt_majority_label"] = np.asarray(
                 [source_majority_labels[prompt_idx] for prompt_idx in source_prompt_indices],
+                dtype=object,
+            )
+        if source_answer_metadata is not None:
+            selected_source_indices = np.asarray(source_indices, dtype=np.int64)
+            selected_prompt_indices = np.asarray(source_prompt_indices, dtype=np.int64)
+            state_non_tensor["chunk_state_source_answer"] = np.asarray(
+                [source_answer_metadata["source_answer"][idx] for idx in selected_source_indices],
+                dtype=object,
+            )
+            state_non_tensor["chunk_state_source_answer_mass"] = np.asarray(
+                [source_answer_metadata["source_answer_mass"][idx] for idx in selected_source_indices],
+                dtype=np.float32,
+            )
+            state_non_tensor["chunk_state_prompt_answer_counts"] = np.asarray(
+                [source_answer_metadata["prompt_answer_counts"][idx] for idx in selected_prompt_indices],
+                dtype=object,
+            )
+            state_non_tensor["chunk_state_prompt_answer_mass"] = np.asarray(
+                [source_answer_metadata["prompt_answer_mass"][idx] for idx in selected_prompt_indices],
                 dtype=object,
             )
         state_proto = DataProto(batch=state_batch, non_tensor_batch=state_non_tensor)
@@ -2353,6 +2418,142 @@ class RayPPOTrainer:
             "chunk_state_teacher_anchor/candidate_index": float(anchor_idx),
         }
 
+    def _chunk_state_text_guard_flags(self, response_str: str, answer: str | None, prompt_answer_mass: dict) -> dict:
+        cfg = self.config.ttrl
+        boxed_count = response_str.count("\\boxed")
+        max_boxed = int(cfg.get("chunk_state_target_guard_max_boxed_count", 2))
+        min_answer_mass = float(cfg.get("chunk_state_target_guard_min_answer_mass", 0.0))
+        answer_text = "" if answer is None else str(answer).strip()
+        prompt_mass = float(prompt_answer_mass.get(answer_text, 0.0)) if answer_text and answer_text != "None" else 0.0
+        empty_answer = answer is None or answer_text == "" or answer_text == "None"
+        repeated_boxed = max_boxed > 0 and boxed_count > max_boxed
+        answer_too_long = len(answer_text) > int(cfg.get("chunk_state_max_answer_chars", 128))
+        prompt_copy = bool(re.search(r"(problem|question)\\s*[:：]", response_str, re.IGNORECASE))
+        multi_problem = bool(re.search(r"(problem|question)\\s*\\d+\\s*[:：]", response_str, re.IGNORECASE))
+        distribution_oov = min_answer_mass > 0.0 and prompt_mass < min_answer_mass
+        return {
+            "empty_answer": empty_answer,
+            "repeated_boxed": repeated_boxed,
+            "answer_too_long": answer_too_long,
+            "prompt_copy": prompt_copy,
+            "multi_problem": multi_problem,
+            "distribution_oov": distribution_oov,
+            "prompt_mass": prompt_mass,
+        }
+
+    def _apply_chunk_state_target_guard(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        probe_output: DataProto,
+        scores: torch.Tensor,
+        candidates: int,
+        probe_samples: int,
+    ) -> tuple[torch.Tensor, dict]:
+        from verl.utils.reward_score.ttrl_math import extract_answer, simplify_expression_string
+
+        cfg = self.config.ttrl
+        if not bool(cfg.get("chunk_state_target_guard_enable", False)):
+            return scores, {}
+        if len(probe_output) != len(chunk_output) * probe_samples:
+            raise ValueError(
+                f"Expected {len(chunk_output) * probe_samples} probe outputs, got {len(probe_output)}"
+            )
+
+        score_matrix = scores.view(len(state_prompts), candidates).float().clone()
+        label_consistent = np.asarray(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_label_consistent",
+                (score_matrix > 0.0).float().cpu().numpy().astype(np.float32),
+            ),
+            dtype=np.float32,
+        ).reshape(len(state_prompts), candidates)
+        prompt_mass_values = [
+            json.loads(str(value)) if str(value) else {}
+            for value in state_prompts.non_tensor_batch.get(
+                "chunk_state_prompt_answer_mass",
+                np.asarray(["{}"] * len(state_prompts), dtype=object),
+            )
+        ]
+
+        chunk_mask = chunk_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool()
+        bad_probe_counts = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
+        max_candidate_score = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
+        flag_counts = Counter()
+        scored_probes = 0
+        anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
+        guard_anchor = bool(cfg.get("chunk_state_target_guard_anchor", True))
+        bad_probe_ratio_threshold = float(cfg.get("chunk_state_target_guard_bad_probe_ratio", 0.5))
+
+        for probe_idx in range(len(probe_output)):
+            chunk_idx = probe_idx // probe_samples
+            state_idx = chunk_idx // candidates
+            candidate_idx = chunk_idx % candidates
+            chunk_len = int(chunk_mask[chunk_idx].sum().item())
+            probe_len = int(probe_mask[probe_idx].sum().item())
+            response_ids = torch.cat(
+                [
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                    probe_output.batch["responses"][probe_idx, :probe_len],
+                ],
+                dim=0,
+            )
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            flags = self._chunk_state_text_guard_flags(response_str, answer, prompt_mass_values[state_idx])
+            scored_probes += 1
+            for key, value in flags.items():
+                if key == "prompt_mass":
+                    continue
+                if value:
+                    flag_counts[key] += 1
+            invalid = any(value for key, value in flags.items() if key != "prompt_mass")
+            if invalid:
+                bad_probe_counts[state_idx, candidate_idx] += 1.0
+            max_candidate_score[state_idx, candidate_idx] = torch.maximum(
+                max_candidate_score[state_idx, candidate_idx],
+                torch.tensor(float(flags["prompt_mass"]), dtype=max_candidate_score.dtype),
+            )
+
+        bad_probe_ratio = bad_probe_counts / max(probe_samples, 1)
+        guard_ok = bad_probe_ratio < bad_probe_ratio_threshold
+        if not guard_anchor and 0 <= anchor_idx < candidates:
+            guard_ok[:, anchor_idx] = True
+        guarded_score_matrix = score_matrix * guard_ok.to(dtype=score_matrix.dtype)
+        label_consistent = label_consistent * guard_ok.cpu().numpy().astype(np.float32)
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.astype(np.float32)
+        state_prompts.non_tensor_batch["chunk_state_target_guard_ok"] = guard_ok.cpu().numpy().astype(np.float32)
+        if bool(cfg.get("chunk_state_target_guard_use_distribution_score", False)):
+            guarded_score_matrix = torch.maximum(guarded_score_matrix, max_candidate_score * guard_ok.float())
+
+        candidate_count = max(len(state_prompts) * candidates, 1)
+        metrics = {
+            "chunk_state_target_guard/enabled": 1.0,
+            "chunk_state_target_guard/kept_candidate_ratio": guard_ok.float().mean().item(),
+            "chunk_state_target_guard/zeroed_candidate_ratio": (~guard_ok).float().mean().item(),
+            "chunk_state_target_guard/score_mean_before": score_matrix.mean().item(),
+            "chunk_state_target_guard/score_mean_after": guarded_score_matrix.mean().item(),
+            "chunk_state_target_guard/prompt_mass_mean": max_candidate_score.mean().item(),
+            "chunk_state_target_guard/anchor_guarded": float(guard_anchor),
+            "chunk_state_target_guard/bad_probe_ratio_mean": bad_probe_ratio.mean().item(),
+            "chunk_state_target_guard/bad_probe_ratio_threshold": bad_probe_ratio_threshold,
+        }
+        for key in [
+            "empty_answer",
+            "repeated_boxed",
+            "answer_too_long",
+            "prompt_copy",
+            "multi_problem",
+            "distribution_oov",
+        ]:
+            metrics[f"chunk_state_target_guard/{key}_probe_ratio"] = flag_counts[key] / max(scored_probes, 1)
+        metrics["chunk_state_target_guard/zeroed_candidates"] = float((~guard_ok).sum().item())
+        metrics["chunk_state_target_guard/candidates"] = float(candidate_count)
+        return guarded_score_matrix.reshape(-1), metrics
+
     def _apply_chunk_state_source_chunk(
         self,
         full_batch: DataProto,
@@ -2603,6 +2804,7 @@ class RayPPOTrainer:
         source_majority_consistent = None
         source_majority_ratios = None
         source_majority_labels = None
+        source_answer_metadata = None
         if source_mode in {"success"} or bool(cfg.get("chunk_state_diag_enable", False)):
             source_correctness = self._compute_original_gt_rewards(full_batch)
         score_mode = str(cfg.get("chunk_state_score_mode", ""))
@@ -2616,6 +2818,8 @@ class RayPPOTrainer:
                 source_majority_ratios,
                 source_majority_labels,
             ) = self._compute_full_rollout_majority_consistency(full_batch)
+        if bool(cfg.get("chunk_state_target_guard_enable", False)):
+            source_answer_metadata = self._compute_full_rollout_answer_metadata(full_batch)
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
             state_prompts, _ = self._make_chunk_state_prompts(
@@ -2624,6 +2828,7 @@ class RayPPOTrainer:
                 source_majority_consistent=source_majority_consistent,
                 source_majority_ratios=source_majority_ratios,
                 source_majority_labels=source_majority_labels,
+                source_answer_metadata=source_answer_metadata,
             )
             if source_correctness is not None:
                 n = int(cfg.n_samples_per_prompt)
@@ -2776,6 +2981,15 @@ class RayPPOTrainer:
                     label_consistent[:, anchor_idx] = 1.0
                     state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent
                     metrics["chunk_state_teacher_anchor/label_consistent_forced"] = 1.0
+            scores, target_guard_metrics = self._apply_chunk_state_target_guard(
+                state_prompts=state_prompts,
+                chunk_output=chunk_output,
+                probe_output=probe_output,
+                scores=scores,
+                candidates=candidates,
+                probe_samples=probe_samples,
+            )
+            metrics.update(target_guard_metrics)
             metrics.update(self._compute_chunk_state_diag_metrics(full_batch, state_prompts, scores))
             metrics.update(self._dump_chunk_state_diag_jsonl(state_prompts, scores))
 
