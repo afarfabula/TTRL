@@ -2537,3 +2537,83 @@ answer_coverage mean=0.7051 min=0.0000 max=1.0000
 
 - 启动同配置 20-step gate，看 final `mean@16/maj@16/best@16` 是否优于 raw majority-completion `0.521/0.662/0.873`。
 - 若 20-step 低于 raw majority-completion，优先降低 `confidence_power` 或 `min_answer_coverage`，而不是取消 confidence gate。
+
+## 2026-08-01 Confidence-gated Majority-completion c128 20-step
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_conf_gate_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+chunk_state_chunk_size=128
+chunk_state_min_majority_ratio=0.25
+chunk_state_min_answer_coverage=0.60
+chunk_state_confidence_power=0.5
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_conf_gate_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_conf_gate_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+worker=1024321, 8x NVIDIA B200
+```
+
+Final validation：
+
+```text
+val-core/math/acc/mean@16=0.5325
+val-core/math/acc/maj@16/mean=0.666974
+val-core/math/acc/best@16/mean=0.877136
+val-aux/math/format_score/mean@16=0.913625
+val-aux/math/format_score/maj@16/mean=0.905506
+timing_s/testing=291.097
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.156
+chunk_state_source/prompt_original_pass=0.906
+chunk_state_source/prompt_original_mean=0.406
+chunk_state_majority_completion/majority_ratio_mean=0.403
+chunk_state_majority_completion/answer_coverage_mean=0.784
+chunk_state_majority_completion/raw_positive_ratio=0.404
+chunk_state_diag/state_all_positive_ratio=0.344
+chunk_state_diag/state_all_negative_ratio=0.031
+chunk_state_diag/state_mixed_ratio=0.625
+chunk_state/confidence_gate_ratio=0.625
+chunk_state/kept_state_ratio=0.562
+chunk_state/loss_weight_mean=0.388
+chunk_state/target_entropy=1.348
+actor/powerflow_loss=0.198
+actor/boxed_reward/mean=0.258
+actor/grad_norm=3.219
+timing_s/gen=21.715
+timing_s/chunk_state_probe=6.827
+timing_s/chunk_state_score=12.285
+timing_s/update_actor=7.448
+```
+
+对比：
+
+```text
+raw majority-completion c256 20-step:
+  mean@16=0.521125 maj@16=0.662318 best@16=0.872676 format_mean@16=0.904125
+
+confidence-gated c128 20-step:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+```
+
+结论：
+
+- 这轮完整跑完，训练和 final validation 均成功。
+- c128 + confidence gate 相比 raw majority-completion 有小幅提升：`mean@16 +0.0114`，`maj@16 +0.0047`，`best@16 +0.0045`，format 也略好。
+- 但提升幅度太小，仍远低于 MV/TTRL 20-step 对齐目标（`mean@16~0.76`、`maj@16~0.82`），不能作为主线扩到 80 step。
+- hard gate 的问题很明确：训练信号稀疏且波动大，step12 只保留 `18.8%` state，`loss_weight_mean=0.119`，`grad_norm=1.267`；后半段虽有恢复，但整体没有形成足够强的 policy improvement。
+- 这说明当前版本不是“只要过滤低置信 state 就会好”，而是需要重新定义 state-local target。更合理的方向是参考 arXiv 2504.16084：同一个 state 下采多个输出，先估计 pseudo-label / majority reward，再以软分布或置信加权方式做 PowerFlow 蒸馏，而不是 hard skip 大量 state。
+
+下一步：
+
+- 不继续 hard-gated c128 80-step。
+- 做 2504.16084 风格的 soft multi-output label estimation：保留全部 informative state，只用 `majority_ratio`、`answer_coverage`、候选得分分布调整 PowerFlow target sharpness/weight。
+- 优先取消 hard `min_answer_coverage=0.60`，改成软置信权重；目标是恢复足够训练信号，同时避免 raw majority-completion 的低置信噪声。
+- 继续使用 PowerFlow loss 作为 chunk actor update 主路径，GRPO 暂不作为主实验。
