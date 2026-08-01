@@ -3439,3 +3439,83 @@ timing_s/update_actor=8.224
 - 新 target 的训练信号更 dense：`state_positive_ratio=0.979`、`label_consistent_ratio=0.865`、`kept_state_ratio=0.677`；同时不是完全 uniform，`powerflow_weight_max=3.143`、`target_entropy=1.789`。
 - `top_mass_mean=0.601`、`top2_margin=0.501` 说明同一 state 内 answer 分布有明显头部答案；但 `unique_answer_mean=8.042` 也说明答案空间仍然分散，20-step gate 必须验证这种 state-local frequency target 是否真的改善最终 acc。
 - 该 smoke 只验证链路和 target 统计，不含 final validation。下一步可以跑同配置 20-step gate；通过标准仍是超过 hard confidence-gated c128 的 `mean@16=0.5325`，否则继续增强 long-horizon verifier / value margin，而不是扩 80-step。
+
+## 2026-08-01 Answer-distribution Mid-state c128 20-step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_score_mode=answer_distribution
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_probe_max_tokens=1024
+chunk_state_min_majority_ratio=0.20
+chunk_state_min_answer_coverage=0.60
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+```
+
+Final validation：
+
+```text
+mean@16=0.399875
+maj@16=0.511854
+best@16=0.828208
+format_mean@16=0.888250
+format_maj@16=0.852188
+format_best@16=0.999942
+testing=309.036s
+```
+
+20-step 平均训练信号：
+
+```text
+answer_distribution_top_mass=0.538
+answer_distribution_top2_margin=0.429
+answer_distribution_unique_answer=8.580
+answer_distribution_answer_coverage=0.737
+answer_distribution_raw_score=0.343
+answer_distribution_label_consistent_ratio=0.865
+answer_distribution_state_positive_ratio=0.966
+kept_state_ratio=0.634
+target_entropy=1.823
+powerflow_weight_max=3.397
+actor/powerflow_loss=0.262
+actor/grad_norm=5.521
+timing_s/gen=24.961
+timing_s/chunk_state_score=10.096
+timing_s/update_actor=7.392
+```
+
+与短程 gate 对比：
+
+```text
+hard confidence-gated c128:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+teacher-anchor mid-state c128:
+  mean@16=0.525875 maj@16=0.656294 best@16=0.867390 format_mean@16=0.899000
+
+answer-consensus minmaj0 mid-state c128:
+  mean@16=0.521750 maj@16=0.652016 best@16=0.865020 format_mean@16=0.907875
+
+answer-distribution mid-state c128:
+  mean@16=0.399875 maj@16=0.511854 best@16=0.828208 format_mean@16=0.888250
+```
+
+结论：
+
+- 这轮 answer-distribution 20-step gate 明显失败，低于 hard confidence-gated c128 的 `mean@16=0.5325`，因此不扩到 80-step。
+- 失败不是链路崩溃：20 step 全程无 NaN/Ray/FSDP/vLLM 崩溃，`diag_jsonl_rows=640`，PowerFlow loss 正常更新，actor update 平均 `7.392s`。
+- 失败更像 target 语义错误：用同一 state 内 `candidate x probe` 的 answer frequency 直接做 soft score，会奖励“在短 probe 中落到高频答案”的 chunk，但这个高频答案不一定是更好的完整解题方向；`best@16=0.828208` 说明搜索空间仍有正确答案，`mean@16/maj@16` 大幅下降说明 policy 被推向了错误或格式化但不可靠的局部分布。
+- 2504.16084 的启发应该继续保留，但要更严格实现：它支持同一 state 多输出 label estimation / reward calculation，而不是把 state-local frequency 本身当最终 chunk reward。下一版需要让 chunk label estimation 和后续 search improvement 绑定，例如用候选 chunk 后的 long-horizon pass/value margin、state value gain、或 search-improved distribution 的 KL/PowerFlow target，而不是只用答案频率。
+- infra 观察：本 run 的额外成本主要是 `chunk_state_score=10.096s`，其中包含 probe generation 和答案解析；actor update 仍不是瓶颈。日志里仍有大量 SymPy warning/subprocess shutdown，说明 parser/scoring 长尾还需要优化，但这次指标失败首先是算法目标问题。
