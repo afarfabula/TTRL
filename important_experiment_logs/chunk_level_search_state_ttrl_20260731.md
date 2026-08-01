@@ -2085,3 +2085,58 @@ timing_s/update_actor=8.485
 - PowerFlow loss 已经接在 chunk actor update 上；失败不是因为走成 GRPO 或 weighted NLL，而是 target construction 噪声仍然过大。
 - 单纯把 successful source next chunk 加进 support 不够。虽然注入率是 1.0，但 step20 仍有 `state_all_negative_ratio=0.281`，且 positive ratio 只有 `0.305`。
 - 下一步继续优先用 PowerFlow distribution matching，但必须先过滤或降权 all-negative / 弱信息 chunk state，避免无区分度的 probe 结果参与 actor update。
+
+## 2026-08-01 Source Chunk + Skip All-negative PowerFlow 3-step Smoke
+
+改动：
+
+```text
+ttrl.chunk_state_skip_all_negative=True
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+```
+
+实现语义：
+
+- 训练目标仍然是 PowerFlow distribution matching，不切 GRPO，也不切 weighted NLL。
+- 对每个 chunk state 仍保留 8 个 candidate 的 batch 形状；如果该 state 的 probe scores 全部为 0，则把该 state 下所有 candidate 的 `powerflow_chunk_weights` 置为 0。
+- 这样 all-negative state 不贡献 actor update，同时 FSDP/Ray batch shape 不变，避免极端 batch 回退到噪声更新。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_sourcechunk_skipneg_probe4_b32_r32_v64_3step_20260731
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+CHUNK_STATE_SKIP_ALL_NEGATIVE=True
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_sourcechunk_skipneg_probe4_b32_r32_v64_3step_20260731.jsonl
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_sourcechunk_skipneg_probe4_b32_r32_v64_3step_20260731.log
+diag_jsonl_rows=96
+worker=1024321, 8x NVIDIA B200
+```
+
+三步关键信号：
+
+```text
+step1: state_all_negative_ratio=0.250 zeroed_state_ratio=0.250 kept_state_ratio=0.750 powerflow_loss=0.267 grad_norm=13.155
+step2: state_all_negative_ratio=0.156 zeroed_state_ratio=0.156 kept_state_ratio=0.844 powerflow_loss=0.136 grad_norm=8.953
+step3: state_all_negative_ratio=0.219 zeroed_state_ratio=0.219 kept_state_ratio=0.781 powerflow_loss=0.410 grad_norm=18.067
+```
+
+三步耗时：
+
+```text
+step1: gen=52.039s chunk_state_probe=6.285s chunk_state_score=11.319s update_actor=8.761s
+step2: gen=22.295s chunk_state_probe=6.512s chunk_state_score=10.925s update_actor=7.953s
+step3: gen=22.701s chunk_state_probe=6.473s chunk_state_score=11.578s update_actor=8.516s
+```
+
+结论：
+
+- smoke 通过。PowerFlow chunk actor update 正常，且 all-negative state 的零权重逻辑生效。
+- step1 慢主要来自 worker/vLLM/FSDP/JIT warmup；step2/3 回到当前 chunk-state 链路的稳定区间。
+- 该版本比 sourcechunk 20-step gate 更合理，因为不会把无信息 state 当成有效 target 训练。下一步可做 20-step gate；如果 20-step 仍失败，应继续改 target construction，而不是回到 GRPO 或 weighted NLL。

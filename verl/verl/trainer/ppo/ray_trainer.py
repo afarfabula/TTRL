@@ -1723,18 +1723,13 @@ class RayPPOTrainer:
             dtype=torch.float32,
         )
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
+        keep_state = torch.ones(num_states, dtype=torch.bool)
         if skip_uniform:
-            keep_state = informative.bool()
-        else:
-            keep_state = torch.ones(num_states, dtype=torch.bool)
+            keep_state &= informative.bool()
         if skip_all_negative:
             keep_state &= score_max > 0.0
-        keep_indices = []
-        for state_idx in range(num_states):
-            if keep_state[state_idx]:
-                keep_indices.extend(range(state_idx * candidates, (state_idx + 1) * candidates))
-        if not keep_indices:
-            keep_indices = list(range(len(chunk_output)))
+        effective_state_loss_weights = state_loss_weights * keep_state.to(dtype=state_loss_weights.dtype)
+        keep_indices = list(range(len(chunk_output)))
 
         repeated_state_prompts = state_prompts.repeat(repeat_times=candidates, interleave=True)
         kept_states = repeated_state_prompts[keep_indices]
@@ -1745,7 +1740,7 @@ class RayPPOTrainer:
         responses = responses[keep_indices]
         response_mask = response_mask[keep_indices]
         flat_weights = weights.reshape(-1)[keep_indices]
-        flat_loss_weights = state_loss_weights.repeat_interleave(candidates)[keep_indices]
+        flat_loss_weights = effective_state_loss_weights.repeat_interleave(candidates)[keep_indices]
         flat_weights = flat_weights * flat_loss_weights
         powerflow_flat_weights = flat_weights * candidates
 
@@ -1802,6 +1797,8 @@ class RayPPOTrainer:
             "chunk_state/num_candidates": float(len(chunk_output)),
             "chunk_state/num_actor_samples": float(len(actor_proto)),
             "chunk_state/loss_weight_mean": flat_loss_weights.mean().detach().item(),
+            "chunk_state/base_loss_weight_mean": state_loss_weights.mean().detach().item(),
+            "chunk_state/zeroed_state_ratio": (effective_state_loss_weights <= 0.0).float().mean().detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
             "chunk_state/informative_ratio": informative.mean().detach().item(),
             "chunk_state/kept_state_ratio": keep_state.float().mean().detach().item(),
