@@ -8509,3 +8509,98 @@ support-flow suffix soft-mass step20: mean@16 = 0.423875, maj@16 = 0.541522, bes
 - 后续 target 必须由 full-rollout group support/value 主导：先定义 prompt-level answer support、majority/value、coverage，再让 chunk 学习哪个局部 transition 会把未来分布推向这个 support。
 - source chunk 只保留为 prior 或 drift guard，不能作为主要 teacher 或 hard floor。
 - probe 如果继续使用，也应是 longer-horizon / staged future support gain 的估计器，而不是短 probe 局部命中本身。
+
+## 2026-08-01 support-flow suffix soft-relative smoke
+
+目的：
+
+- 在 `soft_mass` 20-step gate 失败后，先用已有 `soft_relative_mass` 做 3-step smoke。
+- 这版仍然跳过 short-horizon probe teacher，target 由 full-rollout support suffix mass 主导；区别是把 score 从 absolute support mass 改成 `anchor_mass / source_mass` 的软相对比例。
+- 预期只验证 target density / actor batch / timing；如果仍没有正的 transition margin，就不扩到 20-step。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_flow_suffix_softrel_mid_c128_b32_r32_v64_3step_20260801.sh
+run_id = ttrl_chunk_state_powerflow_support_flow_suffix_softrel_mid_c128_b32_r32_v64_3step_20260801
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_suffix_softrel_mid_c128_b32_r32_v64_3step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_suffix_softrel_mid_c128_b32_r32_v64_3step_20260801.jsonl
+status = completed_3_steps_no_val
+```
+
+配置：
+
+```text
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+train_batch_size = 32
+rollout.n = 32
+N_VOTES_PER_PROMPT = 64
+total_training_steps = 3
+test_freq = -1
+score_mode = support_flow
+support_flow_score_type = soft_relative_mass
+support_anchor_count = 7
+support_anchor_candidate_start = 1
+source_chunk_candidate_index = 0
+chunk_size = 128
+candidates = 8
+dynamic_bsz = false
+PowerFlow loss = enabled
+KL loss = disabled
+```
+
+运行确认：
+
+```text
+chunk_state_probe/skipped_for_support_flow = 1.000
+score_type_soft_relative_mass = 1.000
+Traceback = 0
+OOM = 0
+Timeout during comparison = 3
+Final validation skipped = expected
+```
+
+3-step 均值：
+
+```text
+chunk_state/answer_coverage_mean = 0.831
+chunk_state/num_actor_samples = 72.000
+chunk_state/positive_ratio = 0.439667
+chunk_state/target_entropy = 1.506667
+chunk_state/weight_max = 0.911
+
+chunk_state_support_flow/anchor_mass_mean = 0.228667
+chunk_state_support_flow/source_mass_mean = 0.521
+chunk_state_support_flow/positive_margin_mean = -0.110
+chunk_state_support_flow/score_mean = 0.439667
+chunk_state_support_flow/score_max_mean = 0.779333
+chunk_state_support_flow/label_consistent_ratio = 0.831
+
+actor/powerflow_loss = 1.148667
+actor/grad_norm = 42.403333
+timing_s/gen = 29.476333
+timing_s/chunk_state_score = 6.390
+timing_s/chunk_state_ref = 2.392667
+timing_s/update_actor = 3.086333
+```
+
+infra 证据：
+
+- vLLM config 里 attention backend 为 `FLASH_ATTN`。
+- 运行中出现 `flashinfer.jit` autotune 和 CUDA graph capture。
+- NCCL 日志显示 `NCCL_NVLS_ENABLE=1`、NVLS multicast available、P2P/CUMEM、`isAllDirectP2p 1`。
+- Qwen2.5-Math-7B config 显示 GQA：`num_attention_heads=28`、`num_key_value_heads=4`。
+
+结论：
+
+- 工程上这版是健康的：没有 short probe target，没有 OOM/Traceback，actor batch 没打空，update actor 约 3s。
+- 方法上仍不能扩：`positive_margin_mean=-0.110`，说明 anchor 平均仍低于 source future mass。`soft_relative_mass` 只是把 support replay 权重拉尖，不等于“局部 transition 让未来分布变好”。
+- 这再次支持当前主判断：问题不在 PowerFlow actor update，也不在 target density，而在 target 是否真实表达 search improvement。
+
+下一步：
+
+- 不扩 `soft_relative_mass` 到 20-step。
+- 下一版不要继续在 absolute/relative support replay 之间调参。
+- 需要实现真正的 future/value-gain target：对候选 chunk 后的 longer-horizon 或 staged continuation 估计其 future answer distribution，再用相对 full-rollout support 的 mass gain / top-mass margin / transport improvement 定义 `q_j`。
+- short probe 如果使用，只能作为多阶段估计器的一部分，不能单独决定 teacher。
