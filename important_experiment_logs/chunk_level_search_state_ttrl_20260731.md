@@ -4880,3 +4880,95 @@ diag mixed_ratio = 0.458
 - 关闭 `chunk_state_target_guard_use_mass_gain`，回到 raw full-answer support mass 作为 distribution score。
 - 另做一个 3-step smoke：`source_chunk + support target + candidate anti-repetition`，看是否在不清零 distribution score 的情况下改善重复 boxed 风险。
 - 如果 smoke 健康，再跑 20-step gate；硬门槛仍是 step20 `mean@16` 不能低于 MV 20-step 两点以上。
+
+## 2026-08-01 Raw Support + Candidate Anti-Repeat 3-Step Smoke
+
+目的：
+
+- 验证上一个 mass-gain 版本的问题是否来自 `max(0, candidate_mass - source_mass)` 过严，而不是 candidate guard 本身。
+- 保留 candidate-level anti-repetition guard，关闭 mass-gain，继续把 target 绑定到 full rollout answer support / distribution score。
+- 仍然使用 PowerFlow loss、source chunk injection、batch32/rollout32、dynamic batch off。
+- `2504.16084` 是 TTRL 原文，约束这里的 chunk target 不能用 GT，也不能让任意短 probe 直接当 teacher；target 必须尽量来自同组完整 rollout 的 answer distribution / majority prior。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support_antirepeat_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_use_distribution_score=True
+ttrl.chunk_state_target_guard_use_mass_gain=False
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_target_guard_candidate_max_boxed_count=1
+ttrl.chunk_state_target_guard_candidate_assistant_marker=True
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_antirepeat_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_antirepeat_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+Step 级指标：
+
+```text
+step  gen     chunks  probe  score   ref    update  total_est  kept  score_after  prompt_mass  oov    cand_repeat_boxed  pf_nonzero
+1     51.321  1.077   6.517  11.485  5.598  5.839   81.837     0.395 0.190        0.236        0.530  0.012              0.406
+2     33.069  0.973   6.376  10.668  1.577  4.713   57.376     0.531 0.279        0.296        0.434  0.000              0.531
+3     22.835  1.111   6.760  9.530   1.807  5.546   47.589     0.391 0.176        0.231        0.548  0.004              0.375
+```
+
+3 step 平均：
+
+```text
+kept_candidate_ratio = 0.439
+score_mean_after = 0.215
+prompt_mass_mean = 0.254
+distribution_oov_probe_ratio = 0.504
+candidate_repeated_boxed_ratio = 0.005
+actor_batch_powerflow_weight_nonzero_ratio = 0.437
+boxed_reward_weighted_mean = 0.647
+actor/powerflow_loss = 0.168
+actor/grad_norm = 8.812
+timing_s/update_actor = 5.366s
+timing_total_est = 62.267s
+```
+
+Step 2-3 稳态近似：
+
+```text
+timing_s/gen = 27.952s
+timing_s/chunk_state_chunks = 1.042s
+timing_s/chunk_state_probe = 6.568s
+timing_s/chunk_state_score = 10.099s
+timing_s/chunk_state_ref = 1.692s
+timing_s/update_actor = 5.130s
+timing_total_est = 52.483s
+```
+
+诊断：
+
+- 工程链路通过：3 step 正常结束，final validation 按预期跳过，diag 96 行完整。
+- 配置确认：`source_chunk_enable=True`，`target_guard_use_mass_gain=False`，`candidate_guard_enable=True`，`use_distribution_score=True`，没有被 base wrapper 覆盖。
+- Infra 确认：vLLM attention backend 打印为 `FLASH_ATTN`，FlashInfer autotune、CUDA graph capture、actor flash-attn monkey patch、Triton fused kernels、NCCL NVLS/P2P 均出现。
+- 与 mass-gain 对比：raw support mass 没有被清零，`prompt_mass_mean=0.254`；mass-gain 版本对应值为 0。
+- Candidate guard 没有误伤主信号：candidate 自身重复 boxed 只有约 0.5%，但它能拦住最明显的重复/assistant-marker 退化源。
+- 仍有风险：distribution OOV probe ratio 约 50%，说明短 probe 回到 full rollout answer support 的比例还不高；这可能继续限制 20-step gate 的上限。
+
+结论：
+
+- 这是健康 smoke，可以扩 20-step gate。
+- 当前方案比 mass-gain 更符合 TTRL 原文的 group-level answer distribution 语义：不使用 GT，source 来自 majority-consistent full rollout，target 使用 full rollout answer support 过滤/加权 probe。
+- 当前端到端额外成本主要是 `chunk_state_score` 和 probe，不是 actor update；chunk actor update 约 5s，长度约 121-123 tokens，符合“chunk update 更轻”的预期。
+
+下一步：
+
+- 启动同配置 20-step gate，打开 final validation。
+- Gate 目标：至少不能复现 `support_src20b` 的 repeated boxed 退化；step20 `mean@16` 不能低于 MV 20-step 两点以上。
+- 若 20-step 指标健康，再扩 80-step pilot；若仍低，下一步优先减少 OOV：例如增大 full rollout support 样本数、用 answer-support matching 而不是 raw probe answer、或把 state boundary 限制到更稳定的中后段。
