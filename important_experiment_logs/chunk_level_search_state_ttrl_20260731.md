@@ -3669,3 +3669,83 @@ answer-value-gain mid-state c128:
 - 问题仍是 chunk target 语义：`improved_state_ratio=0.720` 和 `kept_state_ratio=0.398` 表明 proxy 能选出“相对 majority baseline 命中率提升”的 chunk，但 final `mean@16=0.3625` 和日志中的重复 `\boxed{}` 输出说明该 proxy 会鼓励局部 boxed/答案吸引子，不保证完整推理路径质量。
 - 这个结果进一步说明不能只用短 probe 命中 prompt-level pseudo label 做 chunk reward。下一版应转为 long-horizon pass/value margin：候选 chunk 后继续更长 rollout 或小规模 search，score 直接衡量相对原 full rollout 的 pass/maj/best 改善，并加入 anti-degeneration/format guard；或者更贴近 2504.16084，把同一 state 的多候选先做可靠 label/value estimation，再把 search-improved distribution 蒸馏回 PowerFlow target。
 - infra 观察：actor update 平均 `7.322s`，仍不是主要瓶颈；额外成本主要在 `gen=26.440s` 和 `chunk_state_score=11.418s`，其中 scoring 受 SymPy/parser timeout 长尾影响明显。后续若继续 chunk path，应优先降低 probe/search 评估成本，而不是扩大当前错误 target。
+
+## 2026-08-01 2504.16084 Chunk-state 设计约束
+
+论文要点：
+
+- arXiv 2504.16084 本身是 TTRL，不是 chunk-level 方法。它的核心是：对同一个 state/prompt 采多个输出，先做 label estimation，再用估计 label 计算 rule-based reward，最后在线 RL 更新。
+- 原文实现细节：Qwen2.5-Math 和 LRM rollout temperature 使用 `1.0`；先采 64 条用于 voting-based label estimation，再下采样 32 条用于训练；MATH-500 用 10 episodes；max generation length 为 3072。
+- 对我们有用的是“label estimation”和“reward calculation”必须分开。不能把 state-local answer frequency 或短 probe hit-rate 本身当作最终 chunk target，否则容易把模型推向局部答案吸引子。
+- 原文解释 TTRL 能工作的关键是 reward robustness：多输出比较给了更稠密的正/负 reward，即使 majority label 不准，错误答案分散时负样本仍然可靠。chunk 版本也要保留这个性质，即候选 chunk reward 应来自候选后续 search/value 相对 baseline 的改善，同时保留对坏 chunk 的过滤/负信息，而不是只拉高短程高频答案。
+
+对下一版 chunk 方案的约束：
+
+- 继续使用 PowerFlow loss 做 actor update，但 target 必须是 search-improved distribution，不再使用 answer-distribution frequency。
+- chunk scoring 至少要包含：prompt-level pseudo label、candidate 后续 probe/search、相对 full-rollout baseline 的 margin、format/degeneration guard。
+- 如果短 probe 太不可靠，应该改成更长 horizon 的 pass/value margin，或者按每个 state 的 top-k margin 做 normalized target，避免大量 state 得到 uniform/zero target。
+
+## 2026-08-01 Answer-value-margin Mid-state c128 3-step Smoke
+
+动机：
+
+- answer-value-gain 20-step gate 失败后，先做一个更保守的非负 PowerFlow target：候选 chunk 只有在 `hit_rate - baseline >= margin` 时才给正分。
+- 加入 format guard：probe 拼接后的回答必须能抽到非空 answer，答案字符串不超过 128 字符，`\boxed` 次数不超过 8；否则该 probe 视作无效。目标是压住上一轮 final validation 中出现的重复 `\boxed{}` 退化。
+- 这个版本仍然不是完整 long-horizon search-state TTRL，只是验证 “margin + anti-degeneration guard” 是否能稳定跑通，并观察 target 稀疏度和 PowerFlow loss 是否正常。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  新增 _chunk_state_probe_is_well_formed
+  新增 _score_chunk_state_answer_value_margin
+  新增 ttrl.chunk_state_score_mode=answer_value_margin 分支
+
+run_records/ttrl_chunk_state_powerflow_answer_value_margin_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  继承 majority-consistent mid-state c128 配置
+  ttrl.chunk_state_score_mode=answer_value_margin
+  +ttrl.chunk_state_value_margin=0.25
+  +ttrl.chunk_state_format_guard=True
+  +ttrl.chunk_state_max_boxed_count=8
+  +ttrl.chunk_state_max_answer_chars=128
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_value_margin_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_value_margin_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+answer_value_margin_baseline_ratio=0.336
+answer_value_margin_answer_coverage=0.714
+answer_value_margin_hit_rate=0.382
+answer_value_margin_format_rate=0.714
+answer_value_margin_margin=0.205
+answer_value_margin_score=0.178
+answer_value_margin_max_margin=0.356
+answer_value_margin_improved_state_ratio=0.542
+answer_value_margin_label_consistent_ratio=0.336
+kept_state_ratio=0.385
+target_entropy=1.739
+powerflow_weight_max=7.035
+actor/powerflow_loss=0.070
+actor/grad_norm=9.785
+timing_s/gen=35.786
+timing_s/chunk_state_score=8.930
+timing_s/update_actor=7.553
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP/vLLM 崩溃，`chunk_state_score/mode_answer_value_margin=1.0`。
+- format guard 生效后信号更稀疏：`format_rate=0.714`、`score_mean=0.178`、`kept_state_ratio=0.385`，但不是全零。
+- 当前不能直接扩 20-step：前两步 `actor/powerflow_loss=0.0`，第三步才到 `0.210`。这说明保守 margin target 虽然能跑，但和 PowerFlow 的 chunk weights/boxed_reward 交互不够稳定，可能导致有效更新不足。
+- 下一版应优先修 target-to-loss 的有效性：可以把 margin target 改成 state 内 top-k normalized margin，降低 hard margin 到 0.125，或给每个 kept state 至少一个 top candidate 正权重；同时继续保留 format/degeneration guard。只有确认每步 PowerFlow loss 都非零且 format 不退化后，才跑 20-step validation gate。

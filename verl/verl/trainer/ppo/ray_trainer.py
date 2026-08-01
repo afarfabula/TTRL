@@ -1980,6 +1980,134 @@ class RayPPOTrainer:
         }
         return scores, metrics
 
+    def _chunk_state_probe_is_well_formed(self, response_str: str, answer: str | None) -> bool:
+        if answer is None or answer == "None":
+            return False
+        if len(answer.strip()) == 0 or len(answer) > int(self.config.ttrl.get("chunk_state_max_answer_chars", 128)):
+            return False
+        max_boxed = int(self.config.ttrl.get("chunk_state_max_boxed_count", 8))
+        if max_boxed > 0 and response_str.count("\\boxed") > max_boxed:
+            return False
+        return True
+
+    def _score_chunk_state_answer_value_margin(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        probe_output: DataProto,
+        candidates: int,
+        probe_samples: int,
+    ) -> tuple[torch.Tensor, dict]:
+        from verl.utils.reward_score.ttrl_math import extract_answer, grade, simplify_expression_string
+
+        if len(probe_output) != len(chunk_output) * probe_samples:
+            raise ValueError(
+                f"Expected {len(chunk_output) * probe_samples} probe outputs, got {len(probe_output)}"
+            )
+        if "chunk_state_prompt_majority_label" not in state_prompts.non_tensor_batch:
+            raise ValueError("chunk_state_score_mode='answer_value_margin' requires prompt-level majority labels")
+
+        cfg = self.config.ttrl
+        min_margin = float(cfg.get("chunk_state_value_margin", 0.25))
+        format_guard = bool(cfg.get("chunk_state_format_guard", True))
+        state_labels = [str(x) for x in state_prompts.non_tensor_batch["chunk_state_prompt_majority_label"]]
+        baseline_ratios = np.asarray(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_source_prompt_majority_ratio",
+                np.zeros(len(state_prompts), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        chunk_mask = chunk_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool()
+        hit_values = []
+        well_formed_values = []
+        answer_coverage = []
+        state_answer_counts = [0 for _ in range(len(state_prompts))]
+        for probe_idx in range(len(probe_output)):
+            chunk_idx = probe_idx // probe_samples
+            state_idx = chunk_idx // candidates
+            chunk_len = int(chunk_mask[chunk_idx].sum().item())
+            probe_len = int(probe_mask[probe_idx].sum().item())
+            response_ids = torch.cat(
+                [
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                    probe_output.batch["responses"][probe_idx, :probe_len],
+                ],
+                dim=0,
+            )
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            well_formed = self._chunk_state_probe_is_well_formed(response_str, answer)
+            label = state_labels[state_idx]
+            has_label = label != "None"
+            if well_formed:
+                state_answer_counts[state_idx] += 1
+            if not well_formed or not has_label:
+                hit = 0.0
+            elif answer == label:
+                hit = 1.0
+            else:
+                hit = 1.0 if grade(answer, label) else 0.0
+            hit_values.append(hit)
+            well_formed_values.append(1.0 if well_formed else 0.0)
+
+        group_size = candidates * probe_samples
+        hit_tensor = torch.tensor(hit_values, dtype=torch.float32).view(len(state_prompts), candidates, probe_samples)
+        well_formed_tensor = torch.tensor(well_formed_values, dtype=torch.float32).view(
+            len(state_prompts), candidates, probe_samples
+        )
+        hit_rate = hit_tensor.mean(dim=-1)
+        format_rate = well_formed_tensor.mean(dim=-1)
+        baseline = torch.as_tensor(baseline_ratios, dtype=torch.float32).view(len(state_prompts), 1)
+        margin_matrix = (hit_rate - baseline).clamp(min=0.0)
+        score_matrix = torch.where(margin_matrix >= min_margin, margin_matrix, torch.zeros_like(margin_matrix))
+        if format_guard:
+            score_matrix = score_matrix * (format_rate >= 1.0).to(dtype=torch.float32)
+        scores = score_matrix.reshape(-1)
+        label_consistent = (score_matrix > 0.0).to(dtype=torch.float32)
+        answer_coverage_arr = np.asarray(
+            [count / max(group_size, 1) for count in state_answer_counts],
+            dtype=np.float32,
+        )
+        baseline_arr = baseline_ratios.astype(np.float32)
+        max_margin = margin_matrix.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+        max_score = score_matrix.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+        mean_hit = hit_rate.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        mean_format = format_rate.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        improved_state = (max_score > 0.0).astype(np.float32)
+
+        state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = baseline_arr
+        state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = answer_coverage_arr
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
+            np.float32
+        )
+        metrics = {
+            "chunk_state_answer_value_margin/group_size": float(group_size),
+            "chunk_state_answer_value_margin/baseline_ratio_mean": float(baseline_arr.mean())
+            if len(baseline_arr)
+            else 0.0,
+            "chunk_state_answer_value_margin/answer_coverage_mean": float(answer_coverage_arr.mean())
+            if len(answer_coverage_arr)
+            else 0.0,
+            "chunk_state_answer_value_margin/hit_rate_mean": float(mean_hit.mean()) if len(mean_hit) else 0.0,
+            "chunk_state_answer_value_margin/format_rate_mean": float(mean_format.mean()) if len(mean_format) else 0.0,
+            "chunk_state_answer_value_margin/margin_mean": margin_matrix.mean().item() if len(margin_matrix) else 0.0,
+            "chunk_state_answer_value_margin/score_mean": score_matrix.mean().item() if len(score_matrix) else 0.0,
+            "chunk_state_answer_value_margin/max_margin_mean": float(max_margin.mean()) if len(max_margin) else 0.0,
+            "chunk_state_answer_value_margin/improved_state_ratio": float(improved_state.mean())
+            if len(improved_state)
+            else 0.0,
+            "chunk_state_answer_value_margin/label_consistent_ratio": label_consistent.mean().item()
+            if len(label_consistent)
+            else 0.0,
+            "chunk_state_answer_value_margin/min_margin": min_margin,
+            "chunk_state_answer_value_margin/format_guard": float(format_guard),
+        }
+        return scores, metrics
+
     def _score_chunk_state_answer_distribution(
         self,
         state_prompts: DataProto,
@@ -2432,7 +2560,11 @@ class RayPPOTrainer:
         if source_mode in {"success"} or bool(cfg.get("chunk_state_diag_enable", False)):
             source_correctness = self._compute_original_gt_rewards(full_batch)
         score_mode = str(cfg.get("chunk_state_score_mode", ""))
-        if source_mode == "majority_consistent" or score_mode in {"answer_consensus", "answer_value_gain"}:
+        if source_mode == "majority_consistent" or score_mode in {
+            "answer_consensus",
+            "answer_value_gain",
+            "answer_value_margin",
+        }:
             (
                 source_majority_consistent,
                 source_majority_ratios,
@@ -2560,12 +2692,25 @@ class RayPPOTrainer:
                 metrics["chunk_state_probe/raw_positive_ratio"] = value_gain_metrics[
                     "chunk_state_answer_value_gain/gain_mean"
                 ]
+            elif score_mode == "answer_value_margin":
+                scores, value_margin_metrics = self._score_chunk_state_answer_value_margin(
+                    state_prompts=state_prompts,
+                    chunk_output=chunk_output,
+                    probe_output=probe_output,
+                    candidates=candidates,
+                    probe_samples=probe_samples,
+                )
+                metrics.update(value_margin_metrics)
+                metrics["chunk_state_probe/raw_positive_ratio"] = value_margin_metrics[
+                    "chunk_state_answer_value_margin/score_mean"
+                ]
             else:
                 raise ValueError(f"Unsupported ttrl.chunk_state_score_mode={score_mode!r}")
             metrics["chunk_state_score/mode_majority_completion"] = float(score_mode == "majority_completion")
             metrics["chunk_state_score/mode_answer_consensus"] = float(score_mode == "answer_consensus")
             metrics["chunk_state_score/mode_answer_distribution"] = float(score_mode == "answer_distribution")
             metrics["chunk_state_score/mode_answer_value_gain"] = float(score_mode == "answer_value_gain")
+            metrics["chunk_state_score/mode_answer_value_margin"] = float(score_mode == "answer_value_margin")
             metrics["chunk_state_probe/samples"] = float(probe_samples)
             if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
                 anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
