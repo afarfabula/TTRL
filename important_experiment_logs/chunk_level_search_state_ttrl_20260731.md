@@ -8051,3 +8051,95 @@ diag_rows = 8
 - 可以保留 high-support source 作为 state prior，但 boundary 不应推到 0.5-0.9；更合理的是 mid-state 0.25-0.70 或多 boundary mix。
 - score 也不应只用 hard positive gain；更适合用 soft support affinity / smoothed posterior / rank target，同时显式报告 raw coverage 和 OOV，防止 smoothing 掩盖失败。
 - 如果要继续验证 state selector，应尝试“high-support source + normal/mid boundary + soft transport affinity”，目标是先让 raw support coverage 不低于 baseline，再谈 20-step gate。
+
+## 2026-08-01 high-support mid-state soft-affinity smoke
+
+背景：
+
+- 这轮按最新纠偏执行：不再把 short-horizon probe 的局部命中、source answer consistency 或 positive gain 当作主要 teacher。
+- full rollout group support 仍是 score 的参照分布；source chunk 只作为候选 prior / drift guard。
+- 相比 highmass-late，把 boundary 拉回 0.25-0.70，source mass gate 降到 0.40，score 改为 soft `transport_affinity`，并显式关闭 `label_consistent_only` / `zero_inconsistent_candidates`。
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c128_probe4_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c128_probe4_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c128_probe4_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_highsupport_mid_transport_affinity_c128_probe4_b32_r32_v64_1step_20260801.jsonl
+```
+
+配置：
+
+```text
+score_type = transport_affinity
+prior_smoothing = 0.0
+source_mode = majority_consistent
+source_select_by_mass = true
+min_prompt_top_mass = 0.35
+min_source_answer_mass = 0.40
+boundary_mode = mid
+mid_boundary_min_ratio = 0.25
+mid_boundary_max_ratio = 0.70
+probe_samples = 4
+candidates = 8
+chunk_size = 128
+label_consistent_only = false
+zero_inconsistent_candidates = false
+skip_all_negative = false
+min_state_coverage = 0.50
+max_state_oov = 0.50
+min_state_top_margin = 0.02
+```
+
+关键结果：
+
+```text
+source_mass_mean = 0.520
+prompt_top_mass_mean = 0.520
+source_original_acc_mean = 1.000
+source_pseudo_acc_mean = 0.938
+
+real_state_count = 11
+pad_state_count = 5
+skipped_support_sources = 21
+majority_consistent_fallbacks = 11
+boundary_mean = 592
+boundary_min = 256
+boundary_max = 1024
+
+support_coverage_mean = 0.598
+candidate_oov_tv_mean = 0.662
+transport_affinity_mean = 0.338
+transport_gain_mean = -0.182
+state_top_margin_mean = 0.021
+learnable_state_keep_ratio = 0.125
+state_keep_ratio = 0.125
+
+num_actor_samples = 8
+zeroed_state_ratio = 0.938
+target_entropy = 1.894
+actor/powerflow_loss = 2.063
+chunk_state_probe = 14.235s
+chunk_state_score = 9.499s
+chunk_state_ref = 3.904s
+update_actor = 0.737s
+diag_rows = 16
+```
+
+结论：
+
+- 这轮比 highmass-late 健康：raw `support_coverage_mean=0.598`，高于 masssrc baseline 的约 0.564，也明显高于 highmass-late 的 0.434。把 boundary 拉回 mid，并放弃 hard positive-gain collapse 是正确方向。
+- 但这轮仍不能升级 20-step：`candidate_oov_tv_mean=0.662` 仍高，`transport_gain_mean=-0.182` 仍为负，说明候选未来分布平均没有比 source 更接近 full-rollout support。
+- 主要失败点从“无正样本”变成“可训练 state 太少”：`learnable_state_keep_ratio=0.125`、`num_actor_samples=8`、`zeroed_state_ratio=0.938`。只有 2/16 个 state 通过 gate，最后每卡约 1 个样本，训练信号太稀。
+- 这轮也进一步支持最新判断：训练更新不是瓶颈，`update_actor=0.737s` 很快；主矛盾仍是 target/state/candidate 质量，不能继续靠短 probe 局部命中或 source 硬约束加码。
+
+下一步：
+
+- 保留 `transport_affinity` 作为 full-support soft target 方向，但需要改 candidate/state 生成，而不是继续调 PowerFlow 更新速度。
+- 更合理的下一版应让 full rollout group support 更直接地参与 label estimation：
+  - 从每个 prompt 的完整 rollout group 先构造 answer support / value support。
+  - state 选择优先来自 support 内高质量 source，但不要只选 late boundary。
+  - candidate target 使用 per-state softened full-support distribution，source chunk 只作为 prior，不作为 hard teacher。
+  - 对低信息 state 直接跳过：all-negative、高 OOV、support coverage 低、top margin 太平。
+- 下一轮 smoke gate 不看 smoothed 指标单独变好，仍以 raw `support_coverage_mean`、`candidate_oov_tv_mean`、`transport_gain_mean`、`state_keep_ratio`、`num_actor_samples` 为准。
