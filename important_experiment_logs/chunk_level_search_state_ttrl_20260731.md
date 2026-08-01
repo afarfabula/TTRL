@@ -7971,3 +7971,83 @@ NCCL = 2.28.9+cuda13.0, NVLS enabled, isAllDirectP2p 1
   - 对同一 source path 做 multi-boundary 或 suffix-aware candidate，不再让独立 short probe 决定 teacher。
   - 引入 state-level skip：all-negative、高 OOV、low coverage、top margin 太平的 state 直接不训。
   - 如果继续用 smoothing，应把 smoothing 强度作为 prior，不允许它掩盖 raw coverage/OOV 的失败。
+
+## 2026-08-01 high-support late-state smoke
+
+背景：
+
+- 上一轮 smoothed posterior 说明 target construction 可以被 full-support prior 拉动，但 raw candidate quality 没改善。
+- 本轮先不改代码，只用已有 source / boundary gate 验证一个假设：如果从 high-support source rollout 选更靠后的 state，是否能减少低信息 state，并让 raw future support coverage / transport gain 改善。
+- 这是对“改 state/candidate 生成本身”的最小验证，不使用 smoothing。
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_highmass_late_transport_support_gain_c128_probe4_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_highmass_late_transport_support_gain_c128_probe4_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_highmass_late_transport_support_gain_c128_probe4_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_highmass_late_transport_support_gain_c128_probe4_b32_r32_v64_1step_20260801.jsonl
+```
+
+配置：
+
+```text
+score_type = transport_support_gain
+prior_smoothing = 0.0
+source_mode = majority_consistent
+source_select_by_mass = true
+min_prompt_top_mass = 0.40
+min_source_answer_mass = 0.50
+boundary_mode = mid
+mid_boundary_min_ratio = 0.50
+mid_boundary_max_ratio = 0.90
+probe_samples = 4
+candidates = 8
+chunk_size = 128
+```
+
+关键结果：
+
+```text
+source_mass_mean = 0.645
+prompt_top_mass_mean = 0.645
+source_original_acc_mean = 1.000
+source_pseudo_acc_mean = 0.875
+
+real_state_count = 7
+pad_state_count = 1
+skipped_support_sources = 25
+majority_consistent_fallbacks = 9
+boundary_mean = 928
+boundary_min = 768
+boundary_max = 1024
+
+support_coverage_mean = 0.434
+candidate_oov_tv_mean = 0.688
+transport_gain_mean = -0.333
+score_mean = 0.001
+label_consistent_ratio = 0.016
+state_keep_ratio = 0.000
+
+num_actor_samples = 64
+kept_state_ratio = 0.000
+actor/powerflow_loss = 0.000
+chunk_state_probe = 13.404s
+chunk_state_score = 8.393s
+update_actor = 2.880s
+diag_rows = 8
+```
+
+结论：
+
+- 这条路线失败，而且失败原因清楚：high-support source selection 本身有效，`source_mass_mean` 从 0.423 提到 0.645，`source_original_acc_mean=1.0`，但 late boundary 让 candidate 未来 probe 更难回到 full support。
+- raw target 质量没有改善，反而更差：`support_coverage_mean=0.434`，低于 masssrc baseline 的约 0.564；`transport_gain_mean=-0.333`，比 baseline 的约 -0.127 更差。
+- 因为 source baseline 太强，要求 `transport_support_gain` 正增益导致几乎所有 candidate 被打零：`label_consistent_ratio=0.016`、`state_keep_ratio=0`、`actor/powerflow_loss=0`。这不是可训练信号。
+- 因此不能简单做“高 support source + late boundary + positive gain”。这会把训练目标变成“在一个已经很强的后段状态上找到更强 continuation”，实际 sampled candidate 很难超过 source future distribution。
+
+下一步：
+
+- 不再重复 strict highmass-late positive-gain 设置。
+- 可以保留 high-support source 作为 state prior，但 boundary 不应推到 0.5-0.9；更合理的是 mid-state 0.25-0.70 或多 boundary mix。
+- score 也不应只用 hard positive gain；更适合用 soft support affinity / smoothed posterior / rank target，同时显式报告 raw coverage 和 OOV，防止 smoothing 掩盖失败。
+- 如果要继续验证 state selector，应尝试“high-support source + normal/mid boundary + soft transport affinity”，目标是先让 raw support coverage 不低于 baseline，再谈 20-step gate。
