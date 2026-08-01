@@ -7588,3 +7588,123 @@ future_support_keep mean = 0.250
 - 但核心 transport 指标没有改善：`candidate_oov_tv_mean` 基本不变，`transport_gain_mean` 仍为负，`state_keep_ratio` 还略降。因此单纯把 candidate 数翻倍不是主解。
 - infra 侧可以承受：probe 时间从 15.6s 增到 19.8s，actor update 仍约 2s，B200 大显存/算力可以支撑更宽 search；但方法收益不足，不应直接扩 20-step。
 - 下一步应做真正 staged proposal：不是只增加 chunk candidate 数，而是对当前 state 的 candidate 做更长 horizon / 多阶段 future support estimation，或者把 probe 预算从每个 candidate 固定 4 条改成先宽后深的两阶段分配，优先把算力给已经接近 full support 的 candidate。
+
+## 2026-08-01 staged future-support estimation smoke
+
+背景：
+
+- 用户明确要求放弃“局部短视可判定性”：chunk target 不应主要由 short-horizon probe 的局部命中 / source consistency 定义。
+- 当前目标是保留 PowerFlow-style distribution matching 骨架，但把 probe 预算改成两阶段：先用 full-rollout support transport signal 宽筛 candidate，再只对 top-k candidate 做额外 future probe。
+- 这个实验只验证 staged estimator 的工程闭环和 target 质量，不做 validation。
+
+实现：
+
+- 在 `ray_trainer.py` 新增默认关闭的 staged future-support path：
+  - 第一阶段：所有 candidate 使用原 `chunk_state_probe_samples=4` probe，并复用 `future_support_gain + transport_affinity` scorer 做 full-support 粗排。
+  - 第二阶段：每个 state 取 top2 candidate，再追加 `extra_samples=4` 的 deeper probe。
+  - 最终仍调用同一个 full-rollout support transport scorer；source chunk 只作为 prior/drift guard，不作为 hard teacher。
+- 新增配置默认关闭：
+  - `chunk_state_staged_probe_enable`
+  - `chunk_state_staged_probe_topk`
+  - `chunk_state_staged_probe_extra_samples`
+  - `chunk_state_staged_probe_extra_max_tokens`
+
+### staged v1：zero padding merge 失败证据
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.jsonl
+```
+
+关键结果：
+
+```text
+base support_coverage_mean = 0.564
+base candidate_oov_tv_mean = 0.704
+base transport_gain_mean = -0.127
+base state_keep_ratio = 0.292
+
+final support_coverage_mean = 0.363
+final candidate_oov_tv_mean = 0.750
+final transport_gain_mean = -0.173
+final state_keep_ratio = 0.042
+num_actor_samples = 192
+powerflow_weight_mean = 0.000
+actor/powerflow_loss = 0.000
+
+chunk_state_probe = 15.620s
+chunk_state_staged_probe_extra = 13.318s
+update_actor = 6.964s
+diag_rows = 24
+```
+
+结论：
+
+- 这是一个实现失败，不是方法失败。问题在于非 top-k candidate 的 extra probe slot 用空 response padding 补齐，scorer 把这些空 probe 解读成 OOV answer，直接污染 full-support transport target。
+- 这个失败证据很重要：staged estimator 不能用“空 probe”去凑固定形状，否则会人为制造 OOV mass，让 state gate 和 PowerFlow weight 全部坍缩。
+
+### staged v1 fixedmerge：有效更新恢复，但 target 质量未突破
+
+修复：
+
+- 非 top-k candidate 的 extra slot 不再用空 probe padding，而是循环复用该 candidate 的第一阶段 base probes。
+- 这样非 top-k candidate 保持第一阶段证据不变，top-k candidate 才获得额外 future evidence。
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_fixedmerge_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_fixedmerge_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_staged_transport_affinity_masssrc_stategate_c128_probe4xextra4_top2_fixedmerge_b32_r32_v64_1step_20260801.jsonl
+```
+
+关键结果：
+
+```text
+base support_coverage_mean = 0.564
+base candidate_oov_tv_mean = 0.704
+base transport_gain_mean = -0.127
+base state_keep_ratio = 0.292
+
+final support_coverage_mean = 0.557
+final candidate_oov_tv_mean = 0.704
+final transport_gain_mean = -0.127
+final state_keep_ratio = 0.208
+label_consistent_ratio = 0.781
+num_actor_samples = 24
+pruned_sample_ratio = 0.875
+powerflow_weight_mean = 1.000
+actor/powerflow_loss = 0.400
+actor/grad_norm = 2.960
+
+chunk_state_probe = 15.610s
+chunk_state_staged_score = 2.939s
+chunk_state_staged_probe_extra = 13.307s
+chunk_state_score = 12.116s
+chunk_state_ref = 4.213s
+update_actor = 1.319s
+diag_rows = 24
+```
+
+与 c8 masssrc baseline 对比：
+
+```text
+support_coverage_mean: 0.564 -> 0.557
+candidate_oov_tv_mean: 0.704 -> 0.704
+transport_gain_mean: -0.127 -> -0.127
+state_keep_ratio: 0.292 -> 0.208
+num_actor_samples: 40 -> 24
+chunk_state_probe total: 15.622s -> 15.610s + 13.307s extra
+update_actor: 2.020s -> 1.319s
+```
+
+结论：
+
+- fixedmerge 证明 staged probe 工程闭环可跑通，并且不会再把 PowerFlow update 打成 0。
+- 但当前 top2 x extra4 设计没有改善核心 target 质量：`candidate_oov_tv_mean` 和 `transport_gain_mean` 基本与 base 相同，`state_keep_ratio` 还下降。
+- 这说明“先用同一批短 probe 的 transport_affinity 选 top-k，再对 top-k 加同长度 extra probe”不足以摆脱 short-horizon target 噪声；它更像是对已有 noisy signal 做重复确认。
+- 下一步不应直接跑 20-step。更合理的改法是让第二阶段真正回答 future improvement：
+  - 第二阶段 probe horizon / completion policy 要和第一阶段不同，例如更长 continuation 或 fewer but deeper completion。
+  - top-k 选择不能只看当前 `transport_affinity`，还应引入 full rollout answer support margin / coverage uncertainty，优先给高不确定但可学习 state 加深。
+  - scorer 需要区分 base evidence 与 extra evidence，允许 top-k 的 extra evidence 更新 target，而非简单平均后让 base evidence 稀释。

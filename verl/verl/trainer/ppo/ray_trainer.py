@@ -1859,6 +1859,144 @@ class RayPPOTrainer:
         }
         return proto
 
+    def _combine_selected_state_and_completion_prompts(
+        self,
+        state_prompts: DataProto,
+        chunk_output: DataProto,
+        selected_chunk_indices: list[int],
+        max_completion_tokens: int,
+        probe_samples: int = 1,
+    ) -> DataProto:
+        prompt_len = state_prompts.batch["input_ids"].shape[-1]
+        response_mask = chunk_output.batch["response_mask"].bool()
+        candidates = len(chunk_output) // len(state_prompts)
+        combined_ids = []
+        combined_masks = []
+        selected_state_indices = []
+        selected_candidate_indices = []
+        for chunk_idx in selected_chunk_indices:
+            source_idx = int(chunk_idx) // candidates
+            candidate_idx = int(chunk_idx) % candidates
+            state_valid_len = int(state_prompts.batch["attention_mask"][source_idx].sum().item())
+            state_ids = state_prompts.batch["input_ids"][source_idx, -state_valid_len:]
+            chunk_len = int(response_mask[int(chunk_idx)].sum().item())
+            chunk_ids = chunk_output.batch["responses"][int(chunk_idx), :chunk_len]
+            combined = torch.cat([state_ids, chunk_ids], dim=0)
+            if combined.numel() > prompt_len:
+                combined = combined[-prompt_len:]
+            attn = torch.ones_like(combined)
+            combined, attn = verl_F.postprocess_data(
+                input_ids=combined.unsqueeze(0),
+                attention_mask=attn.unsqueeze(0),
+                max_length=prompt_len,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation="left",
+            )
+            combined_ids.append(combined.squeeze(0))
+            combined_masks.append(attn.squeeze(0))
+            selected_state_indices.append(source_idx)
+            selected_candidate_indices.append(candidate_idx)
+
+        input_ids = torch.stack(combined_ids, dim=0)
+        attention_mask = torch.stack(combined_masks, dim=0)
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+        prompt_batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=(len(selected_chunk_indices),),
+        )
+        non_tensor_batch = {}
+        state_indices_np = np.asarray(selected_state_indices, dtype=np.int64)
+        for key, value in state_prompts.non_tensor_batch.items():
+            non_tensor_batch[key] = value[state_indices_np]
+        non_tensor_batch["chunk_state_selected_chunk_index"] = np.asarray(selected_chunk_indices, dtype=np.int64)
+        non_tensor_batch["chunk_state_selected_state_index"] = state_indices_np
+        non_tensor_batch["chunk_state_selected_candidate_index"] = np.asarray(selected_candidate_indices, dtype=np.int64)
+        proto = DataProto(batch=prompt_batch, non_tensor_batch=non_tensor_batch)
+        proto.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": True,
+            "kwargs": {"n": int(probe_samples), "max_tokens": int(max_completion_tokens)},
+        }
+        return proto
+
+    def _merge_chunk_state_staged_probe_output(
+        self,
+        chunk_output: DataProto,
+        base_probe_output: DataProto,
+        extra_probe_output: DataProto,
+        selected_chunk_indices: list[int],
+        base_probe_samples: int,
+        extra_probe_samples: int,
+    ) -> DataProto:
+        total_probe_samples = int(base_probe_samples) + int(extra_probe_samples)
+        selected_extra_offset = {
+            int(chunk_idx): idx * int(extra_probe_samples) for idx, chunk_idx in enumerate(selected_chunk_indices)
+        }
+        response_shape = base_probe_output.batch["responses"].shape[1:]
+        mask_shape = base_probe_output.batch["response_mask"].shape[1:]
+        pad_response = torch.full(
+            response_shape,
+            self.tokenizer.pad_token_id,
+            dtype=base_probe_output.batch["responses"].dtype,
+            device=base_probe_output.batch["responses"].device,
+        )
+        zero_mask = torch.zeros(
+            mask_shape,
+            dtype=base_probe_output.batch["response_mask"].dtype,
+            device=base_probe_output.batch["response_mask"].device,
+        )
+        rows = defaultdict(list)
+        for chunk_idx in range(len(chunk_output)):
+            base_start = chunk_idx * int(base_probe_samples)
+            for offset in range(int(base_probe_samples)):
+                rows[chunk_idx].append(("base", base_start + offset))
+            extra_start = selected_extra_offset.get(chunk_idx, None)
+            if extra_start is None:
+                # Keep non-top-k candidates on their first-stage evidence.
+                # Empty padding would be decoded as OOV answers and would
+                # artificially destroy the full-support transport target.
+                for offset in range(int(extra_probe_samples)):
+                    rows[chunk_idx].append(("base", base_start + (offset % int(base_probe_samples))))
+            else:
+                for offset in range(int(extra_probe_samples)):
+                    rows[chunk_idx].append(("extra", extra_start + offset))
+
+        merged_batch = {}
+        for key in base_probe_output.batch.keys():
+            values = []
+            if key == "responses":
+                pad_value = pad_response
+            elif key == "response_mask":
+                pad_value = zero_mask
+            else:
+                pad_value = torch.zeros(
+                    base_probe_output.batch[key].shape[1:],
+                    dtype=base_probe_output.batch[key].dtype,
+                    device=base_probe_output.batch[key].device,
+                )
+            for chunk_idx in range(len(chunk_output)):
+                for source, row_idx in rows[chunk_idx]:
+                    if source == "base":
+                        values.append(base_probe_output.batch[key][row_idx])
+                    elif source == "extra":
+                        values.append(extra_probe_output.batch[key][row_idx])
+                    else:
+                        values.append(pad_value)
+            merged_batch[key] = torch.stack(values, dim=0)
+
+        td = TensorDict(merged_batch, batch_size=(len(chunk_output) * total_probe_samples,))
+        non_tensor_batch = {}
+        for key, value in chunk_output.non_tensor_batch.items():
+            non_tensor_batch[key] = np.repeat(value, total_probe_samples, axis=0)
+        return DataProto(batch=td, non_tensor_batch=non_tensor_batch)
+
     def _build_probe_reward_batch(
         self,
         state_prompts: DataProto,
@@ -4070,6 +4208,7 @@ class RayPPOTrainer:
                 chunk_output.meta_info.pop("timing", None)
 
         probe_output = None
+        score_probe_samples = probe_samples
         if score_mode in {"support_anchor", "support_flow"}:
             metrics[f"chunk_state_probe/skipped_for_{score_mode}"] = 1.0
         else:
@@ -4088,13 +4227,71 @@ class RayPPOTrainer:
                         timing_raw[f"chunk_state_probe/{key}"] = value
                     probe_output.meta_info.pop("timing", None)
 
+            if score_mode == "future_support_gain" and bool(cfg.get("chunk_state_staged_probe_enable", False)):
+                staged_topk = max(0, min(int(cfg.get("chunk_state_staged_probe_topk", 0)), candidates))
+                staged_extra_samples = max(0, int(cfg.get("chunk_state_staged_probe_extra_samples", 0)))
+                if staged_topk > 0 and staged_extra_samples > 0:
+                    with marked_timer("chunk_state_staged_score", timing_raw, color="yellow"):
+                        base_scores, base_future_support_metrics = self._score_chunk_state_future_support_gain(
+                            state_prompts=state_prompts,
+                            chunk_output=chunk_output,
+                            probe_output=probe_output,
+                            candidates=candidates,
+                            probe_samples=probe_samples,
+                        )
+                    base_score_matrix = base_scores.view(len(state_prompts), candidates).float()
+                    selected_chunk_indices = []
+                    for state_idx in range(len(state_prompts)):
+                        top_indices = torch.topk(base_score_matrix[state_idx], k=staged_topk).indices.tolist()
+                        for cand_idx in top_indices:
+                            selected_chunk_indices.append(state_idx * candidates + int(cand_idx))
+                    metrics["chunk_state_staged_probe/enabled"] = 1.0
+                    metrics["chunk_state_staged_probe/topk"] = float(staged_topk)
+                    metrics["chunk_state_staged_probe/extra_samples"] = float(staged_extra_samples)
+                    metrics["chunk_state_staged_probe/selected_chunks"] = float(len(selected_chunk_indices))
+                    metrics["chunk_state_staged_probe/selected_ratio"] = (
+                        len(selected_chunk_indices) / max(len(chunk_output), 1)
+                    )
+                    for key, value in base_future_support_metrics.items():
+                        metrics[f"chunk_state_staged_base/{key.split('/', 1)[-1]}"] = value
+                    with marked_timer("chunk_state_staged_probe_extra", timing_raw, color="red"):
+                        staged_extra_tokens_cfg = int(
+                            cfg.get("chunk_state_staged_probe_extra_max_tokens", probe_max_tokens)
+                        )
+                        staged_extra_tokens = max(1, min(staged_extra_tokens_cfg, max_model_len - max_prompt_len))
+                        staged_probe_prompts = self._combine_selected_state_and_completion_prompts(
+                            state_prompts=state_prompts,
+                            chunk_output=chunk_output,
+                            selected_chunk_indices=selected_chunk_indices,
+                            max_completion_tokens=staged_extra_tokens,
+                            probe_samples=staged_extra_samples,
+                        )
+                        staged_probe_output = self.actor_rollout_wg.generate_sequences(staged_probe_prompts)
+                        staged_probe_output.non_tensor_batch = staged_probe_prompts.non_tensor_batch
+                        if "timing" in staged_probe_output.meta_info:
+                            for key, value in staged_probe_output.meta_info["timing"].items():
+                                timing_raw[f"chunk_state_staged_probe_extra/{key}"] = value
+                            staged_probe_output.meta_info.pop("timing", None)
+                    probe_output = self._merge_chunk_state_staged_probe_output(
+                        chunk_output=chunk_output,
+                        base_probe_output=probe_output,
+                        extra_probe_output=staged_probe_output,
+                        selected_chunk_indices=selected_chunk_indices,
+                        base_probe_samples=probe_samples,
+                        extra_probe_samples=staged_extra_samples,
+                    )
+                    score_probe_samples = probe_samples + staged_extra_samples
+                    metrics["chunk_state_staged_probe/score_probe_samples"] = float(score_probe_samples)
+                else:
+                    metrics["chunk_state_staged_probe/enabled"] = 0.0
+
         with marked_timer("chunk_state_score", timing_raw, color="yellow"):
             score_mode = str(cfg.get("chunk_state_score_mode", "probe_reward"))
             if score_mode == "probe_reward":
                 probe_batch = self._build_probe_reward_batch(state_prompts, chunk_output, probe_output)
                 reward_tensor, _ = compute_reward(probe_batch, self.reward_fn)
                 raw_probe_scores = reward_tensor.sum(dim=-1).detach().cpu()
-                scores = raw_probe_scores.view(len(state_prompts), candidates, probe_samples).float().mean(dim=-1).reshape(-1)
+                scores = raw_probe_scores.view(len(state_prompts), candidates, score_probe_samples).float().mean(dim=-1).reshape(-1)
                 metrics["chunk_state_probe/raw_positive_ratio"] = raw_probe_scores.float().mean().item()
             elif score_mode == "majority_completion":
                 scores, majority_metrics = self._score_chunk_state_majority_completion(
@@ -4102,7 +4299,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(majority_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = majority_metrics[
@@ -4114,7 +4311,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(consensus_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = consensus_metrics[
@@ -4126,7 +4323,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(distribution_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = distribution_metrics[
@@ -4138,7 +4335,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(value_gain_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = value_gain_metrics[
@@ -4150,7 +4347,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(value_margin_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = value_margin_metrics[
@@ -4162,7 +4359,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(support_mass_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = support_mass_metrics[
@@ -4174,7 +4371,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(future_support_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = future_support_metrics[
@@ -4204,7 +4401,7 @@ class RayPPOTrainer:
                     chunk_output=chunk_output,
                     probe_output=probe_output,
                     candidates=candidates,
-                    probe_samples=probe_samples,
+                    probe_samples=score_probe_samples,
                 )
                 metrics.update(source_consistency_metrics)
                 metrics["chunk_state_probe/raw_positive_ratio"] = source_consistency_metrics[
@@ -4225,7 +4422,7 @@ class RayPPOTrainer:
                 score_mode == "answer_source_consistency"
             )
             if score_mode not in {"support_anchor", "support_flow"}:
-                metrics["chunk_state_probe/samples"] = float(probe_samples)
+                metrics["chunk_state_probe/samples"] = float(score_probe_samples)
             if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
                 anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
                 anchor_score = float(cfg.get("chunk_state_teacher_anchor_score", 1.0))

@@ -52,6 +52,14 @@ ttrl:
   chunk_state_chunk_size: 256
   chunk_state_probe_max_tokens: 3072
   chunk_state_probe_samples: 1
+  # Optional staged future-support estimator. When enabled for
+  # future_support_gain, all candidates first receive the normal cheap probes;
+  # only top-k candidates under the full-rollout support transport signal get
+  # additional deeper probes. Defaults are disabled for exact compatibility.
+  chunk_state_staged_probe_enable: false
+  chunk_state_staged_probe_topk: 2
+  chunk_state_staged_probe_extra_samples: 4
+  chunk_state_staged_probe_extra_max_tokens: ${ttrl.chunk_state_probe_max_tokens}
   chunk_state_states_per_prompt: 1
   chunk_state_max_prefix_tokens: 1024
   chunk_state_boundaries: [0, 256, 512, 768, 1024]
