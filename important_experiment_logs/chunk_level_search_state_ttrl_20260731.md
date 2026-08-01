@@ -3002,3 +3002,71 @@ grad_norm=11.749
 - actor update 仍是 `~7.2s`，保持 chunk actor update 的 infra 收益。
 - step2 的 `chunk_state_score=27.418s` 仍受 SymPy/parser timeout 影响，这不是本轮语义问题。
 - 下一步可以跑同配置 20-step final validation；gate 是必须超过 hard confidence gate `mean@16=0.5325`，否则需要继续增强 verifier/probe，而不是只扩到 80-step。
+
+## 2026-08-01 Majority-consistent Mid-state c128 20-step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_consistent_mid_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_source_chunk_enable=True
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_consistent_mid_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_consistent_mid_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+```
+
+Final validation：
+
+```text
+mean@16=0.486625
+maj@16=0.619360
+best@16=0.863332
+format_mean@16=0.898000
+format_maj@16=0.879554
+testing=295.888s
+```
+
+20-step 平均训练信号：
+
+```text
+source_original_correct=0.752
+source_majority_consistent=1.000
+source_pseudo_acc=0.853
+chunk_majority_ratio=0.466
+chunk_label_consistent_ratio=0.677
+kept_state_ratio=0.619
+positive_ratio=0.467
+probe_mean_source_original_correct=0.531
+probe_mean_source_original_wrong=0.262
+timing_s/gen=26.320
+timing_s/chunk_state_chunks=1.006
+timing_s/chunk_state_probe=6.617
+timing_s/chunk_state_score=10.832
+timing_s/chunk_state_ref=2.511
+timing_s/update_actor=7.538
+```
+
+与当前短程 gate 对比：
+
+```text
+hard confidence-gated c128:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+majority-consistent mid-state c128:
+  mean@16=0.486625 maj@16=0.619360 best@16=0.863332 format_mean@16=0.898000
+```
+
+结论：
+
+- 这轮 20-step gate 明确失败，不能扩到 80-step。
+- `majority_consistent` source construction 本身有效：没有使用真实 GT，但事后真实正确率平均 `0.752`，pseudo acc 平均 `0.853`。
+- 失败点在局部 target：同一个 chunk state 下的 completion majority 平均只有 `0.466`，即便 source 更可靠，next-chunk search distribution 仍不够干净。
+- 这说明 arXiv 2504.16084 的“同一 state 多输出聚合 label/reward”语义要继续保留，但 state 变成 `query + partial reasoning` 后，不能只用短 probe 的局部 completion majority 当训练目标。
+- 下一步应改 label estimation / verifier，而不是继续调 PowerFlow 权重：例如对 chunk candidate 做更长 horizon probe、复用完整 rollout 的 future success、或引入 answer-level verifier 聚合，保证 improved distribution 真正指向最终正确性。
+- infra 侧 actor update 已经稳定在 `~7.5s`；当前端到端主要由 full rollout `~26.3s`、chunk probe `~6.6s`、parser/scoring `~10.8s` 和 validation `~296s` 构成。parser timeout 仍是明显噪声源。
