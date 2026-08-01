@@ -3917,3 +3917,70 @@ actor/powerflow_chunk_loss_target_only: [1.000, 1.000, 1.000]
 - `target_only` 分支成功执行，且 step2/step3 loss 稳定非零；但 step1 仍然是 `actor/powerflow_weight_mean=0.0`、`actor/powerflow_loss=0.0`。
 - 因此第一步清零不是 boxed_reward residual 造成的。更可能的问题在 actor batch 的 `powerflow_chunk_weights` 传递、keep_indices 后的排序/分片、或 actor update 内部 microbatch/mini-batch 选择上；trainer 侧已经有非零 `chunk_state/powerflow_weight_mean`。
 - 暂不跑 20-step。下一步应该增加 actor-batch 权重诊断，例如在 `_build_chunk_state_actor_batch` 输出 `actor_batch_powerflow_weight_mean/max/nonzero_ratio`，并在 actor `update_policy` 入口输出实际收到的 `powerflow_chunk_weights` 统计，以确认权重是在 trainer->actor 传递前还是 actor 内部分片后变零。
+
+## 2026-08-01 Chunk PowerFlow Weight Shard Balance Fix
+
+问题定位：
+
+- `target_only` 3-step smoke 中 step1 的 `actor/powerflow_loss=0.0` 不是 chunk target 没信号。1-step 诊断显示 trainer 全局 `chunk_state/powerflow_weight_mean=0.469`、`chunk_state/actor_batch_powerflow_weight_nonzero_ratio=0.469`。
+- 真正问题是 actor batch 按连续顺序切给 8 个 FSDP/DP shard 时，正权重样本集中在部分 shard。修复前 shard0 完全没有正权重，导致 rank0 上报的 `actor/powerflow_weight/mean=0.0`、`actor/powerflow_loss=0.0`。
+
+修复前诊断：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_diag1_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=1
+diag_jsonl_rows=32
+chunk_state/powerflow_weight_mean=0.469
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio=0.469
+chunk_state/actor_batch_powerflow_weight_shard0_mean=0.000
+chunk_state/actor_batch_powerflow_weight_shard0_nonzero_ratio=0.000
+chunk_state/actor_batch_powerflow_weight_shard_mean_low=0.000
+chunk_state/actor_batch_powerflow_weight_shard_mean_high=0.750
+chunk_state/actor_batch_powerflow_weight_zero_shard_ratio=0.250
+actor/powerflow_loss=0.000
+actor/powerflow_weight/mean=0.000
+actor/powerflow_weight/nonzero_ratio=0.000
+actor/grad_norm=60.661
+timing_s/update_actor=7.705
+```
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  在 _build_chunk_state_actor_batch 中按 powerflow_flat_weights 对 actor batch 做 shard-balanced reorder
+  positive samples 按权重降序 round-robin 分配到 n_gpus_per_node * nnodes 个 bucket
+  zero-weight samples 也 round-robin 填充
+  只改变 actor batch 顺序，不改变 score/weight/loss/训练样本集合
+
+verl/workers/actor/dp_actor.py:
+  增加 actor/powerflow_weight/nonzero_ratio
+  增加 actor/powerflow_local_batch_size
+```
+
+修复后诊断：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_balance1_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=1
+diag_jsonl_rows=32
+chunk_state/powerflow_weight_mean=0.469
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio=0.469
+chunk_state/actor_batch_powerflow_weight_shard0_mean=0.615
+chunk_state/actor_batch_powerflow_weight_shard0_nonzero_ratio=0.469
+chunk_state/actor_batch_powerflow_weight_shard_mean_low=0.379
+chunk_state/actor_batch_powerflow_weight_shard_mean_high=0.615
+chunk_state/actor_batch_powerflow_weight_zero_shard_ratio=0.000
+actor/powerflow_loss=0.177
+actor/powerflow_weight/mean=0.615
+actor/powerflow_weight/nonzero_ratio=0.469
+actor/grad_norm=12.662
+timing_s/update_actor=6.166
+```
+
+结论：
+
+- 这是一个实现/infra 修复，不改变 chunk scoring 语义，也不改变 PowerFlow loss 公式。它只保证 search-improved positive chunks 不会因为 batch ordering 被集中分配到少数 DP shard。
+- 修复后所有 shard 都有正权重，`zero_shard_ratio` 从 `0.250` 降到 `0.000`，rank0 actor loss 从 `0.000` 变为 `0.177`。
+- 下一步应跑同配置 3-step balance smoke，确认三步 `actor/powerflow_loss` 都非零；若通过，再进入 20-step validation gate。

@@ -2479,6 +2479,31 @@ class RayPPOTrainer:
         flat_loss_weights = effective_state_loss_weights.repeat_interleave(candidates)[keep_indices]
         flat_weights = flat_weights * flat_loss_weights
         powerflow_flat_weights = flat_weights * candidates
+        shard_count = max(1, int(self.config.trainer.get("n_gpus_per_node", 1)) * int(self.config.trainer.get("nnodes", 1)))
+        if shard_count > 1 and len(powerflow_flat_weights) >= shard_count:
+            positive_indices = torch.nonzero(powerflow_flat_weights > 0.0, as_tuple=False).flatten()
+            zero_indices = torch.nonzero(powerflow_flat_weights <= 0.0, as_tuple=False).flatten()
+            if len(positive_indices) > 0:
+                positive_indices = positive_indices[
+                    torch.argsort(powerflow_flat_weights[positive_indices], descending=True)
+                ]
+            buckets = [[] for _ in range(shard_count)]
+            for i, index in enumerate(positive_indices.tolist()):
+                buckets[i % shard_count].append(index)
+            for i, index in enumerate(zero_indices.tolist()):
+                buckets[i % shard_count].append(index)
+            balanced_order = [index for bucket in buckets for index in bucket]
+            if len(balanced_order) == len(powerflow_flat_weights):
+                balanced_order = torch.as_tensor(balanced_order, dtype=torch.long)
+                kept_states = kept_states[balanced_order.tolist()]
+                responses = responses[balanced_order]
+                response_mask = response_mask[balanced_order]
+                flat_weights = flat_weights[balanced_order]
+                flat_loss_weights = flat_loss_weights[balanced_order]
+                powerflow_flat_weights = powerflow_flat_weights[balanced_order]
+        powerflow_weight_shards = torch.chunk(powerflow_flat_weights, min(shard_count, max(1, len(powerflow_flat_weights))))
+        shard_means = torch.stack([shard.mean() for shard in powerflow_weight_shards if len(shard) > 0])
+        shard_nonzero = torch.stack([(shard > 0.0).float().mean() for shard in powerflow_weight_shards if len(shard) > 0])
 
         prompt_ids = kept_states.batch["input_ids"]
         prompt_mask = kept_states.batch["attention_mask"]
@@ -2550,6 +2575,12 @@ class RayPPOTrainer:
             "chunk_state/powerflow_weight_mean": powerflow_flat_weights.mean().detach().item(),
             "chunk_state/powerflow_weight_max": powerflow_flat_weights.max().detach().item(),
             "chunk_state/powerflow_weight_min": powerflow_flat_weights.min().detach().item(),
+            "chunk_state/actor_batch_powerflow_weight_nonzero_ratio": (powerflow_flat_weights > 0.0).float().mean().detach().item(),
+            "chunk_state/actor_batch_powerflow_weight_shard0_mean": powerflow_weight_shards[0].mean().detach().item(),
+            "chunk_state/actor_batch_powerflow_weight_shard0_nonzero_ratio": (powerflow_weight_shards[0] > 0.0).float().mean().detach().item(),
+            "chunk_state/actor_batch_powerflow_weight_shard_mean_low": shard_means.min().detach().item(),
+            "chunk_state/actor_batch_powerflow_weight_shard_mean_high": shard_means.max().detach().item(),
+            "chunk_state/actor_batch_powerflow_weight_zero_shard_ratio": (shard_nonzero <= 0.0).float().mean().detach().item(),
         }
         metrics.update(span_metrics)
         return actor_proto, metrics

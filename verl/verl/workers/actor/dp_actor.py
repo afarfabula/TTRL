@@ -406,6 +406,8 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/powerflow_weight/mean": loss_weights.mean().detach().item(),
             "actor/powerflow_weight/min": loss_weights.min().detach().item(),
             "actor/powerflow_weight/max": loss_weights.max().detach().item(),
+            "actor/powerflow_weight/nonzero_ratio": (loss_weights > 0.0).float().mean().detach().item(),
+            "actor/powerflow_local_batch_size": float(loss_weights.numel()),
             "actor/log_z": log_z.mean().detach().item(),
             "actor/importance_weight": imp_w.mean().detach().item(),
             "actor/powerflow_chunk_loss_target_only": float(chunk_loss_mode == "target_only"),
