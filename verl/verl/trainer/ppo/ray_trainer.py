@@ -743,7 +743,9 @@ class RayPPOTrainer:
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
+            print("validation reward start")
             result = self.val_reward_fn(test_batch, return_dict=True)
+            print("validation reward end")
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -802,6 +804,13 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        val_metric_dump_path = self.config.trainer.get("validation_metric_dump_path", None)
+        if val_metric_dump_path:
+            os.makedirs(os.path.dirname(val_metric_dump_path), exist_ok=True)
+            with open(val_metric_dump_path, "w", encoding="utf-8") as f:
+                json.dump(metric_dict, f, ensure_ascii=False, indent=2, sort_keys=True)
+            print(f"validation metrics dumped to {val_metric_dump_path}")
 
         return metric_dict
 

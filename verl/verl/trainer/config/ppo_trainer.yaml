@@ -1035,6 +1035,10 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Optional JSON path for scalar validation metrics. This is useful for long
+  # debug runs where console logs may include large sampled generations.
+  validation_metric_dump_path: null
+
   # Number of nodes used in the training
   nnodes: 1
 

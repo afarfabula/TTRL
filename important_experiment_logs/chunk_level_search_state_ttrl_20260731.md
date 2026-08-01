@@ -6721,3 +6721,93 @@ step 2:
 - 语义上更贴合当前方法目标：teacher 由 full rollout support mass 定义，不依赖 short-horizon probe 的局部 answer hit，也不把 source answer mass 当 hard floor。
 - infra 可接受：第二步 `gen=11.1s`、`chunk_state_score=4.65s`、`update_actor=4.17s`。相比 hard gain 的 update_actor 约 2.2s 更慢一些，是因为保留了更多 actor samples，但仍远低于 full-trajectory actor update。
 - 下一步应该跑 20-step pilot 看 acc 轨迹，同时加低信息 state gate 的轻量 ablation：`min_answer_coverage` / `min_prompt_top_mass` / `min_source_answer_mass`，但不要回到 short-probe teacher。
+
+## 2026-08-01 support_flow soft_mass 20-step pilot
+
+目的：
+
+- 按 2-step smoke 的正向信号，把 `support_flow + soft_mass` 扩展到 20-step pilot。
+- 保持用户修正后的训练语义：不使用 short-horizon probe 局部命中 / source consistency 作为主要 teacher；chunk target 由 full-rollout group support mass 主导。
+- 只观察 pilot 是否能在 20 step 后给出有效 MATH-TTT / math500 validation acc，以及 step time 是否仍处于快链路。
+
+运行配置：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_20step_20260801.sh
+rerun3_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_20step_20260801_rerun3.log
+rerun3_diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_20step_20260801_rerun3.jsonl
+rerun3_val_metrics = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_softmass_mid_c128_b32_r32_v64_20step_20260801_rerun3_val_metrics.json
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+ttrl.n_votes_per_prompt = 64
+actor_rollout_ref.rollout.n = 32
+actor_rollout_ref.rollout.val_kwargs.n = 16
+trainer.total_training_steps = 20
+trainer.total_epochs = 2
+trainer.test_freq = 20
+trainer.final_val_enable = True
+ttrl.chunk_state_score_mode = support_flow
+ttrl.chunk_state_support_flow_score_type = soft_mass
+ttrl.chunk_state_chunk_size = 128
+ttrl.chunk_state_candidates = 8
+ttrl.chunk_state_support_anchor_count = 4
+ttrl.chunk_state_label_consistent_only = True
+ttrl.chunk_state_zero_inconsistent_candidates = True
+ttrl.chunk_state_prune_zero_weight_samples = True
+ttrl.chunk_state_powerflow_weight_clip = 4.0
+actor_rollout_ref.actor.powerflow_enable = True
+actor_rollout_ref.actor.use_kl_loss = False
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+过程问题和修复：
+
+- 第一次 20-step run 和 rerun1 都只跑到 15/20 后自然结束。原因是 MATH-TTT train set 为 500 条，`train_batch_size=32` 时 dataloader size 为 15；如果 `trainer.total_epochs=1`，即使设置 `total_training_steps=20`，训练循环也会在 15 个 batch 后结束。已在 20-step launcher 中固化 `trainer.total_epochs=2`。
+- rerun2 进入 final validation 后没有 acc 落盘。新增 `trainer.validation_metric_dump_path`，并在 `_validate` 中打印 `validation reward start/end` 和写出 scalar JSON。该改动只增强观测，不改变训练语义。
+- 通过 `mlx worker login -- command` 后台启动会被 worker login 退出清理进程，`nohup/setsid` 都没有保住；最终用一个保持打开的 worker 交互 session 前台运行训练，并用 `tee` 写日志。
+
+rerun3 结果：
+
+```text
+训练 scalar step: 20 / 20
+final validation: completed
+validation_metric_dump_path: 写出成功
+
+steady timing, step >= 2:
+  timing_s/gen avg = 10.910s, min = 9.856s, max = 20.265s
+  timing_s/chunk_state_chunks avg = 1.029s, min = 0.939s, max = 1.376s
+  timing_s/chunk_state_score avg = 4.880s, min = 4.376s, max = 7.037s
+  timing_s/chunk_state_ref avg = 1.693s, min = 1.621s, max = 1.779s
+  timing_s/update_actor avg = 4.357s, min = 4.173s, max = 4.658s
+
+target diagnostics, step 1-20:
+  raw_positive_ratio avg = 0.153, min = 0.107, max = 0.217
+  label_consistent_ratio avg = 0.497, min = 0.488, max = 0.500
+  answer_coverage_mean avg = 0.497, min = 0.488, max = 0.500
+  num_actor_samples avg = 124.0, min = 120, max = 128
+  target_entropy avg = 1.151, min = 1.014, max = 1.236
+  source_mass_mean avg = 0.484, min = 0.422, max = 0.590
+
+final val @ step 20:
+  val-core/math/acc/mean@16 = 0.505375
+  val-core/math/acc/maj@16/mean = 0.593922
+  val-core/math/acc/best@16/mean = 0.847144
+```
+
+结论：
+
+- infra 正结果：这条 chunk PowerFlow 链路的训练 step 是快链路，稳态墙钟约 30s/step；actor update 约 4.36s，不是主瓶颈。B200 NCCL 日志确认 `NVLS multicast support is available`、`isAllDirectP2p 1`，vLLM 配置确认 `attention_config.backend=FLASH_ATTN`。
+- validation 观测结论：final validation 的 GPU generation 结束后，耗时主要在 `PrimeRewardManager` 的 rule-based reward 汇总。该路径对 500 prompts x 16 samples = 8000 条输出做 math reward，单条 async timeout 是 300s，畸形 / repeated boxed 输出会制造长尾。rerun3 的 validation reward 最终完成并写 JSON，但 final validation 把总墙钟从训练进度约 10 分钟拉到约 15 分钟。
+- 方法负结果：20-step acc 明显不够好，`mean@16=0.5054`、`maj@16=0.5939`，低于原始 MV / PowerFlow 轨迹。说明 `soft_mass` 虽然解决了 hard gain 过稀的问题，但“只从 full-support anchors 形成局部 soft target”仍不足以产生有效 20-step improvement。
+- 当前主要矛盾不是 short chunk actor update，也不是 FA/NCCL 这类 infra；主要矛盾仍是 chunk target 质量。`answer_coverage_mean` 约 0.50、`raw_positive_ratio` 约 0.15，说明 support anchor 只提供了温和软分布，缺少真正的 future distribution improvement 信号。
+- 下一轮方法应继续放弃“局部短视可判定性”，但不能停在 `anchor support mass`。更合理的最小下一步是：full rollout group 先定义 prompt-level support/value，然后对同一 state 的候选 chunk 做更长 horizon / staged future support gain，score 直接衡量“未来 completion 分布向 full-support good answers 移动了多少”；source chunk 只作为 prior/drift guard，不作为 hard teacher。
+
+下一轮约束更新：
+
+- 不再要求 chunk target 主要由 short-horizon probe 的局部 answer hit、局部 source answer consistency、或“几条短 probe 是否碰巧 boxed 正确”来定义。这类局部短视可判定性是当前最像主矛盾的失败约束。
+- 继续保留 PowerFlow-style distribution matching、`hardfilter + clip4`、不用 GT、依赖 group-level label estimation 的原则。不要因为 20-step soft_mass 失败就退回 full-trajectory MV 或 source hard teacher。
+- full rollout group 必须先定义 prompt-level answer support、majority answer、coverage、pass/best/value；chunk 训练只学习“哪个局部 transition 会把未来 completion 分布推向这些 full-support good answers”。
+- source chunk 只能作为 proposal prior / drift guard / 保守参考，不能作为主要 teacher，也不能把 source answer mass 当 hard score floor。
+- score 应优先写成 per-state sharpened distribution，例如 `q_j ∝ exp(alpha * future_support_gain_j) * prior_j`。其中 `future_support_gain_j` 要来自 longer-horizon 或 staged rollout 后的 support mass / value margin / answer-support transport improvement，而不是 raw short-probe correctness。
+- 低信息 state 要跳过或降权：all-negative、support coverage 低、OOV 高、top answer mass 太平、candidate malformed/repeated boxed/marker 污染严重。否则 PowerFlow 会稳定地拟合噪声分布。
