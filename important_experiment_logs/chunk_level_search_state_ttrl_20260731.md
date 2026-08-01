@@ -3591,3 +3591,81 @@ timing_s/update_actor=7.303
 - `target_entropy=1.687`、`powerflow_weight_max=6.838` 说明目标分布比 answer-distribution 更尖，可能带来更强更新，也可能不稳定；20-step gate 必须观察 `mean@16/maj@16` 是否比 hard confidence-gated c128 更好。
 - infra 仍然正常：8 卡 B200、vLLM `FLASH_ATTN`、FlashInfer autotune、CUDA graph capture、NCCL P2P/CUMEM/NVLS、Actor fused kernels/Triton backend 均在日志中出现；actor dynamic batch 关闭。
 - 下一步可以跑同配置 20-step gate；通过标准仍是超过 hard confidence-gated c128 的 `mean@16=0.5325`，否则继续把 value gain 从 majority-label hit rate 扩展为 long-horizon pass/value margin。
+
+## 2026-08-01 Answer-value-gain Mid-state c128 20-step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_score_mode=answer_value_gain
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_probe_max_tokens=1024
+actor.powerflow_enable=True
+actor.powerflow_use_chunk_weights=True
+actor.chunk_weighted_nll_enable=False
+actor.use_dynamic_bsz=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_value_gain_mid_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+```
+
+final validation：
+
+```text
+mean@16=0.362500
+maj@16=0.463248
+best@16=0.784332
+format_mean@16=0.873625
+format_maj@16=0.827412
+format_best@16=0.999916
+testing=305.987s
+```
+
+20-step 平均训练信号：
+
+```text
+answer_value_gain_baseline_ratio=0.290
+answer_value_gain_answer_coverage=0.744
+answer_value_gain_hit_rate=0.384
+answer_value_gain_gain=0.314
+answer_value_gain_max_gain=0.576
+answer_value_gain_improved_state_ratio=0.720
+answer_value_gain_label_consistent_ratio=0.482
+kept_state_ratio=0.398
+target_entropy=1.626
+powerflow_weight_max=6.270
+actor/powerflow_loss=0.305
+actor/grad_norm=12.182
+timing_s/gen=26.440
+timing_s/chunk_state_score=11.418
+timing_s/update_actor=7.322
+```
+
+与短程 gate 对比：
+
+```text
+hard confidence-gated c128:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+answer-distribution mid-state c128:
+  mean@16=0.399875 maj@16=0.511854 best@16=0.828208 format_mean@16=0.888250
+
+answer-value-gain mid-state c128:
+  mean@16=0.362500 maj@16=0.463248 best@16=0.784332 format_mean@16=0.873625
+```
+
+结论：
+
+- 这轮 answer-value-gain 20-step gate 失败，低于 hard confidence-gated c128，也低于 answer-distribution gate，因此不能扩到 80-step。
+- 失败不是 infra 崩溃：20 step 完成，`diag_jsonl_rows=640`，无 NaN/Ray/FSDP/vLLM 崩溃，PowerFlow loss、grad norm、chunk weights 都有正常更新。
+- 问题仍是 chunk target 语义：`improved_state_ratio=0.720` 和 `kept_state_ratio=0.398` 表明 proxy 能选出“相对 majority baseline 命中率提升”的 chunk，但 final `mean@16=0.3625` 和日志中的重复 `\boxed{}` 输出说明该 proxy 会鼓励局部 boxed/答案吸引子，不保证完整推理路径质量。
+- 这个结果进一步说明不能只用短 probe 命中 prompt-level pseudo label 做 chunk reward。下一版应转为 long-horizon pass/value margin：候选 chunk 后继续更长 rollout 或小规模 search，score 直接衡量相对原 full rollout 的 pass/maj/best 改善，并加入 anti-degeneration/format guard；或者更贴近 2504.16084，把同一 state 的多候选先做可靠 label/value estimation，再把 search-improved distribution 蒸馏回 PowerFlow target。
+- infra 观察：actor update 平均 `7.322s`，仍不是主要瓶颈；额外成本主要在 `gen=26.440s` 和 `chunk_state_score=11.418s`，其中 scoring 受 SymPy/parser timeout 长尾影响明显。后续若继续 chunk path，应优先降低 probe/search 评估成本，而不是扩大当前错误 target。
