@@ -3832,3 +3832,88 @@ chunk_state/kept_state_ratio: [0.469, 0.469, 0.406]
 - 但仍不能扩 20-step：step1 的 `chunk_state/powerflow_weight_mean=0.469`，actor 侧却是 `actor/powerflow_weight_mean=0.000`、`actor/powerflow_loss=0.000`。这说明 target 已经产出，但进入 actor PowerFlow loss 后仍可能被二次权重/boxed_reward/CISPO 链路清空。
 - 下一步不再调大 rollout 参数，也不先跑 20-step。应优先修 actor loss 语义：chunk-state PowerFlow 应直接蒸馏 search-improved continuation distribution，`powerflow_chunk_weights` 作为主权重；`boxed_reward` 只作为 target/value term 或可关闭的 ablation，避免把 margin score 同时作为权重和 reward 后再被 PowerFlow 内部公式压掉。
 - 这轮保留为有效 smoke 证据：infra 没崩，B200/vLLM/FSDP 链路正常，问题集中在 chunk target 到 PowerFlow loss 的映射。
+
+## 2026-08-01 Answer-value-margin Top2 Target-only Mid-state c128 3-step Smoke
+
+动机：
+
+- 上一轮 top2 margin smoke 中，trainer 侧 `chunk_state/powerflow_weight_mean` 每步都有非零信号，但 actor 侧 step1 `actor/powerflow_weight_mean=0.0`、`actor/powerflow_loss=0.0`。
+- 为了隔离是不是 `boxed_reward` 进入 PowerFlow residual 后把局部 margin target 压掉，这轮新增 `actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only`。该模式保持 PowerFlow 的 `log_z + avg_log_prob - beta * avg_ref_log_prob` residual 和 chunk weights，但不把局部 margin score 作为 boxed reward 偏移项。
+- 该分支默认不启用，`standard` 模式保持原 PowerFlow 语义。
+
+代码变更：
+
+```text
+verl/workers/actor/dp_actor.py:
+  compute_powerflow 新增 chunk_loss_mode
+  chunk_loss_mode=target_only 时不使用 boxed_reward residual term
+  输出 actor/powerflow_chunk_loss_target_only 指标
+
+verl/trainer/config/ppo_trainer.yaml:
+  新增 actor.powerflow_chunk_loss_mode，默认 standard
+
+run_records/ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  继承 top2 margin smoke
+  actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+  actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_value_margin_top2_targetonly_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+answer_value_margin_baseline_ratio=0.351
+answer_value_margin_answer_coverage=0.771
+answer_value_margin_hit_rate=0.430
+answer_value_margin_format_rate=0.771
+answer_value_margin_margin=0.230
+answer_value_margin_score=0.089
+answer_value_margin_max_margin=0.409
+answer_value_margin_improved_state_ratio=0.719
+answer_value_margin_label_consistent_ratio=0.164
+answer_value_margin_topk=2.000
+kept_state_ratio=0.458
+positive_ratio=0.089
+target_entropy=1.152
+powerflow_weight_mean=0.458
+powerflow_weight_max=7.336
+actor/powerflow_loss=0.199
+actor/powerflow_chunk_loss_target_only=1.000
+actor/boxed_reward_mean=0.079
+actor/powerflow_weight_mean=0.167
+actor/powerflow_weight_max=3.251
+actor/grad_norm=26.486
+actor/cispo_mask_ratio=0.194
+timing_s/gen=32.778
+timing_s/chunk_state_chunks=1.028
+timing_s/chunk_state_probe=6.703
+timing_s/chunk_state_score=8.800
+timing_s/chunk_state_ref=3.585
+timing_s/update_actor=7.368
+```
+
+逐步 PowerFlow loss：
+
+```text
+actor/powerflow_loss: [0.000, 0.236, 0.360]
+actor/powerflow_weight_mean: [0.000, 0.250, 0.250]
+chunk_state/powerflow_weight_mean: [0.469, 0.500, 0.406]
+chunk_state/kept_state_ratio: [0.469, 0.500, 0.406]
+actor/powerflow_chunk_loss_target_only: [1.000, 1.000, 1.000]
+```
+
+结论：
+
+- `target_only` 分支成功执行，且 step2/step3 loss 稳定非零；但 step1 仍然是 `actor/powerflow_weight_mean=0.0`、`actor/powerflow_loss=0.0`。
+- 因此第一步清零不是 boxed_reward residual 造成的。更可能的问题在 actor batch 的 `powerflow_chunk_weights` 传递、keep_indices 后的排序/分片、或 actor update 内部 microbatch/mini-batch 选择上；trainer 侧已经有非零 `chunk_state/powerflow_weight_mean`。
+- 暂不跑 20-step。下一步应该增加 actor-batch 权重诊断，例如在 `_build_chunk_state_actor_batch` 输出 `actor_batch_powerflow_weight_mean/max/nonzero_ratio`，并在 actor `update_policy` 入口输出实际收到的 `powerflow_chunk_weights` 统计，以确认权重是在 trainer->actor 传递前还是 actor 内部分片后变零。

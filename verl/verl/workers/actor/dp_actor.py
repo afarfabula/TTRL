@@ -349,6 +349,7 @@ class DataParallelPPOActor(BasePPOActor):
         chunk_weights=None,
         rollout_log_probs=None,
         use_boxed_reward=False,
+        chunk_loss_mode="standard",
     ):
         log_ratio = log_prob - old_log_prob
         ratio = torch.exp(log_ratio)
@@ -365,7 +366,9 @@ class DataParallelPPOActor(BasePPOActor):
             boxed_reward = torch.zeros_like(response_mask, dtype=torch.float32)
         sequence_boxed_reward = verl_F.masked_sum(boxed_reward, combined_mask, axis=1)
 
-        if use_boxed_reward:
+        if chunk_loss_mode == "target_only":
+            delta = log_z + avg_log_prob - self.powerflow_beta_coef * avg_ref_log_prob
+        elif use_boxed_reward:
             delta = log_z + avg_log_prob - self.powerflow_beta_coef * (
                 avg_ref_log_prob + (sequence_boxed_reward - 1) / 2
             )
@@ -405,6 +408,7 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/powerflow_weight/max": loss_weights.max().detach().item(),
             "actor/log_z": log_z.mean().detach().item(),
             "actor/importance_weight": imp_w.mean().detach().item(),
+            "actor/powerflow_chunk_loss_target_only": float(chunk_loss_mode == "target_only"),
             "actor/ppo_kl": ppo_kl.detach().item(),
             "actor/ref_kl": ref_kl.detach().item(),
             "actor/beta_coef": float(self.powerflow_beta_coef),
@@ -702,6 +706,7 @@ class DataParallelPPOActor(BasePPOActor):
                             chunk_weights=powerflow_chunk_weights,
                             rollout_log_probs=data["rollout_log_probs"] if "rollout_log_probs" in data_keys else None,
                             use_boxed_reward=self.config.get("powerflow_use_boxed_reward", False),
+                            chunk_loss_mode=self.config.get("powerflow_chunk_loss_mode", "standard"),
                         )
                         pg_loss = policy_loss
                         micro_batch_metrics.update(powerflow_metrics)

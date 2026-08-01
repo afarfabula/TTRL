@@ -246,6 +246,11 @@ actor_rollout_ref:
     # distribution supplied in `powerflow_chunk_weights`.
     powerflow_use_chunk_weights: false
 
+    # standard: original PowerFlow residual, optionally using boxed_reward.
+    # target_only: chunk-state ablation that uses chunk weights as the improved
+    # distribution and does not feed local margin scores as boxed rewards.
+    powerflow_chunk_loss_mode: standard
+
     # If true, use current log probabilities as old log probabilities in the
     # PowerFlow update. This is mainly useful for debugging.
     powerflow_on_policy: false
