@@ -2930,3 +2930,75 @@ arXiv 2504.16084 对下一步的约束：
 - 做 mid-state / high-pass state construction：先采 `32` 条完整 rollout，优先从 prompt-level pass 或高 majority-ratio 的轨迹中截取中后段 state，减少 prompt-only/early/noisy state。
 - 对每个 state 仍按 2504.16084 语义采多 completion 做 label estimation，但 PowerFlow target 只蒸馏更稳定的 search-improved next-chunk distribution。
 - 保持 `actor.use_dynamic_bsz=False` 和 PowerFlow loss 主路径不变，先跑 3-step smoke，再跑 20-step gate；如果 20-step 不能明显超过 hard gate `mean@16=0.5325`，需要引入更强 verifier/probe，而不是再调 chunk 权重。
+
+## 2026-08-01 Majority-consistent Mid-state c128 3-step Smoke
+
+动机：
+
+- label-consistent c128 20-step 失败后，判断主要问题不在 PowerFlow loss，而在 state construction。
+- 随机 source 经常从错误/早期 noisy rollout 截 prefix，导致局部 majority label 与最终正确性弱相关。
+- 新增 `chunk_state_source_mode=majority_consistent`：先对同一个 prompt 的 32 条完整 rollout 做 majority pseudo-label，只优先选匹配该 prompt-level majority label 的 source rollout；这不使用真实 GT，符合 2504.16084 的无标签 majority label estimation 语义。
+- 新增 `chunk_state_boundary_mode=mid`：从中段 prefix 截 state，减少 prompt-only/early state。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  _compute_full_rollout_majority_consistency 只用 full rollout outputs 计算 prompt-level majority consistency
+  _make_chunk_state_prompts 支持 source_mode=majority_consistent
+  _make_chunk_state_prompts 支持 boundary_mode=mid
+  diag/jsonl 增加 source_majority_consistent 和 source_prompt_majority_ratio
+
+verl/trainer/config/ppo_trainer_ttrl.yaml:
+  chunk_state_boundary_mode=cycle
+  chunk_state_mid_boundary_min_ratio=0.25
+  chunk_state_mid_boundary_max_ratio=0.80
+  默认 source_mode 仍为 random，旧实验语义不变
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_consistent_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_source_chunk_enable=True
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_consistent_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_consistent_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步关键信号：
+
+```text
+step1: source_original=0.844 source_majority_consistent=1.000 prompt_majority_ratio=0.343 chunk_majority_ratio=0.482 label_consistent=0.668 kept=0.594 boundary_mean=624.0 loss=0.166 grad=15.238 gen=51.147s score=9.694s update=7.722s
+step2: source_original=0.719 source_majority_consistent=1.000 prompt_majority_ratio=0.337 chunk_majority_ratio=0.489 label_consistent=0.719 kept=0.594 boundary_mean=512.0 loss=0.000 grad=14.832 gen=22.722s score=27.418s update=6.802s
+step3: source_original=0.812 source_majority_consistent=1.000 prompt_majority_ratio=0.340 chunk_majority_ratio=0.486 label_consistent=0.711 kept=0.688 boundary_mean=460.0 loss=0.748 grad=5.177 gen=22.225s score=9.365s update=7.002s
+```
+
+三步平均：
+
+```text
+source_original_correct=0.792
+source_majority_consistent=1.000
+prompt_majority_ratio=0.340
+chunk_majority_ratio=0.486
+chunk_label_consistent_ratio=0.699
+kept_state_ratio=0.625
+timing_s/gen=32.031
+timing_s/chunk_state_score=15.492
+timing_s/update_actor=7.175
+grad_norm=11.749
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP/vLLM 崩溃。
+- 关键改进成立：source selection 没有用真实 GT，但事后看 `source_original_correct` 平均达到 `0.792`，远高于随机 source 的 `~0.1-0.25`。
+- chunk-level majority ratio 提高到 `~0.486`，label-consistent ratio 提高到 `~0.699`，说明高质量 source + mid-state 让局部 completion majority 更稳定。
+- actor update 仍是 `~7.2s`，保持 chunk actor update 的 infra 收益。
+- step2 的 `chunk_state_score=27.418s` 仍受 SymPy/parser timeout 影响，这不是本轮语义问题。
+- 下一步可以跑同配置 20-step final validation；gate 是必须超过 hard confidence gate `mean@16=0.5325`，否则需要继续增强 verifier/probe，而不是只扩到 80-step。

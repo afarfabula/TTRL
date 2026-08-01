@@ -1063,10 +1063,56 @@ class RayPPOTrainer:
         reward_tensor, _ = compute_reward(original_batch, self.reward_fn)
         return reward_tensor.sum(dim=-1).detach().cpu().float()
 
+    def _compute_full_rollout_majority_consistency(self, batch: DataProto) -> tuple[torch.Tensor, torch.Tensor]:
+        from verl.trainer.ppo.ttrl_utils import _batch_majority_vote
+        from verl.utils.reward_score.ttrl_math import extract_answer, grade, simplify_expression_string
+
+        cfg = self.config.ttrl
+        n = int(cfg.n_samples_per_prompt)
+        if len(batch) % n != 0:
+            raise ValueError(f"Expected full rollout batch length divisible by n={n}, got {len(batch)}")
+
+        response_mask = batch.batch["response_mask"].bool()
+        model_outputs = []
+        decoded_answers = []
+        for idx in range(len(batch)):
+            response_len = int(response_mask[idx].sum().item())
+            response_ids = batch.batch["responses"][idx, :response_len]
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            model_outputs.append(response_str)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            decoded_answers.append(answer)
+
+        majority_labels, majority_ratios = _batch_majority_vote(
+            model_outputs,
+            n,
+            num_processes=int(cfg.get("majority_vote_num_processes", 0)),
+        )
+        consistency = []
+        for prompt_idx, majority_label in enumerate(majority_labels):
+            start = prompt_idx * n
+            end = start + n
+            for answer in decoded_answers[start:end]:
+                if majority_label == "None" or answer is None or answer == "None":
+                    consistency.append(0.0)
+                elif answer == majority_label:
+                    consistency.append(1.0)
+                else:
+                    consistency.append(1.0 if grade(answer, majority_label) else 0.0)
+
+        return (
+            torch.tensor(consistency, dtype=torch.float32),
+            torch.tensor(majority_ratios, dtype=torch.float32),
+        )
+
     def _make_chunk_state_prompts(
         self,
         batch: DataProto,
         source_correctness: Optional[torch.Tensor] = None,
+        source_majority_consistent: Optional[torch.Tensor] = None,
+        source_majority_ratios: Optional[torch.Tensor] = None,
     ) -> tuple[DataProto, list[int]]:
         cfg = self.config.ttrl
         n = int(cfg.n_samples_per_prompt)
@@ -1075,6 +1121,7 @@ class RayPPOTrainer:
         boundaries = [int(x) for x in cfg.get("chunk_state_boundaries", [0, 256, 512, 768, 1024])]
         min_boundary = int(cfg.get("chunk_state_min_boundary", 0))
         source_mode = str(cfg.get("chunk_state_source_mode", "random"))
+        boundary_mode = str(cfg.get("chunk_state_boundary_mode", "cycle"))
         if not boundaries:
             boundaries = [0]
         min_required_response_len = max([b for b in boundaries if b >= min_boundary], default=min_boundary)
@@ -1094,6 +1141,7 @@ class RayPPOTrainer:
         source_response_lengths = []
         state_loss_weights = []
         skipped_short_sources = 0
+        majority_consistent_fallbacks = 0
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
                 source_offset = self.global_steps + prompt_idx + state_idx
@@ -1121,6 +1169,26 @@ class RayPPOTrainer:
                         continue
                     else:
                         source_local = source_offset % n
+                elif source_mode == "majority_consistent" and source_majority_consistent is not None:
+                    prompt_consistent = source_majority_consistent[prompt_start:prompt_stop]
+                    good_locals = torch.nonzero(prompt_consistent > 0.0, as_tuple=False).flatten()
+                    if min_required_response_len > 0 and long_locals.numel() > 0:
+                        long_good_mask = prompt_consistent[long_locals] > 0.0
+                        long_good_locals = long_locals[long_good_mask]
+                        if long_good_locals.numel() > 0:
+                            good_locals = long_good_locals
+                    if good_locals.numel() > 0:
+                        source_local = int(good_locals[source_offset % good_locals.numel()].item())
+                    elif min_required_response_len > 0 and long_locals.numel() > 0:
+                        majority_consistent_fallbacks += 1
+                        source_local = int(long_locals[source_offset % long_locals.numel()].item())
+                    elif min_required_response_len > 0:
+                        majority_consistent_fallbacks += 1
+                        skipped_short_sources += 1
+                        continue
+                    else:
+                        majority_consistent_fallbacks += 1
+                        source_local = source_offset % n
                 elif min_required_response_len > 0 and long_locals.numel() > 0:
                     source_local = int(long_locals[source_offset % long_locals.numel()].item())
                 elif min_required_response_len > 0:
@@ -1141,6 +1209,19 @@ class RayPPOTrainer:
                 if not allowed_boundaries:
                     skipped_short_sources += 1
                     continue
+                if boundary_mode == "mid":
+                    mid_min_ratio = float(cfg.get("chunk_state_mid_boundary_min_ratio", 0.25))
+                    mid_max_ratio = float(cfg.get("chunk_state_mid_boundary_max_ratio", 0.80))
+                    mid_boundaries = [
+                        b
+                        for b in allowed_boundaries
+                        if valid_response_len > 0
+                        and b > 0
+                        and b >= int(valid_response_len * mid_min_ratio)
+                        and b <= int(valid_response_len * mid_max_ratio)
+                    ]
+                    if mid_boundaries:
+                        allowed_boundaries = mid_boundaries
                 boundary = allowed_boundaries[(self.global_steps + prompt_idx + state_idx) % len(allowed_boundaries)]
                 prefix_ids = batch.batch["responses"][source_index, :boundary]
                 state_ids = torch.cat([prompt_ids, prefix_ids], dim=0)
@@ -1216,9 +1297,21 @@ class RayPPOTrainer:
         state_non_tensor["chunk_state_skipped_short_sources"] = np.asarray(
             [skipped_short_sources] * len(source_indices), dtype=np.int64
         )
+        state_non_tensor["chunk_state_majority_consistent_fallbacks"] = np.asarray(
+            [majority_consistent_fallbacks] * len(source_indices), dtype=np.int64
+        )
         if source_correctness is not None:
             state_non_tensor["chunk_state_source_original_correct"] = (
                 source_correctness[np.asarray(source_indices, dtype=np.int64)].numpy().astype(np.float32)
+            )
+        if source_majority_consistent is not None:
+            state_non_tensor["chunk_state_source_majority_consistent"] = (
+                source_majority_consistent[np.asarray(source_indices, dtype=np.int64)].numpy().astype(np.float32)
+            )
+        if source_majority_ratios is not None:
+            selected_prompt_indices = np.asarray(source_prompt_indices, dtype=np.int64)
+            state_non_tensor["chunk_state_source_prompt_majority_ratio"] = (
+                source_majority_ratios[selected_prompt_indices].numpy().astype(np.float32)
             )
         state_proto = DataProto(batch=state_batch, non_tensor_batch=state_non_tensor)
         state_proto.meta_info = {
@@ -1249,6 +1342,10 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_skipped_short_sources", np.asarray([0])),
             dtype=torch.float32,
         )
+        majority_consistent_fallbacks = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_majority_consistent_fallbacks", np.asarray([0])),
+            dtype=torch.float32,
+        )
         real_state_count = torch.as_tensor(
             state_prompts.non_tensor_batch.get("chunk_state_real_state_count", np.asarray([num_states])),
             dtype=torch.float32,
@@ -1268,6 +1365,7 @@ class RayPPOTrainer:
                 "chunk_state_diag/boundary_max": boundaries.max().item(),
                 "chunk_state_diag/boundary_zero_ratio": (boundaries == 0).float().mean().item(),
                 "chunk_state_diag/skipped_short_sources": skipped_short_sources.max().item(),
+                "chunk_state_diag/majority_consistent_fallbacks": majority_consistent_fallbacks.max().item(),
                 "chunk_state_diag/real_state_count": real_state_count.max().item(),
                 "chunk_state_diag/pad_state_count": pad_state_count.max().item(),
                 "chunk_state_diag/loss_weight_mean": loss_weights.mean().item(),
@@ -1282,6 +1380,27 @@ class RayPPOTrainer:
                 ).float().mean().item(),
             }
         )
+
+        source_majority_consistent = state_prompts.non_tensor_batch.get("chunk_state_source_majority_consistent", None)
+        if source_majority_consistent is not None:
+            source_majority_consistent = np.asarray(source_majority_consistent, dtype=np.float32)
+            source_prompt_majority_ratio = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_prompt_majority_ratio",
+                    np.zeros_like(source_majority_consistent),
+                ),
+                dtype=np.float32,
+            )
+            metrics.update(
+                {
+                    "chunk_state_diag/source_majority_consistent_mean": float(source_majority_consistent.mean())
+                    if source_majority_consistent.size
+                    else 0.0,
+                    "chunk_state_diag/source_prompt_majority_ratio_mean": float(source_prompt_majority_ratio.mean())
+                    if source_prompt_majority_ratio.size
+                    else 0.0,
+                }
+            )
 
         if not bool(cfg.get("chunk_state_diag_enable", False)):
             return metrics
@@ -1365,6 +1484,14 @@ class RayPPOTrainer:
         source_original = state_prompts.non_tensor_batch.get("chunk_state_source_original_correct", None)
         if source_original is not None:
             source_original = np.asarray(source_original, dtype=np.float32)
+        source_majority_consistent = state_prompts.non_tensor_batch.get("chunk_state_source_majority_consistent", None)
+        if source_majority_consistent is not None:
+            source_majority_consistent = np.asarray(source_majority_consistent, dtype=np.float32)
+        source_prompt_majority_ratios = state_prompts.non_tensor_batch.get(
+            "chunk_state_source_prompt_majority_ratio", None
+        )
+        if source_prompt_majority_ratios is not None:
+            source_prompt_majority_ratios = np.asarray(source_prompt_majority_ratios, dtype=np.float32)
         majority_ratios = state_prompts.non_tensor_batch.get("chunk_state_majority_ratio", None)
         if majority_ratios is not None:
             majority_ratios = np.asarray(majority_ratios, dtype=np.float32)
@@ -1391,6 +1518,16 @@ class RayPPOTrainer:
                     "pad_state_count": int(pad_state_count.max()) if pad_state_count.size else 0,
                     "source_original_correct": (
                         float(source_original[state_idx]) if source_original is not None else None
+                    ),
+                    "source_majority_consistent": (
+                        float(source_majority_consistent[state_idx])
+                        if source_majority_consistent is not None
+                        else None
+                    ),
+                    "source_prompt_majority_ratio": (
+                        float(source_prompt_majority_ratios[state_idx])
+                        if source_prompt_majority_ratios is not None
+                        else None
                     ),
                     "majority_ratio": float(majority_ratios[state_idx]) if majority_ratios is not None else None,
                     "answer_coverage": float(answer_coverage[state_idx]) if answer_coverage is not None else None,
@@ -1963,11 +2100,22 @@ class RayPPOTrainer:
         max_prompt_len = int(self.config.data.max_prompt_length)
         source_mode = str(cfg.get("chunk_state_source_mode", "random"))
         source_correctness = None
-        if source_mode == "success" or bool(cfg.get("chunk_state_diag_enable", False)):
+        source_majority_consistent = None
+        source_majority_ratios = None
+        if source_mode in {"success"} or bool(cfg.get("chunk_state_diag_enable", False)):
             source_correctness = self._compute_original_gt_rewards(full_batch)
+        if source_mode == "majority_consistent":
+            source_majority_consistent, source_majority_ratios = self._compute_full_rollout_majority_consistency(
+                full_batch
+            )
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
-            state_prompts, _ = self._make_chunk_state_prompts(full_batch, source_correctness=source_correctness)
+            state_prompts, _ = self._make_chunk_state_prompts(
+                full_batch,
+                source_correctness=source_correctness,
+                source_majority_consistent=source_majority_consistent,
+                source_majority_ratios=source_majority_ratios,
+            )
             if source_correctness is not None:
                 n = int(cfg.n_samples_per_prompt)
                 prompt_count = len(full_batch) // n
@@ -1982,6 +2130,19 @@ class RayPPOTrainer:
                     original_prompt.max(dim=-1).values > 0.0
                 ).float().mean().item()
                 metrics["chunk_state_source/prompt_original_mean"] = original_prompt.mean(dim=-1).mean().item()
+            if source_majority_consistent is not None:
+                n = int(cfg.n_samples_per_prompt)
+                prompt_count = len(full_batch) // n
+                source_indices = torch.as_tensor(
+                    state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=torch.long
+                )
+                metrics["chunk_state_source/selected_majority_consistent_mean"] = source_majority_consistent[
+                    source_indices
+                ].float().mean().item()
+                metrics["chunk_state_source/prompt_majority_ratio_mean"] = source_majority_ratios.mean().item()
+                metrics["chunk_state_source/prompt_majority_pass"] = (
+                    source_majority_consistent.view(prompt_count, n).max(dim=-1).values > 0.0
+                ).float().mean().item()
 
         with marked_timer("chunk_state_chunks", timing_raw, color="red"):
             chunk_prompts = deepcopy(state_prompts)

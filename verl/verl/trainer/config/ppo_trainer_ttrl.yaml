@@ -78,7 +78,12 @@ ttrl:
   chunk_state_diag_jsonl: null
   # random keeps the first pilot behavior. success prefers source rollouts that
   # are correct under original GT reward, falling back to random if none exist.
+  # majority_consistent prefers full-rollout samples that match the prompt-level
+  # majority pseudo-label, avoiding GT leakage while selecting cleaner states.
   chunk_state_source_mode: random
+  chunk_state_boundary_mode: cycle
+  chunk_state_mid_boundary_min_ratio: 0.25
+  chunk_state_mid_boundary_max_ratio: 0.80
   chunk_state_skip_all_negative: false
   # Which response span receives the chunk-state actor loss. "chunk" preserves
   # the original pilot behavior. "chunk_probe" aligns the loss with the scored
