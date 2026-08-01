@@ -2343,3 +2343,51 @@ timing_s/testing=296.079
 - 相比 sourcechunk + skip-negative 版本的 `mean@16=0.401` 有小幅改善，但幅度太小；说明取消 hard source teacher 是对的，但仅靠 `K=8` next chunk + `probe_samples=4` 的 short probe 仍然不能构造可靠 target。
 - step20 `state_all_negative_ratio=0.719`、`kept_state_ratio=0.281`，有效 chunk states 太少；同时 `raw_positive_ratio=0.143`，probe 分布非常稀疏。PowerFlow loss 被正确启用，但大部分 update 信号来自少量高噪声局部转移。
 - 下一轮不应继续扩大这种 short-probe gate 到 80 step。需要把 chunk target 改成更接近 TTRL 原文 2504.16084 的同 state 多输出 label estimation：对 `query + prefix` state 采多个 next chunk 后，继续 rollout 到完整答案，用 state-level answer majority / consistency 给 next chunk 分配 search-improved weight，而不是直接用短 probe 的稀疏正确率。
+
+## 2026-08-01 Majority-completion PowerFlow 3-step Smoke
+
+实现目标：
+
+- 保留 chunk actor update 的 PowerFlow loss，不切 GRPO，不切 weighted NLL。
+- 新增 `ttrl.chunk_state_score_mode=majority_completion`，默认不影响旧实验。
+- 对每个 `query + prefix` state 采 `K=8` 个 next chunk，每个 chunk 再采 `probe_samples=4` 个 continuation。
+- 在同一 state 的 `K * probe_samples = 32` 条完整 continuation 上做 answer majority，得到 state-local self-supervised label。
+- 每个 next chunk 的 score = 该 chunk 的 4 条 continuation 中匹配 state majority answer 的比例。
+- 这更贴近 TTRL 2504.16084 的同一 state 多输出 label estimation / reward calculation 语义，同时保持 PowerFlow distribution matching 作为 actor update。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_completion_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_completion_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_completion_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+worker=1024321, 8x NVIDIA B200
+```
+
+三步关键信号：
+
+```text
+step1: majority_ratio=0.343 answer_coverage=0.758 raw_positive=0.343 all_positive=0.156 all_negative=0.000 mixed=0.844 kept_state=1.000 powerflow_weight=1.000 powerflow_loss=0.517 grad_norm=37.760
+step2: majority_ratio=0.242 answer_coverage=0.657 raw_positive=0.242 all_positive=0.125 all_negative=0.031 mixed=0.844 kept_state=0.969 powerflow_weight=0.969 powerflow_loss=1.568 grad_norm=42.783
+step3: majority_ratio=0.274 answer_coverage=0.698 raw_positive=0.274 all_positive=0.156 all_negative=0.062 mixed=0.781 kept_state=0.938 powerflow_weight=0.938 powerflow_loss=0.835 grad_norm=29.193
+```
+
+三步耗时：
+
+```text
+step1: gen=51.446s chunk_state_probe=6.800s chunk_state_score=30.783s update_actor=8.853s
+step2: gen=27.382s chunk_state_probe=6.944s chunk_state_score=12.337s update_actor=8.578s
+step3: gen=24.123s chunk_state_probe=6.954s chunk_state_score=9.907s update_actor=8.606s
+```
+
+结论：
+
+- smoke 跑通，无 NaN/Ray/FSDP 崩溃。
+- target density 明显优于 short-probe correct-rate：上一版 20-step gate step20 `state_all_negative_ratio=0.719`、`kept_state_ratio=0.281`；本版 3-step smoke 的 `state_all_negative_ratio=0.000/0.031/0.062`、`kept_state_ratio=1.000/0.969/0.938`。
+- `answer_coverage=0.657-0.758`，说明多数 completion 能抽到答案；但 `majority_ratio=0.242-0.343`，state-local majority 本身还不够尖锐，后续可能需要 confidence sharpening / majority margin gate。
+- 首步 `chunk_state_score=30.783s` 受 parser/JIT/冷启动影响，step2/3 降到 `12.337s/9.907s`，与旧 short-probe 版本接近；parser timeout 仍是 infra 优化重点。
+- 可以启动 20-step gate。通过标准：至少不能出现 short-probe 版那种 `mean@16~0.44` 崩坏；若 20-step 指标仍差，下一步加 majority confidence gate，而不是回退 source chunk teacher。
