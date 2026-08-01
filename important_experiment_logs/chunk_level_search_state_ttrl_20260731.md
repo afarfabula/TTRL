@@ -3369,3 +3369,73 @@ answer-consensus minmaj0 mid-state c128:
 - actor update 不是主要瓶颈，平均 `update_actor=7.354s`；端到端训练步主要成本仍是 full rollout 生成 `gen=25.684s` 和 answer-consensus probe/scoring `chunk_state_score=9.669s`。
 - 当前 answer-consensus 的 reward 只判断 `state + next_chunk + probe` 是否落到 full-rollout prompt-level consensus answer，仍可能奖励“局部看起来能走到多数答案”的 chunk，而不是奖励真正改善后续搜索分布的 chunk。
 - 下一版不应继续只调 gate 或延长训练，应改 scoring 语义：考虑 state 内多 probe 的 answer distribution sharpening、chunk 后续 value margin、或把 source full rollout 的 mid-state 与候选 chunk 的 long-horizon success 做更直接的 distribution matching。
+
+## 2026-08-01 Answer-distribution Mid-state c128 3-step Smoke
+
+动机：
+
+- relaxed answer-consensus 的失败说明：只把 `state + next_chunk + probe` 匹配到 full-rollout prompt-level consensus answer 不够，容易奖励“能走到多数答案”的局部 continuation，而不一定是真正改善当前 state 搜索分布的 chunk。
+- 2504.16084 的关键语义是同一 state 下多输出先做 label estimation，再做 reward calculation；因此本轮新增 `chunk_state_score_mode=answer_distribution`，完全在同一 chunk state 内用所有 `candidate x probe` 的 answer 分布估计局部 label。
+- 对每个 state，提取 8 个候选 chunk、每个 4 条 probe completion 的最终答案，得到 32 个 answer sample；每个 probe 的软分数是该 answer 在当前 state 中的频率 `count(answer) / valid_answer_count`，candidate score 取 4 条 probe 的均值。
+- 该 target 比 `majority_completion` 更 soft，比 `answer_consensus` 更少依赖 full prompt consensus；actor update 仍然是 PowerFlow distribution matching，不切 GRPO、不切 weighted NLL。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  新增 _score_chunk_state_answer_distribution
+  新增 ttrl.chunk_state_score_mode=answer_distribution 分支
+  记录 top_mass/top2_margin/unique_answer/answer_coverage/raw_score 等统计
+
+run_records/ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  复用 majority-consistent mid-state c128 配置
+  ttrl.chunk_state_score_mode=answer_distribution
+  关闭 teacher_anchor 和 source_chunk 注入
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_score_mode=answer_distribution
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_min_majority_ratio=0.20
+chunk_state_min_answer_coverage=0.60
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_distribution_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+answer_distribution_top_mass=0.601
+answer_distribution_top2_margin=0.501
+answer_distribution_unique_answer=8.042
+answer_distribution_answer_coverage=0.749
+answer_distribution_raw_score=0.369
+answer_distribution_label_consistent_ratio=0.865
+answer_distribution_state_positive_ratio=0.979
+kept_state_ratio=0.677
+target_entropy=1.789
+powerflow_weight_max=3.143
+actor/powerflow_loss=0.219
+actor/grad_norm=8.993
+timing_s/gen=32.543
+timing_s/chunk_state_score=11.384
+timing_s/update_actor=8.224
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP/vLLM 崩溃，`chunk_state_score/mode_answer_distribution=1.0`。
+- 新 target 的训练信号更 dense：`state_positive_ratio=0.979`、`label_consistent_ratio=0.865`、`kept_state_ratio=0.677`；同时不是完全 uniform，`powerflow_weight_max=3.143`、`target_entropy=1.789`。
+- `top_mass_mean=0.601`、`top2_margin=0.501` 说明同一 state 内 answer 分布有明显头部答案；但 `unique_answer_mean=8.042` 也说明答案空间仍然分散，20-step gate 必须验证这种 state-local frequency target 是否真的改善最终 acc。
+- 该 smoke 只验证链路和 target 统计，不含 final validation。下一步可以跑同配置 20-step gate；通过标准仍是超过 hard confidence-gated c128 的 `mean@16=0.5325`，否则继续增强 long-horizon verifier / value margin，而不是扩 80-step。
