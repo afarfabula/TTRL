@@ -7496,3 +7496,95 @@ future_support_keep mean = 0.125
 - 直接把同 prompt 高 support rollout 的后续 chunk 拼到当前 state 后面并不等价于一个 state-compatible local action。原因大概率是这些 continuation chunk 依赖各自原始前文，和当前 state prefix 不匹配；它们虽然来自高 support 完整轨迹，但在当前 state 上不是自然下一步。
 - 这个结果进一步收窄下一步方向：candidate proposal 不能是无条件 high-support continuation copy。需要做 state-compatible proposal，例如从当前 state 继续做 staged long-horizon resampling、用 high-support trajectory 只提供 answer/value target 而不是直接提供 chunk token，或者先做 prefix alignment / nearest-state matching 再注入 continuation。
 - 因此下一步不扩 20-step。应设计 `state-compatible staged proposal`：同一 state 先生成 candidate chunk，再对这些 candidate 做更长 horizon future support estimation；或在 full rollout group 中只选择与当前 state prefix 语义/文本接近的 continuation 作为 anchor。
+
+## 2026-08-01 Wide Current-State Candidate c16 smoke
+
+背景：
+
+- 上一轮 `support proposal` 说明无条件复制 high-support rollout continuation 是负方向，因为它不一定和当前 state prefix 兼容。
+- 这轮不改 target/scorer，不复制外部 continuation，只把当前 state 的自采样 candidate 从 8 扩到 16，利用 B200 大显存做更宽的 state-compatible search。
+- 目标是检查：更多当前 state 采样是否能提高进入 full-rollout support 的概率，并改善 `candidate_oov_tv` / `transport_gain`。
+
+配置：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_masssrc_stategate_c128_probe4_b32_r32_v64_c16_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_transport_affinity_masssrc_stategate_c128_probe4_b32_r32_v64_c16_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_transport_affinity_masssrc_stategate_c128_probe4_b32_r32_v64_c16_1step_20260801.jsonl
+
+score_mode = future_support_gain
+score_type = transport_affinity
+source_mode = majority_consistent
+source_select_by_mass = True
+source_chunk_enable = True
+candidates = 16
+probe_samples = 4
+probe_max_tokens = 3072
+support_anchor_enable = False
+dynamic_bsz = False
+final_validation = skipped
+```
+
+结果：
+
+```text
+group_size = 64
+source_mass_mean = 0.423
+support_coverage_mean = 0.586
+candidate_coverage_mean = 0.586
+candidate_quality_keep_ratio = 0.773
+state_oov_mean = 0.414
+candidate_oov_tv_mean = 0.706
+source_oov_tv_mean = 0.577
+transport_affinity_mean = 0.294
+transport_gain_mean = -0.129
+score_mean = 0.293
+label_consistent_ratio = 0.773
+state_top_margin_mean = 0.024
+state_keep_ratio = 0.250
+num_actor_samples = 40
+pruned_sample_ratio = 0.896
+target_entropy = 2.654
+update_actor = 1.905s
+
+timing_s/gen = 43.488
+timing_s/chunk_state_chunks = 1.074
+timing_s/chunk_state_probe = 19.782
+timing_s/chunk_state_score = 12.804
+timing_s/chunk_state_ref = 4.438
+timing_s/update_actor = 1.905
+```
+
+与 c8 mass-ranked source baseline 对比：
+
+```text
+support_coverage_mean: 0.564 -> 0.586
+candidate_oov_tv_mean: 0.704 -> 0.706
+transport_affinity_mean: 0.296 -> 0.294
+transport_gain_mean: -0.127 -> -0.129
+label_consistent_ratio: 0.781 -> 0.773
+state_keep_ratio: 0.292 -> 0.250
+num_actor_samples: 40 -> 40
+chunk_state_probe: 15.622s -> 19.782s
+update_actor: 2.020s -> 1.905s
+```
+
+diag 聚合：
+
+```text
+jsonl_rows = 24
+source_answer_mass mean = 0.423, min = 0.259, max = 0.808
+answer_coverage mean = 0.586, min = 0.000, max = 0.891
+future_support_state_mean_mass mean = 0.216
+future_support_state_max_mass mean = 0.327
+future_support_state_top_margin mean = 0.024
+probe_mean mean = 0.293
+future_support_keep mean = 0.250
+```
+
+结论：
+
+- c16 是轻微正向但不够强：`support_coverage_mean` 和 state-level mass 有改善，说明更宽的当前 state 自采样确实更容易碰到 full support。
+- 但核心 transport 指标没有改善：`candidate_oov_tv_mean` 基本不变，`transport_gain_mean` 仍为负，`state_keep_ratio` 还略降。因此单纯把 candidate 数翻倍不是主解。
+- infra 侧可以承受：probe 时间从 15.6s 增到 19.8s，actor update 仍约 2s，B200 大显存/算力可以支撑更宽 search；但方法收益不足，不应直接扩 20-step。
+- 下一步应做真正 staged proposal：不是只增加 chunk candidate 数，而是对当前 state 的 candidate 做更长 horizon / 多阶段 future support estimation，或者把 probe 预算从每个 candidate 固定 4 条改成先宽后深的两阶段分配，优先把算力给已经接近 full support 的 candidate。
