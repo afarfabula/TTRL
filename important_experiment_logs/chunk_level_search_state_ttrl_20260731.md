@@ -5771,3 +5771,111 @@ hardfilter_clip4:
 - `powerflow_weight_clip=4 + renorm` 工程上有效：hardfilter2 中 step3 到 8.0 的尖权重被压到约 2.0，actor loss/grad 明显变稳，同时保留了 hardfilter 的 actor update 提速。
 - 这不是 target-quality fix：`support_coverage` 仍只有约 0.48-0.51，OOV 仍约 0.49-0.52。clip 只是让稀疏 target 不炸，不会让 chunk candidate 更贴近 full rollout support。
 - 这版可以作为后续 chunk PowerFlow 的默认稳定器，但不应单独扩 20 step。下一步应该把精力放在 state/candidate 的 label estimation：从 full rollout answer support 中抽更高 coverage 的 state，过滤 OOV-heavy/malformed candidate，并把 score 改成更明确的 future support mass gain / transport improvement，而不是靠 clip 掩盖 target 噪声。
+
+## 2026-08-01 Future-Support-Gain Candidate Filter 3-Step Smoke
+
+目的：
+
+- 验证一个更贴近 full-rollout support 语义的 candidate 级过滤：如果某个 chunk 的 probe 很少落入 prompt-level full rollout answer support，就不让它进入 PowerFlow target。
+- 继续复用 `hardfilter + clip4` 的工程稳定器，只新增 `future_support_gain` scorer 内部的 candidate quality gate。
+- 这轮仍是 3-step gate，不做 validation。
+
+代码改动：
+
+```text
+新增默认关闭配置：
+  ttrl.chunk_state_future_support_min_candidate_coverage: 0.0
+  ttrl.chunk_state_future_support_min_candidate_mean_mass: 0.0
+
+在 future_support_gain scorer 内：
+  candidate_coverage = valid_probe_mass_ratio per candidate
+  mean_mass = mean(prompt_answer_support_mass) per candidate
+  candidate_quality_ok =
+    candidate_coverage >= min_candidate_coverage
+    and mean_mass >= min_candidate_mean_mass
+  score_matrix *= candidate_quality_ok
+
+新增日志：
+  chunk_state_future_support_gain/min_candidate_coverage
+  chunk_state_future_support_gain/min_candidate_mean_mass
+  chunk_state_future_support_gain/candidate_coverage_mean
+  chunk_state_future_support_gain/candidate_quality_keep_ratio
+  chunk_state_future_support_gain/score_mean_before_candidate_filter
+  chunk_state_future_support_gain/label_consistent_ratio_before_candidate_filter
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_candfilter_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_candfilter_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_future_support_min_candidate_coverage=0.25
+ttrl.chunk_state_future_support_min_candidate_mean_mass=0.03125
+ttrl.chunk_state_powerflow_weight_clip=4.0
+ttrl.chunk_state_powerflow_weight_clip_renorm=True
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_gain_candfilter_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_candfilter_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 关键指标：
+
+```text
+step1:
+  support_coverage_mean = 0.470
+  candidate_quality_keep_ratio = 0.602
+  score_mean_before_candidate_filter = 0.026
+  score_mean = 0.026
+  label_consistent_before = 0.281
+  label_consistent_after = 0.281
+  OOV = 0.530
+  num_actor_samples = 56
+  powerflow_weight_max = 2.174
+  update_actor = 1.523s
+
+step2:
+  support_coverage_mean = 0.522
+  candidate_quality_keep_ratio = 0.656
+  score_mean_before_candidate_filter = 0.034
+  score_mean = 0.034
+  label_consistent_before = 0.289
+  label_consistent_after = 0.289
+  OOV = 0.478
+  num_actor_samples = 56
+  powerflow_weight_max = 2.051
+  update_actor = 1.283s
+
+step3:
+  support_coverage_mean = 0.438
+  candidate_quality_keep_ratio = 0.559
+  score_mean_before_candidate_filter = 0.018
+  score_mean = 0.018
+  label_consistent_before = 0.211
+  label_consistent_after = 0.211
+  OOV = 0.562
+  num_actor_samples = 40
+  powerflow_weight_max = 1.908
+  update_actor = 1.174s
+```
+
+diag jsonl 统计：
+
+```text
+step1: boundary_mean=624, source_correct=0.844, coverage=0.470, probe_mean=0.0230, all_negative=0.531, mixed=0.438
+step2: boundary_mean=564, source_correct=0.750, coverage=0.522, probe_mean=0.0328, all_negative=0.438, mixed=0.562
+step3: boundary_mean=532, source_correct=0.719, coverage=0.438, probe_mean=0.0183, all_negative=0.469, mixed=0.531
+```
+
+结论：
+
+- 工程上通过：3 step 完整结束，raw log 和 diag 都已落盘；actor update 仍保持约 1.2-1.5s，clip 后 `powerflow_weight_max` 约 1.9-2.2。
+- 这是一个负结果：candidate quality gate 保留了约 56%-66% candidate，但 `score_mean` 和 `label_consistent_ratio` 在过滤前后完全一致。说明当前 positive-gain target 本来就只来自 support 内 probe，简单 candidate coverage / mean-mass gate 不会进一步改善 target。
+- target 质量瓶颈仍在 state/source/probe 分布：step3 `support_coverage=0.438`、`OOV=0.562`，比 clip4 还差；这版不应扩 20 step。
+- 下一步应从 state selection 和 probe horizon 改，而不是继续加 candidate gate：例如只选 prompt full-rollout support coverage 更高、majority mass 更强的 prompt/state；或者增加/拉长 probe，使 future support mass 不再被大量 OOV/empty answer 稀释。

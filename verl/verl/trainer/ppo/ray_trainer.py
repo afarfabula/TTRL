@@ -2441,6 +2441,8 @@ class RayPPOTrainer:
         baseline_scale = float(cfg.get("chunk_state_future_support_baseline_scale", 1.0))
         source_prior_weight = float(cfg.get("chunk_state_future_support_source_prior_weight", 1.0))
         min_positive_margin = float(cfg.get("chunk_state_future_support_min_positive_margin", 0.0))
+        min_candidate_coverage = float(cfg.get("chunk_state_future_support_min_candidate_coverage", 0.0))
+        min_candidate_mean_mass = float(cfg.get("chunk_state_future_support_min_candidate_mean_mass", 0.0))
         source_prior_idx = int(cfg.get("chunk_state_source_chunk_candidate_index", 0))
         prompt_mass_values = [
             json.loads(str(value)) if str(value) else {}
@@ -2498,6 +2500,7 @@ class RayPPOTrainer:
         )
         mean_mass = mass_tensor.mean(dim=-1)
         max_mass = mass_tensor.max(dim=-1).values
+        candidate_coverage = valid_tensor.mean(dim=-1)
         future_value = mean_mass + max_mass_coef * max_mass
         source_baseline = (source_answer_mass * baseline_scale).view(len(state_prompts), 1)
         raw_gain = future_value - source_baseline
@@ -2509,6 +2512,13 @@ class RayPPOTrainer:
             score_matrix = (raw_gain / (1.0 - source_baseline).clamp(min=1e-6)).clamp(min=0.0, max=1.0)
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_future_support_score_type={score_type!r}")
+        pre_filter_score_matrix = score_matrix.clone()
+        candidate_quality_ok = torch.ones_like(score_matrix, dtype=torch.bool)
+        if min_candidate_coverage > 0.0:
+            candidate_quality_ok &= candidate_coverage >= min_candidate_coverage
+        if min_candidate_mean_mass > 0.0:
+            candidate_quality_ok &= mean_mass >= min_candidate_mean_mass
+        score_matrix = score_matrix * candidate_quality_ok.to(dtype=score_matrix.dtype)
         scores = score_matrix.reshape(-1)
         label_consistent = (score_matrix > 0.0).to(dtype=torch.float32)
 
@@ -2518,12 +2528,15 @@ class RayPPOTrainer:
         state_prompts.non_tensor_batch["chunk_state_target_prior"] = prior.cpu().numpy().astype(np.float32)
 
         support_coverage = valid_tensor.mean(dim=(1, 2)).detach().cpu().numpy().astype(np.float32)
+        candidate_coverage_arr = candidate_coverage.detach().cpu().numpy().astype(np.float32)
         mean_mass_arr = mean_mass.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
         max_mass_arr = max_mass.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
         gain_arr = raw_gain.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
         source_mass_arr = source_answer_mass.detach().cpu().numpy().astype(np.float32)
         prompt_top_mass_arr = prompt_top_mass.detach().cpu().numpy().astype(np.float32)
-        positive_margin = raw_gain.max(dim=-1).values
+        filtered_raw_gain = raw_gain.masked_fill(~candidate_quality_ok, float("-inf"))
+        positive_margin = filtered_raw_gain.max(dim=-1).values
+        positive_margin = torch.where(torch.isfinite(positive_margin), positive_margin, torch.zeros_like(positive_margin))
         improved_state = (positive_margin > 0.0).float().detach().cpu().numpy().astype(np.float32)
         future_state_keep = (positive_margin >= min_positive_margin).float().detach().cpu().numpy().astype(np.float32)
 
@@ -2549,6 +2562,8 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,
             "chunk_state_future_support_gain/source_prior_weight": source_prior_weight,
             "chunk_state_future_support_gain/min_positive_margin": min_positive_margin,
+            "chunk_state_future_support_gain/min_candidate_coverage": min_candidate_coverage,
+            "chunk_state_future_support_gain/min_candidate_mean_mass": min_candidate_mean_mass,
             "chunk_state_future_support_gain/source_mass_mean": float(source_mass_arr.mean())
             if len(source_mass_arr)
             else 0.0,
@@ -2558,11 +2573,28 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/support_coverage_mean": float(support_coverage.mean())
             if len(support_coverage)
             else 0.0,
+            "chunk_state_future_support_gain/candidate_coverage_mean": float(candidate_coverage_arr.mean())
+            if len(candidate_coverage_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/candidate_quality_keep_ratio": candidate_quality_ok.float().mean().item()
+            if len(candidate_quality_ok)
+            else 0.0,
             "chunk_state_future_support_gain/mean_mass_mean": float(mean_mass_arr.mean()) if len(mean_mass_arr) else 0.0,
             "chunk_state_future_support_gain/max_mass_mean": float(max_mass_arr.mean()) if len(max_mass_arr) else 0.0,
             "chunk_state_future_support_gain/raw_gain_mean": float(gain_arr.mean()) if len(gain_arr) else 0.0,
+            "chunk_state_future_support_gain/score_mean_before_candidate_filter": pre_filter_score_matrix.mean().item()
+            if len(pre_filter_score_matrix)
+            else 0.0,
             "chunk_state_future_support_gain/score_mean": score_matrix.mean().item()
             if len(score_matrix)
+            else 0.0,
+            "chunk_state_future_support_gain/label_consistent_ratio_before_candidate_filter": (
+                pre_filter_score_matrix > 0.0
+            )
+            .float()
+            .mean()
+            .item()
+            if len(pre_filter_score_matrix)
             else 0.0,
             "chunk_state_future_support_gain/label_consistent_ratio": label_consistent.mean().item()
             if len(label_consistent)

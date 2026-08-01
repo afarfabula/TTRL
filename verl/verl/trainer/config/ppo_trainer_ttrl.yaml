@@ -146,6 +146,11 @@ ttrl:
   chunk_state_future_support_baseline_scale: 1.0
   chunk_state_future_support_source_prior_weight: 2.0
   chunk_state_future_support_min_positive_margin: 0.0
+  # Optional candidate-level quality gate for future_support_gain. It keeps the
+  # target tied to prompt-level full-rollout answer support by dropping chunks
+  # whose probes rarely land inside that support.
+  chunk_state_future_support_min_candidate_coverage: 0.0
+  chunk_state_future_support_min_candidate_mean_mass: 0.0
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.
