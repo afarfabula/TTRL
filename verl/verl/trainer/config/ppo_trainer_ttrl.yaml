@@ -127,6 +127,14 @@ ttrl:
   chunk_state_teacher_anchor_enable: false
   chunk_state_teacher_anchor_score: 1.0
   chunk_state_teacher_anchor_candidate_index: 0
+  # Optional compatibility gate for support-anchor proposals. When enabled,
+  # a high-support full-rollout continuation is injected only if its prefix
+  # before the current boundary matches the selected state source prefix. This
+  # keeps anchors as state-compatible proposals, not cross-trajectory teachers.
+  chunk_state_support_anchor_prefix_compat_enable: false
+  chunk_state_support_anchor_prefix_compat_tokens: 128
+  chunk_state_support_anchor_min_prefix_match: 0.75
+  chunk_state_support_anchor_skip_source: true
   # Optional post-scoring hard guard for chunk targets. It preserves the TTRL
   # order of estimating a full-rollout answer distribution before calculating
   # chunk rewards, then removes local targets with malformed answers or obvious

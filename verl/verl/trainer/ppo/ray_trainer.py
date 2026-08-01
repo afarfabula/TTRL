@@ -3613,6 +3613,10 @@ class RayPPOTrainer:
         anchor_start = int(cfg.get("chunk_state_support_anchor_candidate_start", 0))
         chunk_size = int(cfg.get("chunk_state_chunk_size", 256))
         min_mass = float(cfg.get("chunk_state_support_anchor_min_mass", 0.0))
+        prefix_compat_enable = bool(cfg.get("chunk_state_support_anchor_prefix_compat_enable", False))
+        prefix_compat_tokens = int(cfg.get("chunk_state_support_anchor_prefix_compat_tokens", 128))
+        min_prefix_match = float(cfg.get("chunk_state_support_anchor_min_prefix_match", 0.75))
+        skip_source = bool(cfg.get("chunk_state_support_anchor_skip_source", True))
         if anchor_count <= 0:
             raise ValueError("ttrl.chunk_state_support_anchor_count must be positive")
         if anchor_start < 0 or anchor_start + anchor_count > candidates:
@@ -3620,9 +3624,12 @@ class RayPPOTrainer:
                 "support anchor candidate range is outside chunk_state_candidates: "
                 f"start={anchor_start}, count={anchor_count}, candidates={candidates}"
             )
+        if prefix_compat_tokens <= 0:
+            raise ValueError("ttrl.chunk_state_support_anchor_prefix_compat_tokens must be positive")
 
         n = int(cfg.n_samples_per_prompt)
         boundaries = np.asarray(state_prompts.non_tensor_batch["chunk_state_boundary"], dtype=np.int64)
+        source_indices = np.asarray(state_prompts.non_tensor_batch["chunk_state_source_index"], dtype=np.int64)
         prompt_indices = np.asarray(state_prompts.non_tensor_batch["chunk_state_source_prompt_index"], dtype=np.int64)
         full_response_mask = full_batch.batch["response_mask"].bool()
         source_answer_mass = np.asarray(source_answer_metadata["source_answer_mass"], dtype=np.float32)
@@ -3639,14 +3646,28 @@ class RayPPOTrainer:
         injected_matrix = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
         injected = 0
         skipped_no_anchor = 0
+        skipped_by_compat = 0
+        skipped_source = 0
         anchor_lengths = []
         anchor_masses = []
         selected_ranks = []
+        prefix_match_ratios = []
         for state_idx, (prompt_idx, boundary) in enumerate(zip(prompt_indices, boundaries)):
             prompt_start = int(prompt_idx) * n
             prompt_stop = prompt_start + n
+            source_idx = int(source_indices[state_idx])
+            source_prefix = None
+            prefix_window = min(prefix_compat_tokens, int(boundary))
+            if prefix_compat_enable and prefix_window > 0:
+                source_prefix = full_batch.batch["responses"][
+                    source_idx,
+                    int(boundary) - prefix_window : int(boundary),
+                ]
             ranked = []
             for full_idx in range(prompt_start, prompt_stop):
+                if skip_source and int(full_idx) == source_idx:
+                    skipped_source += 1
+                    continue
                 mass = float(source_answer_mass[full_idx])
                 if mass < min_mass:
                     continue
@@ -3658,7 +3679,18 @@ class RayPPOTrainer:
                 anchor_len = min(chunk_size, valid_response_len - int(boundary))
                 if anchor_len <= 0:
                     continue
-                ranked.append((-mass, full_idx - prompt_start, full_idx, anchor_len))
+                prefix_match = 1.0
+                if prefix_compat_enable and prefix_window > 0 and source_prefix is not None:
+                    candidate_prefix = full_batch.batch["responses"][
+                        full_idx,
+                        int(boundary) - prefix_window : int(boundary),
+                    ]
+                    prefix_match = (candidate_prefix == source_prefix).float().mean().item()
+                    if prefix_match < min_prefix_match:
+                        skipped_by_compat += 1
+                        continue
+                prefix_match_ratios.append(prefix_match)
+                ranked.append((-mass, -prefix_match, full_idx - prompt_start, full_idx, anchor_len))
             if not ranked:
                 skipped_no_anchor += 1
                 continue
@@ -3667,7 +3699,7 @@ class RayPPOTrainer:
             # keeping the teacher distribution anchored in full-rollout support.
             offset = (self.global_steps + state_idx) % len(ranked)
             ordered = ranked[offset:] + ranked[:offset]
-            for anchor_rank, (_, _, full_idx, anchor_len) in enumerate(ordered[:anchor_count]):
+            for anchor_rank, (_, _, _, full_idx, anchor_len) in enumerate(ordered[:anchor_count]):
                 candidate_idx = anchor_start + anchor_rank
                 target_idx = state_idx * candidates + candidate_idx
                 chunk_output.batch["responses"][target_idx].fill_(self.tokenizer.pad_token_id)
@@ -3705,12 +3737,24 @@ class RayPPOTrainer:
             "chunk_state_support_anchor/count": float(anchor_count),
             "chunk_state_support_anchor/candidate_start": float(anchor_start),
             "chunk_state_support_anchor/min_mass": min_mass,
+            "chunk_state_support_anchor/prefix_compat_enable": float(prefix_compat_enable),
+            "chunk_state_support_anchor/prefix_compat_tokens": float(prefix_compat_tokens),
+            "chunk_state_support_anchor/min_prefix_match": min_prefix_match,
+            "chunk_state_support_anchor/skip_source": float(skip_source),
             "chunk_state_support_anchor/injected_ratio": injected / max(len(state_prompts) * anchor_count, 1),
             "chunk_state_support_anchor/state_keep_ratio": float(state_keep.mean()) if len(state_keep) else 0.0,
             "chunk_state_support_anchor/skipped_no_anchor_ratio": skipped_no_anchor / state_count,
+            "chunk_state_support_anchor/skipped_by_compat_ratio": skipped_by_compat / max(len(state_prompts) * n, 1),
+            "chunk_state_support_anchor/skipped_source_ratio": skipped_source / max(len(state_prompts) * n, 1),
             "chunk_state_support_anchor/score_mean": score_matrix.mean().item() if len(score_matrix) else 0.0,
             "chunk_state_support_anchor/positive_candidate_ratio": (score_matrix > 0.0).float().mean().item()
             if len(score_matrix)
+            else 0.0,
+            "chunk_state_support_anchor/prefix_match_mean": float(np.mean(prefix_match_ratios))
+            if prefix_match_ratios
+            else 0.0,
+            "chunk_state_support_anchor/prefix_match_min": float(np.min(prefix_match_ratios))
+            if prefix_match_ratios
             else 0.0,
             "chunk_state_support_anchor/anchor_mass_mean": float(np.mean(anchor_masses)) if anchor_masses else 0.0,
             "chunk_state_support_anchor/anchor_mass_max": float(np.max(anchor_masses)) if anchor_masses else 0.0,

@@ -7777,3 +7777,92 @@ update_actor: 1.319s -> 1.044s
 - candidate score 要从 raw short-probe correctness 改成相对 full group support 的 future quality improvement，例如 support mass gain、top answer margin、transport/KL improvement 或 longer-horizon pass gain。
 - 对低信息 state 直接跳过或降权：all-negative、support coverage 低、OOV 高、top mass 太平、malformed/repeated boxed 或 marker 污染。
 - PowerFlow loss 骨架可以保留，但 target 应是 per-state sharpened distribution `q_j ∝ exp(alpha * score_j) * prior_j`，其中 `score_j` 来自 full-rollout support/value improvement，而不是局部短 probe 命中。
+
+## 2026-08-01 state-compatible support proposal smoke
+
+背景：
+
+- 前一轮 `supportprop` 直接把同 prompt 的 high-mass full-rollout continuation 注入 candidate slot，结果 target 质量没有提升；原因是这些 continuation 虽然 answer support 高，但不一定兼容当前 state 的局部推理路径。
+- 本轮新增一个默认关闭的 prefix compatibility gate：support anchor 必须来自同 prompt，且在当前 boundary 前的 tail tokens 与 selected source prefix 足够匹配，才允许作为 candidate proposal 注入。
+- 注意：这仍然只是 proposal，不是 teacher。active scorer 仍是 `future_support_gain + transport_affinity`，PowerFlow target 仍由 probe 后的 full-support transport score 决定。
+
+实现：
+
+- 新增配置：
+  - `chunk_state_support_anchor_prefix_compat_enable`
+  - `chunk_state_support_anchor_prefix_compat_tokens`
+  - `chunk_state_support_anchor_min_prefix_match`
+  - `chunk_state_support_anchor_skip_source`
+- 在 `_apply_chunk_state_support_anchors` 中，比较 candidate full rollout 与 selected source rollout 在 `boundary - compat_tokens : boundary` 的 token-level match ratio。
+- 默认关闭，兼容已有实验；launcher 显式打开。
+
+### strict compat：tail128 / min match 0.75
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_c128_probe4_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_c128_probe4_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_c128_probe4_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_c128_probe4_b32_r32_v64_1step_20260801.jsonl
+```
+
+关键结果：
+
+```text
+support_anchor injected_ratio = 0.000
+support_anchor skipped_no_anchor_ratio = 1.000
+support_anchor skipped_by_compat_ratio = 0.409
+support_anchor prefix_match_mean = 0.000
+
+support_coverage_mean = 0.564
+candidate_oov_tv_mean = 0.704
+transport_gain_mean = -0.127
+state_keep_ratio = 0.292
+num_actor_samples = 40
+actor/powerflow_loss = 0.196
+chunk_state_probe = 15.551s
+update_actor = 2.085s
+gen = 43.701s
+diag_rows = 24
+```
+
+### relaxed compat：tail32 / min match 0.25
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_relaxed_c128_probe4_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_relaxed_c128_probe4_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_relaxed_c128_probe4_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_transport_affinity_compatprop_relaxed_c128_probe4_b32_r32_v64_1step_20260801.jsonl
+```
+
+关键结果：
+
+```text
+support_anchor injected_ratio = 0.000
+support_anchor skipped_no_anchor_ratio = 1.000
+support_anchor skipped_by_compat_ratio = 0.409
+support_anchor prefix_match_mean = 0.000
+
+support_coverage_mean = 0.564
+candidate_oov_tv_mean = 0.704
+transport_gain_mean = -0.127
+state_keep_ratio = 0.292
+num_actor_samples = 40
+actor/powerflow_loss = 0.248
+chunk_state_probe = 15.599s
+update_actor = 1.911s
+gen = 43.628s
+diag_rows = 24
+```
+
+结论：
+
+- token-level state-compatible support proposal 在当前独立 rollout group 中基本没有可用交集；即使放松到 tail32 / 0.25，非 source high-support trajectory 也无法通过 prefix compatibility。
+- 因为注入率为 0，两个 smoke 的 target 指标完全退回 masssrc baseline：`support_coverage_mean=0.564`、`candidate_oov_tv_mean=0.704`、`transport_gain_mean=-0.127`、`state_keep_ratio=0.292`。
+- 这说明“从其它 full rollout 截 high-support continuation”不是一个可用的 next-chunk proposal，除非引入语义级 state matching / edit-distance retrieval / tree-search shared-prefix 机制。
+- 继续降低 token threshold 没意义，会退化成前一轮 non-compatible supportprop，把别的推理路径硬塞进当前 state。
+
+下一步：
+
+- 不再继续放松 token-prefix anchor。更合理的最小下一步是同一 source path 的 longer-horizon value estimation：保留当前 state 的 sampled chunk，但 probe 不再用短局部 answer hit 主导，而是更长 horizon / multi-stage rollout 后计算相对 full-support distribution 的 transport/value gain。
+- 如果继续做 support proposal，需要先构造真正的 shared-prefix search tree 或语义相似检索，而不是从独立 full rollouts 按相同 token boundary 直接截 continuation。
+- 因此当前最稳的后续实验是：`source-path staged long probe`，即对同一 state 的 candidate 先做 chunk，再 rollout 到更接近完整答案的 horizon，用 full-rollout group support/value 计算 `q_j ∝ exp(alpha * future_support_gain_j) * prior_j`。
