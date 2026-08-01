@@ -8231,3 +8231,134 @@ diag_rows = 16
 - 不再把主要精力放在 c16/c32 或继续调 hard gate；这些只能改善样本数，不能改变 target 是否正确。
 - 下一步应改 label estimation 机制：让 full rollout group support 直接生成 per-state target distribution，例如从完整 rollout 的 answer support / future suffix support 中构造 target，再把 source chunk 只作为 prior。
 - 候选生成也需要更贴近 support：可以从 high-support rollout 的真实 suffix chunk 做 replay/proposal，或混合 on-policy resample 与 support-suffix proposal，而不是完全依赖 state-local short probe 判断候选好坏。
+
+## 2026-08-01 support-flow suffix soft-mass smoke
+
+背景：
+
+- 这轮是对前面失败结论的直接修正：放弃“局部短视可判定性”，不再要求 chunk target 主要由 short-horizon probe 的局部命中、source answer consistency 或 source chunk hard teacher 决定。
+- full rollout group 先定义 prompt-level answer support；同 prompt support 内的真实 suffix chunk 被注入为 candidate proposal，score 使用 support mass 的 soft target。
+- source chunk 仍保留在 candidate 0，但只作为 prior / drift guard；support anchors 从 candidate 1 开始填充，不再让 source chunk 直接决定 target。
+- 本轮 `score_mode=support_flow`，因此 short probe 被显式跳过：`chunk_state_probe/skipped_for_support_flow=1.000`。
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_1step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_1step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_1step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_suffix_softmass_mid_c128_b32_r32_v64_1step_20260801.jsonl
+```
+
+配置：
+
+```text
+score_mode = support_flow
+support_flow_score_type = soft_mass
+source_mode = majority_consistent
+source_select_by_mass = true
+min_prompt_top_mass = 0.35
+min_source_answer_mass = 0.40
+source_chunk_enable = true
+source_chunk_candidate_index = 0
+support_anchor_enable = true
+support_anchor_count = 7
+support_anchor_candidate_start = 1
+support_anchor_min_mass = 0.03125
+support_anchor_prefix_compat_enable = false
+support_anchor_skip_source = true
+boundary_mode = mid
+mid_boundary_min_ratio = 0.25
+mid_boundary_max_ratio = 0.70
+candidates = 8
+chunk_size = 128
+probe_samples = 1
+probe_max_tokens = 1
+label_consistent_only = false
+zero_inconsistent_candidates = false
+skip_all_negative = false
+```
+
+关键结果：
+
+```text
+source_mass_mean = 0.520
+source_prompt_top_mass_mean = 0.520
+source_original_acc_mean = 1.000
+source_pseudo_acc_mean = 0.938
+
+real_state_count = 11
+pad_state_count = 5
+skipped_support_sources = 21
+majority_consistent_fallbacks = 11
+boundary_mean = 592
+boundary_min = 256
+boundary_max = 1024
+
+source_chunk_injected_ratio = 1.000
+support_anchor_injected_ratio = 0.973
+support_anchor_positive_candidate_ratio = 0.852
+support_anchor_anchor_mass_mean = 0.246
+support_anchor_anchor_mass_max = 0.808
+
+support_flow_anchor_mass_mean = 0.210
+support_flow_source_mass_mean = 0.520
+support_flow_positive_margin_mean = -0.077
+support_flow_state_keep_ratio = 1.000
+support_flow_label_consistent_ratio = 0.852
+
+answer_coverage_mean = 0.852
+future_support_keep_ratio = 1.000
+positive_ratio = 0.210
+informative_ratio = 1.000
+num_actor_samples = 88
+zeroed_state_ratio = 0.312
+target_entropy = 1.406
+powerflow_weight_before_clip_max = 7.456
+powerflow_weight_max = 4.000
+
+actor/powerflow_loss = 0.960
+actor/boxed_reward/mean = 0.248
+actor/boxed_reward/max = 0.808
+actor/grad_norm = 41.035
+chunk_state_actor_span/response_len_mean = 119.406
+
+timing_s/gen = 43.537
+timing_s/chunk_state_chunks = 1.101
+timing_s/chunk_state_score = 7.570
+timing_s/chunk_state_ref = 5.316
+timing_s/update_actor = 3.900
+diag_rows = 16
+```
+
+diag JSONL 统计：
+
+```text
+rows = 16
+answer_coverage_mean = 0.851562
+answer_coverage_min = 0.500000
+answer_coverage_max = 0.875000
+future_support_keep_mean = 1.000000
+loss_weight_mean = 0.687500
+probe_positive_count_mean = 6.812500
+boundary_mean = 592
+source_answer_mass_mean = 0.520083
+source_answer_mass_min = 0.416667
+source_answer_mass_max = 0.807692
+all_positive_mean = 0
+all_negative_mean = 0
+```
+
+结论：
+
+- 这是当前 chunk-state 方向里第一次真正避开 short-horizon probe local hit teacher 的 smoke。日志明确显示 `chunk_state_probe/skipped_for_support_flow=1.000`，target 来自 full-rollout support suffix soft mass，而不是局部短 probe 命中。
+- target 质量出现方向性改善：`answer_coverage_mean=0.852`，显著高于前两轮 probe/local 候选的约 0.58-0.60；`support_anchor_positive_candidate_ratio=0.852`，说明候选空间确实被拉回 full support 内。
+- 样本量也可训练：`num_actor_samples=88`，比 highsupport-mid 的 8 大幅改善，虽然低于 c16 softgate 的 112，但后者 target coverage/OOV 仍没有解决。
+- 这不是 20-step gate 通过，只是确认“放弃局部短视可判定性、用 full support suffix 定义 target”是更正确的主线。下一步必须跑 20-step 看 validation trajectory，而不是继续在 short-probe 打分上调 gate。
+- 仍有一个重要风险：`support_flow_positive_margin_mean=-0.077`，表示 support anchor soft mass 平均还低于 source mass；当前 soft target 更像 support distillation / replay proposal，不等价于已经证明每个 transition 都带来正向 support gain。20-step 必须同时看 validation 和 target drift。
+
+下一步：
+
+- 基于这一版启动 20-step gate：每 20 step 做 val，优先看 `mean@16/maj@16/best@16` 是否至少不低于复现 MV 的 step20。
+- 20-step 过程中保留这些诊断：`answer_coverage_mean`、`support_anchor_injected_ratio`、`support_flow_positive_margin_mean`、`num_actor_samples`、`actor/grad_norm`、`timing_s/update_actor`。
+- 若 20-step 不稳，下一版不回退到 short-probe teacher，而是在 support-flow 内改 score：从 `soft_mass` 升级为 `soft_relative_mass` 或 value-margin target，并加入低信息 state skip。
