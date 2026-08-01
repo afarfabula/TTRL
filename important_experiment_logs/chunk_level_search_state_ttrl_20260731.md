@@ -8859,3 +8859,117 @@ staged_base/support_coverage_mean = 0.412667
 - 不再让 short base probe 先决定 teacher 候选。
 - 下一版改为全候选 longer-horizon future distribution estimation：保持所有 candidates 都用同一 probe horizon，先验证 `probe1536x4` 或 `probe2048x4` 是否提高 support coverage / state_keep_ratio / transport gain。
 - 如果全候选长 probe 仍不提升，再考虑改 target 公式，而不是继续堆 staged gate。
+
+## 2026-08-01 full-candidate long-probe future-gain smoke
+
+目的：
+
+- 验证最新方法判断：不要让 short-horizon probe/local hit/source consistency 主导 chunk target。
+- 取消 staged top-k 粗筛，对同一 state 的全部 8 个 candidates 使用同一较长 horizon probe 来估计 future answer distribution。
+- target 仍由 full-rollout group support distribution 定义，probe 只作为 candidate future distribution estimator。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_3step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_3step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_3step_20260801.jsonl
+status = completed_3_steps_no_val
+```
+
+配置：
+
+```text
+batch = 32 prompts
+rollout.n = 32
+votes_per_prompt = 64
+chunk_size = 128
+candidates = 8
+probe = 1536 tokens x 4 samples
+staged_probe_enable = false
+support_anchor_count = 3
+support_anchor_candidate_start = 5
+score = future_support_gain / smoothed_transport_support_gain
+PowerFlow loss = enabled
+dynamic_bsz = false
+```
+
+运行确认：
+
+```text
+model = /models/Qwen2.5-Math-7B
+venv = /mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200
+vLLM attention_config.backend = FLASH_ATTN
+FlashInfer autotune = observed
+NCCL NVLS = enabled
+NCCL P2P/CUMEM = observed
+Traceback / OOM = 0 / 0
+Timeout during comparison = 3
+Timeout during parsing = 0
+Final validation skipped = expected
+```
+
+3-step 均值：
+
+```text
+chunk_state_future_support_gain/improved_state_ratio = 0.979333
+chunk_state_future_support_gain/positive_margin_mean = 0.173333
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.119333
+chunk_state_future_support_gain/smoothed_transport_affinity_mean = 0.674667
+chunk_state_future_support_gain/transport_affinity_mean = 0.349667
+
+chunk_state_future_support_gain/support_coverage_mean = 0.543000
+chunk_state_future_support_gain/state_oov_mean = 0.457000
+chunk_state_future_support_gain/state_keep_ratio = 0.437333
+chunk_state_future_support_gain/label_consistent_ratio = 0.854000
+chunk_state_future_support_gain/score_mean = 0.104333
+chunk_state_future_support_gain/raw_gain_mean = -0.196000
+
+chunk_state/num_actor_samples = 32.000000
+chunk_state/target_entropy = 1.817000
+
+timing_s/generate_sequences = 22.003000
+timing_s/gen = 30.231000
+timing_s/chunk_state_probe = 7.444000
+timing_s/chunk_state_score = 8.176333
+timing_s/chunk_state_ref = 1.801333
+timing_s/update_actor = 1.426667
+```
+
+与 support3 baseline 对比：
+
+```text
+metric                                            support3      fullcand1536x4
+improved_state_ratio                              0.729333      0.979333
+positive_margin_mean                              0.137333      0.173333
+smoothed_transport_gain_mean                      0.073333      0.119333
+smoothed_transport_affinity_mean                  0.630333      0.674667
+transport_affinity_mean                           0.260000      0.349667
+support_coverage_mean                             0.427667      0.543000
+state_oov_mean                                    0.572333      0.457000
+state_keep_ratio                                  0.292000      0.437333
+label_consistent_ratio                            0.612000      0.854000
+score_mean                                        0.094000      0.104333
+raw_gain_mean                                    -0.298667     -0.196000
+num_actor_samples                                 24.000000     32.000000
+target_entropy                                    1.928000      1.817000
+timing_s/chunk_state_probe                        5.266333      7.444000
+timing_s/chunk_state_score                        7.815333      8.176333
+timing_s/update_actor                             1.145667      1.426667
+Timeout during comparison                         3             3
+Timeout during parsing                            0             0
+```
+
+结论：
+
+- 这是目前 chunk-state future-support 系列里最好的 3-step smoke，且方向和最新方法约束一致。
+- 全候选长 probe 明显改善 target 质量：coverage 从 0.428 到 0.543，OOV 从 0.572 到 0.457，state keep 从 0.292 到 0.437，transport gain 从 0.073 到 0.119。
+- 该结果支持“放弃局部短视可判定性”：不要用短 probe/top-k/source hard gate 过早决定 teacher，而是让所有候选用较长 horizon 估计 future distribution。
+- 代价是 probe 从约 5.27s 增至 7.44s，score 约 8.18s，update_actor 仍只有约 1.43s；瓶颈仍不是 chunk actor update。
+- step 1 端到端约 111s，受 CUDA graph/JIT/首轮生成长度影响；step 2/3 约 48-51s，稳定后可接受作为 20-step pilot。
+
+下一步：
+
+- 可以扩到 20-step validation gate，优先验证 mean/maj/best trajectory 是否真正优于 MV 复现线。
+- 20-step 前建议保持语义不变，只做工程层面的日志解析和 timeout 统计；不要重新引入 staged short-probe top-k。
+- 如果 20-step 训练稳定但速度偏慢，再考虑用 B200 大显存做并行 candidate probe batching 或更长 max_num_batched_tokens，而不是改变 target 语义。
