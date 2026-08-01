@@ -3139,3 +3139,82 @@ actor/grad_norm=16.443
 - target 更锐：`target_entropy` 从约 `1.59` 降到 `1.38`，`positive_ratio` 从约 `0.486` 提到 `0.535`。
 - 这只是 smoke，不代表最终 acc 会提升；但它满足“改 label estimation / verifier，而不是调权重”的下一轮条件。
 - 下一步可以跑 20-step gate。gate 仍然是超过 hard confidence-gated c128 的 `mean@16=0.5325`；如果 20-step 仍失败，就说明 naive future chunk anchor 不足，需要更强的 answer-level verifier / longer horizon probe，而不是直接扩到 80-step。
+
+## 2026-08-01 Teacher-anchor Mid-state c128 20-step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_candidates=8
+chunk_state_chunk_size=128
+chunk_state_probe_samples=4
+chunk_state_probe_max_tokens=1024
+chunk_state_teacher_anchor_enable=True
+chunk_state_teacher_anchor_candidate_index=0
+chunk_state_teacher_anchor_score=1.0
+chunk_state_source_chunk_enable=False
+actor.powerflow_enable=True
+actor.use_dynamic_bsz=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+```
+
+Final validation：
+
+```text
+mean@16=0.525875
+maj@16=0.656294
+best@16=0.867390
+format_mean@16=0.899000
+format_maj@16=0.883678
+format_best@16=0.999000
+testing=295.607s
+```
+
+20-step 平均训练信号：
+
+```text
+teacher_anchor_replaced_ratio=1.000
+teacher_anchor_label_consistent_forced=1.000
+source_original_correct=0.780
+source_majority_consistent=1.000
+positive_ratio_after_anchor=0.556
+label_consistent_ratio_after_anchor=0.731
+kept_state_ratio=0.678
+target_entropy=1.450
+timing_s/gen=25.185
+timing_s/chunk_state_probe=6.670
+timing_s/chunk_state_score=10.945
+timing_s/update_actor=7.356
+```
+
+与短程 gate 对比：
+
+```text
+hard confidence-gated c128:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+majority-consistent mid-state c128:
+  mean@16=0.486625 maj@16=0.619360 best@16=0.863332 format_mean@16=0.898000
+
+teacher-anchor mid-state c128:
+  mean@16=0.525875 maj@16=0.656294 best@16=0.867390 format_mean@16=0.899000
+```
+
+结论：
+
+- 这轮 teacher-anchor 20-step gate 没有超过 hard confidence-gated c128 的 `mean@16=0.5325`，因此不能扩到 80-step。
+- 相比 majority-consistent mid-state，teacher-anchor 明显修复了局部训练信号：`mean@16` 从 `0.486625` 回到 `0.525875`，但仍略低于 hard gate。
+- anchor 机制本身按预期生效：`replaced_ratio=1.0`，`label_consistent_forced=1.0`，`kept_state_ratio=0.678`，actor update 只训练约 128-token chunk，平均 `~7.36s`。
+- 失败说明 naive future chunk anchor 只能减少局部 target 噪声，不能保证 chunk-level improved distribution 指向最终正确性。
+- 下一步不应继续调 PowerFlow 权重或直接扩 80-step；应参考 arXiv 2504.16084 的 state-level 多输出 label estimation / reward calculation / online self-improvement 思路，把 `query + partial reasoning` state 下的 candidate scoring 改成更强的 answer-level verifier 或 longer-horizon probe 聚合。
+- infra 侧当前端到端主要由 full rollout `~25.2s`、chunk probe `~6.7s`、math parser/scoring `~10.9s`、actor update `~7.4s` 构成；SymPy warning/timeout 仍是 chunk search 实验的主要工程噪声源。
