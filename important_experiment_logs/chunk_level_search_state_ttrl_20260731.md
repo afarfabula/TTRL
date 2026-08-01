@@ -3070,3 +3070,72 @@ majority-consistent mid-state c128:
 - 这说明 arXiv 2504.16084 的“同一 state 多输出聚合 label/reward”语义要继续保留，但 state 变成 `query + partial reasoning` 后，不能只用短 probe 的局部 completion majority 当训练目标。
 - 下一步应改 label estimation / verifier，而不是继续调 PowerFlow 权重：例如对 chunk candidate 做更长 horizon probe、复用完整 rollout 的 future success、或引入 answer-level verifier 聚合，保证 improved distribution 真正指向最终正确性。
 - infra 侧 actor update 已经稳定在 `~7.5s`；当前端到端主要由 full rollout `~26.3s`、chunk probe `~6.6s`、parser/scoring `~10.8s` 和 validation `~296s` 构成。parser timeout 仍是明显噪声源。
+
+## 2026-08-01 Teacher-anchor Mid-state c128 3-step Smoke
+
+动机：
+
+- majority-consistent mid-state 20-step gate 失败后，判断失败点是局部 target 不够干净，而不是 source construction 或 PowerFlow actor update 崩掉。
+- 按 24h goal 的下一步，应改 label estimation / verifier，而不是继续调 PowerFlow 权重。
+- 本轮引入 teacher-anchor：把 source full rollout 在 boundary 之后的真实 next chunk 注入候选槽 0，并给它 `score_floor=1.0`。
+- 这相当于先复用 full rollout 的 future-success path 作为一个 search anchor，再让 PowerFlow 在同一 state 的候选分布上蒸馏；仍然不使用真实 GT 选择 source。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  teacher_anchor score floor 生效时，同步把 anchor candidate 的 chunk_state_label_consistent 置 1
+  避免 ttrl.chunk_state_label_consistent_only=True 时 anchor 被 mask 掉
+
+run_records/ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  复用 majority-consistent mid-state c128 配置
+  打开 chunk_state_teacher_anchor_enable=True
+  关闭 source_chunk_enable，避免两个 anchor 机制重复
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+chunk_state_source_mode=majority_consistent
+chunk_state_boundary_mode=mid
+chunk_state_teacher_anchor_enable=True
+chunk_state_teacher_anchor_candidate_index=0
+chunk_state_teacher_anchor_score=1.0
+chunk_state_source_chunk_enable=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_teacher_anchor_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+teacher_anchor_replaced_ratio=1.000
+teacher_anchor_label_consistent_forced=1.000
+source_original_correct=0.812
+source_majority_consistent=1.000
+chunk_majority_ratio=0.473
+chunk_majority_label_consistent_ratio=0.673
+positive_ratio_after_anchor=0.535
+label_consistent_ratio_after_anchor=0.698
+kept_state_ratio=0.635
+target_entropy=1.382
+timing_s/gen=32.716
+timing_s/chunk_state_probe=7.164
+timing_s/chunk_state_score=9.771
+timing_s/update_actor=7.390
+actor/powerflow_loss=0.293
+actor/grad_norm=16.443
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP/vLLM 崩溃。
+- anchor 机制确实生效：`replaced_ratio=1.0`，`score_floor=1.0`，`label_consistent_forced=1.0`。
+- 相比上一轮 majority-consistent 3-step smoke，source 质量略高：`source_original_correct` 从 `0.792` 到 `0.812`。
+- target 更锐：`target_entropy` 从约 `1.59` 降到 `1.38`，`positive_ratio` 从约 `0.486` 提到 `0.535`。
+- 这只是 smoke，不代表最终 acc 会提升；但它满足“改 label estimation / verifier，而不是调权重”的下一轮条件。
+- 下一步可以跑 20-step gate。gate 仍然是超过 hard confidence-gated c128 的 `mean@16=0.5325`；如果 20-step 仍失败，就说明 naive future chunk anchor 不足，需要更强的 answer-level verifier / longer horizon probe，而不是直接扩到 80-step。

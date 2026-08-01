@@ -2207,6 +2207,14 @@ class RayPPOTrainer:
                 )
                 scores = score_matrix.reshape(-1)
                 metrics["chunk_state_teacher_anchor/score_floor"] = anchor_score
+                if "chunk_state_label_consistent" in state_prompts.non_tensor_batch:
+                    label_consistent = np.asarray(
+                        state_prompts.non_tensor_batch["chunk_state_label_consistent"],
+                        dtype=np.float32,
+                    ).reshape(len(state_prompts), candidates)
+                    label_consistent[:, anchor_idx] = 1.0
+                    state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent
+                    metrics["chunk_state_teacher_anchor/label_consistent_forced"] = 1.0
             metrics.update(self._compute_chunk_state_diag_metrics(full_batch, state_prompts, scores))
             metrics.update(self._dump_chunk_state_diag_jsonl(state_prompts, scores))
 
