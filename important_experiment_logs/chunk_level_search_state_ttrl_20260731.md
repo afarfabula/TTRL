@@ -4581,7 +4581,7 @@ RuntimeError: DataLoader worker (pid 1740812) is killed by signal: Killed.
 
 - 不扩 guard20 到 80 step。
 - 优先实现 `chunk_state_target_guard_min_answer_mass > 0` 或更强的 distribution-in-support target：candidate 的 probe answer 不在 full-rollout answer support 中时，权重置零或强降权。
-- 去掉 `teacher_anchor_score=0.5` 的硬 floor 做对照，只保留 source chunk injection + distribution guard，判断 anchor floor 是否在错误地保护局部坏 chunk。
+- 去掉 `teacher_anchor_score=0.5` 的硬 floor 做对照；下一版先验证 support-only target，再显式重跑 source chunk injection + distribution guard，判断 anchor floor 是否在错误地保护局部坏 chunk。
 - 设计 answer-boundary-aware state selection，尽量在 reasoning/answer 边界附近截 state，而不是随机 mid boundary。
 - validation 侧需要减少超长样本 stdout，避免 metrics 后 DataLoader/Ray worker 清理阶段被 kill。
 
@@ -4591,8 +4591,9 @@ RuntimeError: DataLoader worker (pid 1740812) is killed by signal: Killed.
 
 - 接上 guard20 的失败结论，不继续微调普通 guard 阈值。
 - 更接近 arXiv 2504.16084 的拆分：先从 32 条 full rollout 估计 answer distribution，再用该 distribution 约束 chunk target。
-- 去掉 `teacher_anchor_score=0.5` 的硬 floor，只保留 source chunk injection；避免 teacher anchor floor 保护局部坏 chunk。
+- 去掉 `teacher_anchor_score=0.5` 的硬 floor，先跑 support-only 版本；避免 teacher anchor floor 保护局部坏 chunk。
 - 启用 full-answer support guard：probe answer 不在 full rollout answer support 中时置零；同时把 prompt answer mass 注入 score，形成 support-constrained target。
+- 注意：本次实际配置中 `answer_value_margin` wrapper 最后覆盖了 `ttrl.chunk_state_source_chunk_enable=False`。因此这次 smoke 是 support-only target，不是 source-chunk-injection target。后续 20-step gate 必须显式补 `ttrl.chunk_state_source_chunk_enable=True` 并重新确认 Hydra final config。
 
 运行：
 
@@ -4611,7 +4612,7 @@ ttrl.chunk_state_candidates=8
 ttrl.chunk_state_chunk_size=128
 ttrl.chunk_state_probe_samples=4
 ttrl.chunk_state_probe_max_tokens=1024
-ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_source_chunk_enable=False
 ttrl.chunk_state_teacher_anchor_enable=False
 ttrl.chunk_state_target_guard_enable=True
 ttrl.chunk_state_target_guard_bad_probe_ratio=0.5
@@ -4676,4 +4677,4 @@ diag_jsonl_rows = 96
 - 去掉 `teacher_anchor_score` 后 actor batch 仍没有打空，三步 `zero_shard_ratio=0.000`，PowerFlow loss 正常非零。
 - `boxed_reward_weighted_mean` 升到约 0.65，说明 distribution score 正在把权重集中到 full-answer support 内的 candidate。
 - 风险是 actor loss/grad norm 明显高于 guard20：`actor/powerflow_loss` 到 1.5-1.6，`grad_norm` 到 32-52。20-step gate 必须观察是否过强更新导致 mean/maj 继续塌。
-- 该 smoke 没有 final validation，不能判断效果；下一步可跑 20-step gate，但必须仍以 step20 mean/maj 为硬判据。
+- 该 smoke 没有 final validation，不能判断效果；下一步先跑显式 source-chunk-injection 的 20-step gate，并必须以 step20 mean/maj 为硬判据。
