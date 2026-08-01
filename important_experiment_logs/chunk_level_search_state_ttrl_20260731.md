@@ -7162,3 +7162,102 @@ state_mixed_ratio = 0.375
 - 方法 gate 没过。`score_mean=0.003`、`label_consistent_ratio=0.082`、`state_keep_ratio=0.156`、`num_actor_samples=8`，说明“必须相对 source baseline 有正 transport gain”在当前 candidate/probe 分布下过于稀疏。
 - 这轮不是简单 gate 太硬：核心信号仍是 `candidate_oov_tv_mean=0.738`、`transport_gain_mean=-0.159`，与 longctx affinity 一致，说明候选未来分布整体没有走向 full support。hard positive-gain 只会把 actor update 压到 0.7s，但训练信号几乎全灭。
 - 下一步不应回到 short-horizon local teacher，也不应继续强化 source hard constraint。更合理的是 `full-support gated soft affinity`：先用 state-level full-support coverage/top-mass/margin 过滤低信息 state；保留 candidate 的 absolute support affinity 作为 soft distribution；但不要强制 positive transport gain。目标是先得到非稀疏、由 full support 主导、且 OOV 可控的 target，再考虑 20-step。
+
+## 2026-08-01 Transport Affinity + Full-Support State Gate 设计
+
+背景：
+
+- `transport_support_gain` 验证了 hard positive transport gain 过稀疏：`score_mean=0.003`、`num_actor_samples=8`、`state_keep_ratio=0.156`。这能减少 actor update 时间，但几乎没有训练信号。
+- 因此下一轮不再要求 candidate 必须相对 source 有正 gain，而是保留 `transport_affinity = 1 - candidate_oov_tv` 的 soft distribution；full-rollout support 只用于过滤低信息 state/candidate 和定义 affinity。
+
+配置：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_stategate_c128_probe4_b32_r32_v64_1step_20260801.sh
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+max_model_len = 4096
+score_type = transport_affinity
+min_state_coverage = 0.50
+max_state_oov = 0.50
+min_state_top_margin = 0.02
+min_candidate_coverage = 0.25
+min_candidate_mean_mass = 0.02
+source_prior_weight = 1.05
+dynamic_bsz = False
+final_validation = skipped
+```
+
+Gate：
+
+- 目标是介于原始 longctx affinity 和 hard support-gain 之间：`num_actor_samples` 不应低到个位数，`state_keep_ratio` 不应全灭，同时 `candidate_quality_keep_ratio` 和 `state_top_margin` 应体现 full-support gate 的筛选效果。
+- 如果仍然只有很少样本，说明当前 probe/candidate distribution 本身不进入 full support，需要改 candidate 生成或 state selection，而不是继续调 loss。
+
+结果：
+
+```text
+run = ttrl_chunk_state_powerflow_future_support_transport_affinity_stategate_c128_probe4_b32_r32_v64_1step_20260801
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+max_model_len = 4096
+score_type = transport_affinity
+dynamic_bsz = False
+final_validation = skipped
+
+support_coverage_mean = 0.479
+candidate_coverage_mean = 0.479
+candidate_quality_keep_ratio = 0.645
+state_oov_mean = 0.521
+candidate_oov_tv_mean = 0.738
+source_oov_tv_mean = 0.579
+transport_affinity_mean = 0.262
+transport_gain_mean = -0.159
+score_mean_before_candidate_filter = 0.262
+score_mean = 0.260
+label_consistent_ratio = 0.645
+state_top_margin_mean = 0.025
+learnable_state_keep_ratio = 0.250
+state_keep_ratio = 0.250
+num_actor_samples = 56
+pruned_sample_ratio = 0.781
+target_entropy = 1.777
+powerflow_weight_max = 1.807
+grad_norm = 8.338
+
+timing_s/gen = 43.816
+timing_s/chunk_state_chunks = 1.086
+timing_s/chunk_state_probe = 17.145
+timing_s/chunk_state_score = 11.306
+timing_s/chunk_state_ref = 4.595
+timing_s/update_actor = 2.641
+```
+
+diag 聚合：
+
+```text
+jsonl_rows = 32
+answer_coverage mean = 0.479, min = 0.000, max = 0.969
+probe_mean mean = 0.260, min = 0.000, max = 0.668
+probe_max mean = 0.358, min = 0.000, max = 0.750
+source_answer_mass mean = 0.421, min = 0.048, max = 0.808
+source_original_correct mean = 0.844
+future_support_keep mean = 0.250
+future_support_state_top_margin mean = 0.025
+state_all_positive_ratio = 0.438
+state_all_negative_ratio = 0.188
+state_mixed_ratio = 0.375
+```
+
+结论：
+
+- 这轮比 hard `transport_support_gain` 明显更可训练：`num_actor_samples` 从 8 回升到 56，`score_mean` 从 0.003 回升到 0.260，`state_keep_ratio` 从 0.156 到 0.250，`update_actor=2.641s` 仍然很轻。
+- 但它没有解决根因：`candidate_oov_tv_mean=0.738`、`transport_gain_mean=-0.159` 与前两轮一致，说明 candidate future distribution 仍整体不比 source 更接近 full support。这个版本只是把训练信号从“全灭”拉回“可训练”，不是一个应扩 20-step 的正结果。
+- 当前最清楚的方向是：loss / gate 已经不是主矛盾，candidate 生成和 state selection 才是。下一步应该让 candidate proposal 更接近 full-rollout support，例如从 full support 内的高质量 rollout 后续 chunk 做 contrastive candidate、或在同一 state 下用 support-conditioned resampling / staged continuation 生成候选，再用 soft affinity 做 PowerFlow matching。
