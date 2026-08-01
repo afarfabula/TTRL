@@ -6468,3 +6468,70 @@ positive_ratio mean = 0.094
 - infra 侧是正结果：放弃 short probe teacher 后，support_anchor 仍能稳定给满 128 actor samples，score 开销约 1ms，chunk actor update 约 3s。
 - 训练效果是负结果：20-step mean@16 只有 0.43725，maj@16 0.558596，明显低于我们已有 MV / PowerFlow 早期轨迹。当前 support_anchor 只把 full-support completion 的局部 chunk 注入并蒸馏，缺少真正的 search-improvement / distribution transport 信号。
 - 方法判断：这证明“不要用短 probe 局部命中定义 teacher”方向是可实现且计算友好的，但 naive support-anchor distillation 不足以提升数学准确率。下一版需要让 chunk target 对齐 full rollout group 的未来分布改善，例如 support mass gain / value margin / answer support transport，而不是只学习高 support 完整轨迹里的局部 next chunk。
+
+## 2026-08-01 N64 full-support future-support-gain smoke
+
+目的：
+
+- 验证 B200 大显存下把 full rollout support 从 32 放到 64，是否能直接改善 chunk target 的 support coverage / OOV。
+- 保留 hardfilter + clip4 的高效 actor update 设置，只做 2-step target-quality smoke，不做 final val。
+- 这是对“full group label estimation 是否因为 N 太小而噪”的排查，不作为正式方法扩展。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_n64_hardfilter_clip4_mid_c128_probe4_2step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_gain_n64_hardfilter_clip4_mid_c128_probe4_2step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_n64_hardfilter_clip4_mid_c128_probe4_2step_20260801.jsonl
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+actor_rollout_ref.rollout.n = 64
+trainer.total_training_steps = 2
+trainer.final_val_enable = False
+ttrl.chunk_state_score_mode = future_support_gain
+ttrl.chunk_state_future_support_score_type = positive_gain
+ttrl.chunk_state_chunk_size = 128
+ttrl.chunk_state_probe_samples = 4
+ttrl.chunk_state_probe_max_tokens = 1024
+ttrl.chunk_state_powerflow_weight_clip = 4.0
+ttrl.chunk_state_powerflow_weight_clip_renorm = True
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+target quality / timing：
+
+```text
+step 1:
+  support_coverage_mean = 0.399
+  state_oov_mean = 0.601
+  raw_gain_mean = -0.209
+  tv_gain_mean = -0.084
+  label_consistent_ratio = 0.223
+  num_actor_samples = 48
+  gen = 45.274s
+  chunk_state_probe = 6.690s
+  chunk_state_score = 15.196s
+  chunk_state_ref = 7.359s
+  update_actor = 10.195s
+
+step 2:
+  support_coverage_mean = 0.454
+  state_oov_mean = 0.546
+  raw_gain_mean = -0.150
+  tv_gain_mean = -0.082
+  label_consistent_ratio = 0.188
+  num_actor_samples = 40
+  gen = 23.641s
+  chunk_state_probe = 6.627s
+  chunk_state_score = 13.843s
+  chunk_state_ref = 0.820s
+  update_actor = 9.031s
+```
+
+结论：
+
+- 负结果。把 full rollout support 扩到 N=64 没有解决 target 质量，coverage 反而只有 0.399 / 0.454，OOV 仍是 0.601 / 0.546；相比之前 N32 hardfilter_clip4 的约 0.48-0.51 coverage / 0.49-0.52 OOV 没有改善。
+- 成本明显变重。N64 的 generate / verifier / score 都更贵，actor samples 只有 48 / 40，update_actor 约 9-10s；这不是值得扩展到 20-step 的方向。
+- 方法判断：主矛盾不是 full support N 太小，也不是 actor update 太慢，而是“局部短视可判定性”这个约束本身。后续不再要求 chunk target 主要由 short-horizon probe 的局部 answer hit、source consistency 或几条短 probe 的偶然命中定义。
+- 下一版应改成：full rollout group 先定义 prompt-level support / majority / pass / coverage / value；chunk candidate 只学习哪个 local transition 会把 future completion distribution 推向这个 support。source chunk 只作为 prior / drift guard，不作为主要 teacher；probe 只能作为长程分布估计的一部分或诊断信号，不能单独决定 target。
