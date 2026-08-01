@@ -5152,3 +5152,108 @@ step2_3_update_actor ≈ 5s
 - 相比失败的 `support_antirepeat_src20`，这版 target 明显更温和：`powerflow_weight_max` 约 2.2-3.5，而失败 gate step19/20 常见 7.x；这降低了少数短 probe 命中被过度蒸馏的风险。
 - OOV 仍偏高，约 49%，但不再通过 max mass 把单个 probe 命中放大成主监督；这更像 distribution matching。
 - 下一步建议先跑 20-step gate，final val 目标至少恢复到 MV 20-step 附近；如果仍低，再试 `chunk_state_answer_support_score=relative_gain` 或提高 `probe_samples`，但不要回到 max-mass target。
+
+## 2026-08-01 support-mass 20-step gate
+
+目的：
+
+- 验证 `answer_support_mass` target 是否能把 3-step smoke 的温和信号扩展到 20-step。
+- 配置继续遵守 no-GT target、no dynamic batch、8x B200、PowerFlow chunk actor update。
+- 该 gate 用 full rollout 的 answer support mass 作为 chunk probe continuation 的软 target，避免 raw max support 对单个短 probe 过尖。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support_massavg_src20_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+ttrl.chunk_state_score_mode=answer_support_mass
+ttrl.chunk_state_answer_support_score=mass
+ttrl.chunk_state_answer_support_min_mass=0.03125
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_use_distribution_score=False
+ttrl.chunk_state_target_guard_use_mass_gain=False
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_target_guard_candidate_max_boxed_count=1
+ttrl.chunk_state_target_guard_candidate_assistant_marker=True
+actor_rollout_ref.actor.use_dynamic_bsz=False
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_use_chunk_weights=True
+```
+
+产物：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_massavg_src20_mid_c128_probe4_b32_r32_v64_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_massavg_src20_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_massavg_src20_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 640
+```
+
+Final validation:
+
+```text
+val-core/math/acc/mean@16 = 0.453625
+val-core/math/acc/maj@16 = 0.586292
+val-core/math/acc/best@16 = 0.850910
+val-aux/math/format_score/mean@16 = 0.899375
+val-aux/math/format_score/maj@16 = 0.881332
+val-aux/math/format_score/best@16 = 0.999992
+```
+
+20 step 平均诊断：
+
+```text
+timing_s/gen = 26.296s
+timing_s/chunk_state_probe = 6.635s
+timing_s/chunk_state_score = 11.777s
+timing_s/chunk_state_ref = 1.911s
+timing_s/update_actor = 5.269s
+distribution_oov_probe_ratio = 0.518
+probe_support_coverage_mean = 0.482
+positive_ratio = 0.161
+kept_state_ratio = 0.386
+powerflow_weight_max = 3.122
+```
+
+Step 20:
+
+```text
+probe_support_coverage_mean = 0.488
+score_mean = 0.223
+kept_candidate_ratio = 0.453
+distribution_oov_probe_ratio = 0.512
+powerflow_weight_max = 2.617
+timing_s/gen = 21.519s
+timing_s/chunk_state_probe = 6.837s
+timing_s/chunk_state_score = 18.715s
+timing_s/update_actor = 5.382s
+```
+
+对比：
+
+```text
+MV/TTRL 20-step target baseline: mean@16 ≈ 0.735, maj@16 ≈ 0.818, best@16 ≈ 0.913
+support_antirepeat_src20: mean@16 = 0.525125, maj@16 = 0.657004, best@16 = 0.870802
+support_massavg_src20: mean@16 = 0.453625, maj@16 = 0.586292, best@16 = 0.850910
+```
+
+结论：
+
+- gate 失败，不扩 80 step。`answer_support_mass` 比 anti-repeat 版本更温和，但 final acc 更低，说明单纯用 full rollout answer mass 做 chunk probe distribution matching 不能稳定迁移到局部 state。
+- actor update 本身没有变慢，平均约 5.27s；额外开销主要来自 `chunk_state_score` 和 probe generation。当前链路不是 actor update bound。
+- 主要训练信号问题是 support 覆盖不足：OOV probe 平均 0.518，positive ratio 平均 0.161，只有约 38.6% states 被保留；大量 probe continuation 落在原 full rollout answer support 之外，PowerFlow loss 在很稀的局部监督上更新，容易把 policy 推向格式尚可但答案错的区域。
+- validation 样例中仍能看到重复 instruction、`\boxed{}` 空壳和 `asy` 片段串扰；format mean 仍有 0.899，但 acc 已经退化，说明 guard 没有解决语义级 drift。
+
+下一步：
+
+- 停止沿 `answer_support_mass=mass` 扩展。
+- 若继续 chunk-level route，需要重新定义 target：不能只看 answer mass support，需要让 chunk target 和完整解答语义绑定得更强。
+- 可选方向一：从 full 32 rollout 选高置信 majority-consistent source，然后只在 source 轨迹的中后段截取 state，target 使用 source answer 的 conditional likelihood / rank，而不是 probe answer 是否落入 global support。
+- 可选方向二：参考 chunked search inference 的 beam/prune 语义，用同一 state 下的 continuation tree 做 listwise preference，先保证 chunk choice 能预测 full-answer correctness，再接 PowerFlow distribution matching。
+- 可选方向三：先做离线诊断集，统计 chunk boundary、probe horizon、OOV、source correctness 到 final acc 的相关性，避免继续用 20-step training gate 盲试 target。
