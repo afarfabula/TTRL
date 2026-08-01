@@ -2474,3 +2474,66 @@ chunk_state/kept_state_ratio=0.972
 - 做 confidence-gated majority-completion：只训练 `majority_ratio`、`answer_coverage`、`score margin` 足够的 state；低置信 state 要么跳过，要么降低 PowerFlow weight。
 - 同时试 `chunk_size=128`，更贴近 chunked search / PowerFlow 的局部转移粒度，并降低 actor chunk response 长度。
 - 保持 PowerFlow loss 为主路径，GRPO 只作为后续 ablation。
+
+## 2026-08-01 Confidence-gated Majority-completion c128 3-step Smoke
+
+实现目标：
+
+- 保持 PowerFlow loss 为 chunk actor update 主路径。
+- 在 `majority_completion` 中把 state-local `majority_ratio` 和 `answer_coverage` 写入 state batch。
+- actor batch 构造阶段新增 confidence gate：
+  - `chunk_state_min_majority_ratio=0.25`
+  - `chunk_state_min_answer_coverage=0.60`
+  - `chunk_state_confidence_power=0.5`
+- 低置信 state 被跳过，高置信 state 按 `(majority_ratio * answer_coverage) ** 0.5` 降权。
+- `chunk_state_chunk_size=128`，boundary 改为 `[0,128,256,384,512,640,768,896,1024]`，更贴近 chunk-level search 的局部转移粒度。
+- 默认配置保持中性：阈值 0、power 0，不影响旧脚本和对照实验。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_conf_gate_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_conf_gate_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_conf_gate_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+worker=1024321, 8x NVIDIA B200
+```
+
+三步关键信号：
+
+```text
+step1: majority_ratio=0.364 answer_coverage=0.706 confidence_gate=0.500 kept_state=0.500 loss_weight=0.379 response_len=126.102 powerflow_loss=0.377 grad_norm=6.883
+step2: majority_ratio=0.333 answer_coverage=0.777 confidence_gate=0.500 kept_state=0.500 loss_weight=0.354 response_len=124.938 powerflow_loss=0.228 grad_norm=5.797
+step3: majority_ratio=0.264 answer_coverage=0.632 confidence_gate=0.438 kept_state=0.438 loss_weight=0.285 response_len=119.875 powerflow_loss=0.094 grad_norm=2.210
+```
+
+三步耗时：
+
+```text
+step1: gen=51.290s chunk_state_chunks=1.200s chunk_state_probe=6.953s chunk_state_score=11.262s update_actor=8.295s
+step2: gen=23.990s chunk_state_chunks=0.956s chunk_state_probe=7.302s chunk_state_score=10.262s update_actor=7.460s
+step3: gen=23.265s chunk_state_chunks=0.963s chunk_state_probe=7.109s chunk_state_score=11.518s update_actor=7.446s
+```
+
+diag 聚合：
+
+```text
+diag rows=96
+majority_ratio mean=0.3203 min=0.0000 max=0.9688
+answer_coverage mean=0.7051 min=0.0000 max=1.0000
+```
+
+结论：
+
+- smoke 成功，无 NaN/Ray/FSDP 崩溃，confidence gate 按预期生效。
+- 相比 raw majority-completion c256，c128 把 actor response span 从约 228-249 token 降到约 120-126 token，`update_actor` 从约 `8.6s` 降到约 `7.45s`，`chunk_state_chunks` 从约 `1.5s` 降到约 `1.0s`。
+- gate 没有过紧：三步保留 `43.8%-50.0%` state，仍有可训练信号。
+- 风险是信号可能过弱：step3 `powerflow_loss=0.094`、`grad_norm=2.210` 已明显偏小；20-step gate 需要关注是否因为降权过强导致学习不足。
+
+下一步：
+
+- 启动同配置 20-step gate，看 final `mean@16/maj@16/best@16` 是否优于 raw majority-completion `0.521/0.662/0.873`。
+- 若 20-step 低于 raw majority-completion，优先降低 `confidence_power` 或 `min_answer_coverage`，而不是取消 confidence gate。

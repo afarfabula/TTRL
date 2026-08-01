@@ -1365,6 +1365,12 @@ class RayPPOTrainer:
         source_original = state_prompts.non_tensor_batch.get("chunk_state_source_original_correct", None)
         if source_original is not None:
             source_original = np.asarray(source_original, dtype=np.float32)
+        majority_ratios = state_prompts.non_tensor_batch.get("chunk_state_majority_ratio", None)
+        if majority_ratios is not None:
+            majority_ratios = np.asarray(majority_ratios, dtype=np.float32)
+        answer_coverage = state_prompts.non_tensor_batch.get("chunk_state_answer_coverage", None)
+        if answer_coverage is not None:
+            answer_coverage = np.asarray(answer_coverage, dtype=np.float32)
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         rows = 0
@@ -1386,6 +1392,8 @@ class RayPPOTrainer:
                     "source_original_correct": (
                         float(source_original[state_idx]) if source_original is not None else None
                     ),
+                    "majority_ratio": float(majority_ratios[state_idx]) if majority_ratios is not None else None,
+                    "answer_coverage": float(answer_coverage[state_idx]) if answer_coverage is not None else None,
                     "probe_mean": float(state_scores.mean().item()),
                     "probe_max": float(state_scores.max().item()),
                     "probe_min": float(state_scores.min().item()),
@@ -1596,6 +1604,8 @@ class RayPPOTrainer:
         scores = raw_probe_scores.view(len(state_prompts), candidates, probe_samples).mean(dim=-1).reshape(-1)
         majority_ratios_arr = np.asarray(majority_ratios, dtype=np.float32)
         answer_coverage_arr = np.asarray(answer_coverage, dtype=np.float32)
+        state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = majority_ratios_arr
+        state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = answer_coverage_arr
         metrics = {
             "chunk_state_majority_completion/group_size": float(group_size),
             "chunk_state_majority_completion/majority_ratio_mean": float(majority_ratios_arr.mean())
@@ -1794,6 +1804,9 @@ class RayPPOTrainer:
         eps = float(cfg.get("chunk_state_eps", 0.05))
         skip_uniform = bool(cfg.get("chunk_state_skip_uniform", False))
         skip_all_negative = bool(cfg.get("chunk_state_skip_all_negative", False))
+        min_majority_ratio = float(cfg.get("chunk_state_min_majority_ratio", 0.0))
+        min_answer_coverage = float(cfg.get("chunk_state_min_answer_coverage", 0.0))
+        confidence_power = float(cfg.get("chunk_state_confidence_power", 0.0))
 
         score_matrix = scores.view(num_states, candidates).float()
         raw_weights = torch.pow(score_matrix + eps, alpha)
@@ -1806,13 +1819,28 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_loss_weight", np.ones(num_states, dtype=np.float32)),
             dtype=torch.float32,
         )
+        majority_ratios = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_majority_ratio", np.ones(num_states, dtype=np.float32)),
+            dtype=torch.float32,
+        )
+        answer_coverage = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_answer_coverage", np.ones(num_states, dtype=np.float32)),
+            dtype=torch.float32,
+        )
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
+        confidence_gate = (majority_ratios >= min_majority_ratio) & (answer_coverage >= min_answer_coverage)
+        confidence_weight = torch.ones(num_states, dtype=torch.float32)
+        if confidence_power > 0.0:
+            confidence_weight = torch.pow((majority_ratios * answer_coverage).clamp(min=0.0, max=1.0), confidence_power)
         keep_state = torch.ones(num_states, dtype=torch.bool)
         if skip_uniform:
             keep_state &= informative.bool()
         if skip_all_negative:
             keep_state &= score_max > 0.0
-        effective_state_loss_weights = state_loss_weights * keep_state.to(dtype=state_loss_weights.dtype)
+        keep_state &= confidence_gate
+        effective_state_loss_weights = (
+            state_loss_weights * keep_state.to(dtype=state_loss_weights.dtype) * confidence_weight
+        )
         keep_indices = list(range(len(chunk_output)))
 
         repeated_state_prompts = state_prompts.repeat(repeat_times=candidates, interleave=True)
@@ -1883,6 +1911,10 @@ class RayPPOTrainer:
             "chunk_state/loss_weight_mean": flat_loss_weights.mean().detach().item(),
             "chunk_state/base_loss_weight_mean": state_loss_weights.mean().detach().item(),
             "chunk_state/zeroed_state_ratio": (effective_state_loss_weights <= 0.0).float().mean().detach().item(),
+            "chunk_state/confidence_gate_ratio": confidence_gate.float().mean().detach().item(),
+            "chunk_state/confidence_weight_mean": confidence_weight.mean().detach().item(),
+            "chunk_state/majority_ratio_mean": majority_ratios.mean().detach().item(),
+            "chunk_state/answer_coverage_mean": answer_coverage.mean().detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
             "chunk_state/informative_ratio": informative.mean().detach().item(),
             "chunk_state/kept_state_ratio": keep_state.float().mean().detach().item(),
