@@ -4124,3 +4124,78 @@ val-aux/math/format_score/maj@16/mean = 0.856
   - 不能只依赖短 probe 的局部 positive hit-rate。
   - 需要把 full-rollout majority label / original answer distribution 作为全局 anchor，避免 chunk target 把模型推向空 boxed 或局部格式吸引子。
   - 下一版优先尝试 `anchored PowerFlow target`：局部 chunk target 只对能保持 source full-answer label 或提升 full-answer consistency 的 candidate 加权，同时加入原始 full rollout answer 分布的保守 anchor，而不是 target-only。
+
+## 2026-08-01 Anchored Standard Chunk PowerFlow 3-Step Smoke
+
+目的：
+
+- 验证 target-only 失败后，回到更保守的 standard PowerFlow loss。
+- 把 full rollout 里的 source chunk 注入为 candidate 0，并用 teacher anchor 赋 score floor，避免局部短 probe target 单独主导 actor update。
+- 这版仍遵循 2504.16084/TTRL 的拆分：先在同一 `query + prefix` state 上做 label/distribution estimation，再用 PowerFlow target 做参数更新；真实 GT 只用于事后 diag，不用于选 source。
+
+配置：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_anchor_standard3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_value_margin=0.125
+ttrl.chunk_state_value_topk=2
+ttrl.chunk_state_format_guard=True
+ttrl.chunk_state_label_consistent_only=True
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_source_chunk_candidate_index=0
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_candidate_index=0
+ttrl.chunk_state_teacher_anchor_score=0.5
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_use_chunk_weights=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+训练侧统计：
+
+```text
+diag_jsonl_rows=96
+chunk_state_source_chunk/injected_ratio: [1.000, 1.000, 1.000], avg=1.000
+chunk_state_teacher_anchor/replaced_ratio: [1.000, 1.000, 1.000], avg=1.000
+chunk_state/kept_state_ratio: [0.531, 0.500, 0.500], avg=0.510
+chunk_state/powerflow_weight_mean: [0.531, 0.500, 0.500], avg=0.510
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio: [0.531, 0.500, 0.500], avg=0.510
+chunk_state/actor_batch_powerflow_weight_zero_shard_ratio: [0.000, 0.000, 0.000], avg=0.000
+chunk_state/positive_ratio: [0.139, 0.112, 0.125], avg=0.125
+chunk_state/target_entropy: [0.725, 0.640, 0.683], avg=0.683
+actor/powerflow_loss: [0.369, 0.227, 0.084], avg=0.227
+actor/boxed_reward/mean: [0.131, 0.031, 0.100], avg=0.087
+actor/powerflow_weight/nonzero_ratio: [0.531, 0.500, 0.500], avg=0.510
+actor/log_z: [-0.998, -1.202, -1.189], avg=-1.130
+actor/grad_norm: [21.184, 8.865, 4.272], avg=11.440
+timing_s/gen: [53.577, 32.351, 22.230], avg=36.053
+timing_s/chunk_state_score: [9.167, 19.346, 11.090], avg=13.201
+timing_s/chunk_state_ref: [5.693, 1.788, 1.906], avg=3.129
+timing_s/update_actor: [6.215, 5.441, 6.047], avg=5.901
+```
+
+结论：
+
+- 3-step smoke 通过。source chunk 和 teacher anchor 均为 `1.000`，说明 anchor 按预期进入 actor batch。
+- `actor_batch_powerflow_weight_zero_shard_ratio=0.000`，确认 shard-balanced reorder 在 anchored/standard 路径下也稳定。
+- `actor/powerflow_loss` 三步均非零，但从 `0.369 -> 0.227 -> 0.084` 明显下降；这不是立即失败，但 20-step gate 必须重点看 loss 是否继续衰减到弱更新，以及 final validation 是否恢复到 MV baseline 附近。
+- 性能侧仍是 rollout + chunk scoring 主导。稳态 step3 中 `gen=22.230s`、`chunk_state_score=11.090s`、`chunk_state_ref=1.906s`、`update_actor=6.047s`。
+
+下一步：
+
+- 启动同配置 20-step validation gate。
+- 若 20-step `mean@16/maj@16` 仍明显低于 MV baseline，则不要继续扩 80-step；优先调整 anchor target 的 score/floor 或 chunk label estimation，而不是再调 infra 参数。
