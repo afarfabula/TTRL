@@ -14,16 +14,22 @@ export TEST_FREQ="${TEST_FREQ:-2000000}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 export FINAL_VAL_ENABLE="${FINAL_VAL_ENABLE:-False}"
 export DIAG_JSONL="${DIAG_JSONL:-/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/${RUN_ID}.jsonl}"
+export CHUNK_STATE_VALUE_MARGIN="${CHUNK_STATE_VALUE_MARGIN:-0.25}"
+export CHUNK_STATE_VALUE_TOPK="${CHUNK_STATE_VALUE_TOPK:-0}"
+export CHUNK_STATE_FORMAT_GUARD="${CHUNK_STATE_FORMAT_GUARD:-True}"
+export CHUNK_STATE_MAX_BOXED_COUNT="${CHUNK_STATE_MAX_BOXED_COUNT:-8}"
+export CHUNK_STATE_MAX_ANSWER_CHARS="${CHUNK_STATE_MAX_ANSWER_CHARS:-128}"
 
 exec bash "$BASE" \
   ttrl.chunk_state_score_mode=answer_value_margin \
   ttrl.chunk_state_source_chunk_enable=False \
   ttrl.chunk_state_teacher_anchor_enable=False \
   ttrl.chunk_state_probe_max_tokens=1024 \
-  +ttrl.chunk_state_value_margin=0.25 \
-  +ttrl.chunk_state_format_guard=True \
-  +ttrl.chunk_state_max_boxed_count=8 \
-  +ttrl.chunk_state_max_answer_chars=128 \
+  +ttrl.chunk_state_value_margin="$CHUNK_STATE_VALUE_MARGIN" \
+  +ttrl.chunk_state_value_topk="$CHUNK_STATE_VALUE_TOPK" \
+  +ttrl.chunk_state_format_guard="$CHUNK_STATE_FORMAT_GUARD" \
+  +ttrl.chunk_state_max_boxed_count="$CHUNK_STATE_MAX_BOXED_COUNT" \
+  +ttrl.chunk_state_max_answer_chars="$CHUNK_STATE_MAX_ANSWER_CHARS" \
   ttrl.chunk_state_min_majority_ratio=0.20 \
   ttrl.chunk_state_min_answer_coverage=0.60 \
   ttrl.chunk_state_min_informative_gap=0.0 \

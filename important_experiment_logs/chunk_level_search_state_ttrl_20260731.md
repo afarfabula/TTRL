@@ -3749,3 +3749,86 @@ timing_s/update_actor=7.553
 - format guard 生效后信号更稀疏：`format_rate=0.714`、`score_mean=0.178`、`kept_state_ratio=0.385`，但不是全零。
 - 当前不能直接扩 20-step：前两步 `actor/powerflow_loss=0.0`，第三步才到 `0.210`。这说明保守 margin target 虽然能跑，但和 PowerFlow 的 chunk weights/boxed_reward 交互不够稳定，可能导致有效更新不足。
 - 下一版应优先修 target-to-loss 的有效性：可以把 margin target 改成 state 内 top-k normalized margin，降低 hard margin 到 0.125，或给每个 kept state 至少一个 top candidate 正权重；同时继续保留 format/degeneration guard。只有确认每步 PowerFlow loss 都非零且 format 不退化后，才跑 20-step validation gate。
+
+## 2026-08-01 Answer-value-margin Top2 Mid-state c128 3-step Smoke
+
+动机：
+
+- 上一版 hard margin `0.25` 太稀疏，且前两步 `actor/powerflow_loss=0.0`。这轮只改 target-to-loss 有效性，不改变 chunk state 主语义：仍是 majority-consistent source、mid-state、c128、probe4、PowerFlow loss。
+- 按 arXiv 2504.16084 给我们的约束，先在同一 state 下做多输出 label/value estimation，再把 improved distribution 变成训练 target。这里的近似实现是：候选 chunk 的 probe hit-rate 相对 full-rollout majority baseline 至少高 `0.125`，再在每个 state 内只保留 top2 正 margin candidate。
+- 继续保留 format/degeneration guard：probe 必须能抽取非空 answer，答案字符串不超过 128，`\boxed` 次数不超过 8。
+
+代码变更：
+
+```text
+verl/trainer/ppo/ray_trainer.py:
+  answer_value_margin scoring 新增 ttrl.chunk_state_value_topk
+  先构造 valid_matrix = margin >= min_margin，再按 state 保留 top-k valid positive margin
+  输出 chunk_state_answer_value_margin/topk 指标
+
+run_records/ttrl_chunk_state_powerflow_answer_value_margin_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  将 margin/topk/format guard 参数改为 env 控制，默认保持旧 hard-margin 语义
+
+run_records/ttrl_chunk_state_powerflow_answer_value_margin_top2_mid_c128_probe4_b32_r32_v64_3step_20260801.sh:
+  CHUNK_STATE_VALUE_MARGIN=0.125
+  CHUNK_STATE_VALUE_TOPK=2
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_value_margin_top2_mid_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_value_margin_top2_mid_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_value_margin_top2_mid_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+```
+
+三步平均：
+
+```text
+answer_value_margin_baseline_ratio=0.344
+answer_value_margin_answer_coverage=0.759
+answer_value_margin_hit_rate=0.418
+answer_value_margin_format_rate=0.759
+answer_value_margin_margin=0.223
+answer_value_margin_score=0.082
+answer_value_margin_max_margin=0.377
+answer_value_margin_improved_state_ratio=0.635
+answer_value_margin_label_consistent_ratio=0.146
+answer_value_margin_min_margin=0.125
+answer_value_margin_topk=2.000
+kept_state_ratio=0.448
+positive_ratio=0.082
+target_entropy=1.255
+powerflow_weight_mean=0.448
+powerflow_weight_max=7.665
+actor/powerflow_loss=0.153
+actor/boxed_reward_mean=0.074
+actor/powerflow_weight_mean=0.250
+actor/powerflow_weight_max=3.801
+actor/grad_norm=7.137
+timing_s/gen=32.396
+timing_s/chunk_state_chunks=1.041
+timing_s/chunk_state_probe=6.720
+timing_s/chunk_state_score=8.960
+timing_s/chunk_state_ref=3.594
+timing_s/update_actor=7.444
+```
+
+逐步 PowerFlow loss：
+
+```text
+actor/powerflow_loss: [0.000, 0.174, 0.285]
+actor/powerflow_weight_mean: [0.000, 0.250, 0.500]
+chunk_state/powerflow_weight_mean: [0.469, 0.469, 0.406]
+chunk_state/kept_state_ratio: [0.469, 0.469, 0.406]
+```
+
+结论：
+
+- top2 margin target 比 hard margin 更好：每步 chunk target 都有非零 state，`kept_state_ratio` 稳定在 0.4 以上，step2/step3 已经能产生非零 PowerFlow loss。
+- 但仍不能扩 20-step：step1 的 `chunk_state/powerflow_weight_mean=0.469`，actor 侧却是 `actor/powerflow_weight_mean=0.000`、`actor/powerflow_loss=0.000`。这说明 target 已经产出，但进入 actor PowerFlow loss 后仍可能被二次权重/boxed_reward/CISPO 链路清空。
+- 下一步不再调大 rollout 参数，也不先跑 20-step。应优先修 actor loss 语义：chunk-state PowerFlow 应直接蒸馏 search-improved continuation distribution，`powerflow_chunk_weights` 作为主权重；`boxed_reward` 只作为 target/value term 或可关闭的 ablation，避免把 margin score 同时作为权重和 reward 后再被 PowerFlow 内部公式压掉。
+- 这轮保留为有效 smoke 证据：infra 没崩，B200/vLLM/FSDP 链路正常，问题集中在 chunk target 到 PowerFlow loss 的映射。

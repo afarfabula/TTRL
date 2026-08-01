@@ -2009,6 +2009,7 @@ class RayPPOTrainer:
 
         cfg = self.config.ttrl
         min_margin = float(cfg.get("chunk_state_value_margin", 0.25))
+        topk = int(cfg.get("chunk_state_value_topk", 0))
         format_guard = bool(cfg.get("chunk_state_format_guard", True))
         state_labels = [str(x) for x in state_prompts.non_tensor_batch["chunk_state_prompt_majority_label"]]
         baseline_ratios = np.asarray(
@@ -2063,9 +2064,17 @@ class RayPPOTrainer:
         format_rate = well_formed_tensor.mean(dim=-1)
         baseline = torch.as_tensor(baseline_ratios, dtype=torch.float32).view(len(state_prompts), 1)
         margin_matrix = (hit_rate - baseline).clamp(min=0.0)
-        score_matrix = torch.where(margin_matrix >= min_margin, margin_matrix, torch.zeros_like(margin_matrix))
+        valid_matrix = margin_matrix >= min_margin
         if format_guard:
-            score_matrix = score_matrix * (format_rate >= 1.0).to(dtype=torch.float32)
+            valid_matrix &= format_rate >= 1.0
+        if topk > 0:
+            topk = min(topk, candidates)
+            candidate_matrix = torch.where(valid_matrix, margin_matrix, torch.zeros_like(margin_matrix))
+            _, top_indices = torch.topk(candidate_matrix, k=topk, dim=-1)
+            topk_mask = torch.zeros_like(candidate_matrix, dtype=torch.bool)
+            topk_mask.scatter_(dim=-1, index=top_indices, value=True)
+            valid_matrix &= topk_mask & (candidate_matrix > 0.0)
+        score_matrix = torch.where(valid_matrix, margin_matrix, torch.zeros_like(margin_matrix))
         scores = score_matrix.reshape(-1)
         label_consistent = (score_matrix > 0.0).to(dtype=torch.float32)
         answer_coverage_arr = np.asarray(
@@ -2104,6 +2113,7 @@ class RayPPOTrainer:
             if len(label_consistent)
             else 0.0,
             "chunk_state_answer_value_margin/min_margin": min_margin,
+            "chunk_state_answer_value_margin/topk": float(topk),
             "chunk_state_answer_value_margin/format_guard": float(format_guard),
         }
         return scores, metrics
