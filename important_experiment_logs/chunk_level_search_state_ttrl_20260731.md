@@ -6811,3 +6811,130 @@ final val @ step 20:
 - source chunk 只能作为 proposal prior / drift guard / 保守参考，不能作为主要 teacher，也不能把 source answer mass 当 hard score floor。
 - score 应优先写成 per-state sharpened distribution，例如 `q_j ∝ exp(alpha * future_support_gain_j) * prior_j`。其中 `future_support_gain_j` 要来自 longer-horizon 或 staged rollout 后的 support mass / value margin / answer-support transport improvement，而不是 raw short-probe correctness。
 - 低信息 state 要跳过或降权：all-negative、support coverage 低、OOV 高、top answer mass 太平、candidate malformed/repeated boxed/marker 污染严重。否则 PowerFlow 会稳定地拟合噪声分布。
+
+## 2026-08-01 Future-Support Transport Affinity 2-Step Smoke 设计
+
+目的：
+
+- 继续沿着“放弃局部短视可判定性”的方向，把 chunk target 从局部 answer hit / source consistency 改成 full-rollout support distribution 的 transport affinity。
+- 不使用 GT，不把 source answer 当 teacher；source 只保留弱 prior / drift guard。
+- score 直接来自 candidate future answer distribution 到 prompt-level full-rollout answer support distribution 的距离，并把 `None` / OOV answer 显式当作 off-support mass 惩罚。
+
+代码改动：
+
+```text
+ttrl.chunk_state_future_support_score_type 新增：
+  transport_affinity:
+    score = 1 - TV_OOV(candidate_future_answer_dist, full_rollout_support_dist)
+  transport_positive_gain:
+    score = max(TV_OOV(source_onehot, support_dist) - TV_OOV(candidate_dist, support_dist), 0)
+
+新增指标：
+  chunk_state_future_support_gain/source_oov_tv_mean
+  chunk_state_future_support_gain/candidate_oov_tv_mean
+  chunk_state_future_support_gain/transport_affinity_mean
+  chunk_state_future_support_gain/transport_gain_mean
+```
+
+与旧 `tv_positive_gain` 的区别：
+
+- 旧 TV 只在非空 answer counts 上归一化，`None` / malformed / OOV answer 的惩罚不够直接。
+- 新 transport score 以 `probe_samples` 总数为分母，full-support 外的答案和空答案都会进入 OOV mass，因此更贴近“future completion 分布是否靠近 full rollout group 认为好的答案分布”。
+
+运行计划：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_affinity_mid_c128_probe4_long_b32_r32_v64_2step_20260801.sh
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+actor_rollout_ref.rollout.n = 32
+trainer.total_training_steps = 2
+trainer.final_val_enable = False
+ttrl.chunk_state_score_mode = future_support_gain
+ttrl.chunk_state_future_support_score_type = transport_affinity
+ttrl.chunk_state_probe_samples = 4
+ttrl.chunk_state_probe_max_tokens = 2048
+ttrl.chunk_state_chunk_size = 128
+ttrl.chunk_state_powerflow_weight_clip = 4.0
+ttrl.chunk_state_prune_zero_weight_samples = True
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+Gate：
+
+- 如果 `candidate_oov_tv_mean` 仍高、`transport_affinity_mean` 太低、`state_top_margin` 仍接近 0，则说明仅换 transport score 不够，需要改 state selection / staged long-horizon probe。
+- 如果 target entropy、nonzero ratio、OOV-aware transport 指标明显健康，再扩 20-step；否则只作为负结果记录。
+
+运行结果：
+
+```text
+run_id = ttrl_chunk_state_powerflow_future_support_transport_affinity_mid_c128_probe4_long_b32_r32_v64_2step_20260801
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_transport_affinity_mid_c128_probe4_long_b32_r32_v64_2step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_transport_affinity_mid_c128_probe4_long_b32_r32_v64_2step_20260801.jsonl
+diag_jsonl_rows = 64
+final validation = skipped
+```
+
+step 指标：
+
+```text
+step1:
+  support_coverage_mean = 0.304
+  candidate_oov_tv_mean = 0.832
+  transport_affinity_mean = 0.168
+  transport_gain_mean = -0.304
+  state_top_margin_mean = 0.051
+  label_consistent_ratio = 0.492
+  future_support_keep_ratio = 0.719
+  num_actor_samples = 112
+  target_entropy = 1.543
+  powerflow_weight_max = 2.753
+  grad_norm = 19.438
+  gen = 39.787s
+  chunk_state_probe = 7.134s
+  chunk_state_score = 9.137s
+  chunk_state_ref = 5.504s
+  update_actor = 4.166s
+
+step2:
+  support_coverage_mean = 0.429
+  candidate_oov_tv_mean = 0.756
+  transport_affinity_mean = 0.244
+  transport_gain_mean = -0.212
+  state_top_margin_mean = 0.049
+  label_consistent_ratio = 0.602
+  future_support_keep_ratio = 0.844
+  num_actor_samples = 152
+  target_entropy = 1.567
+  powerflow_weight_max = 3.060
+  grad_norm = 14.675
+  gen = 10.733s
+  chunk_state_probe = 8.999s
+  chunk_state_score = 6.846s
+  chunk_state_ref = 2.025s
+  update_actor = 4.963s
+```
+
+diag 聚合：
+
+```text
+answer_coverage mean = 0.366, min = 0.000, max = 0.969
+probe_mean mean = 0.206, min = 0.000, max = 0.804
+probe_max mean = 0.312, min = 0.000, max = 0.893
+source_answer_mass mean = 0.464, min = 0.091, max = 0.938
+source_original_correct mean = 0.734
+future_support_keep mean = 0.781
+future_support_state_top_margin mean = 0.050
+all_negative = 0.203
+mixed = 0.500
+all_positive = 0.297
+```
+
+结论：
+
+- 工程通过：2 step 完整结束，8 卡 B200、`/models/Qwen2.5-Math-7B`、`FLASH_ATTN`、NVLS/P2P 路径均正常；dynamic batch 关闭；final validation 按 smoke 配置跳过。
+- 相比 hard positive-gain / source-consistency 这类稀疏目标，`transport_affinity` 明显提高了 target 密度：step2 `label_consistent_ratio=0.602`、`future_support_keep_ratio=0.844`、`num_actor_samples=152`，PowerFlow 权重 clip 后 `powerflow_weight_max` 约 3.06，未出现尖权重失控。
+- 但这不是可扩 20-step 的正结果：OOV-aware transport 仍然显示 candidate future distribution 离 full-rollout support 很远，step2 `candidate_oov_tv_mean=0.756`、`transport_affinity_mean=0.244`、`transport_gain_mean=-0.212`。也就是说，大多数 chunk 的后续 completion 仍没有比 source baseline 更接近 full support。
+- `state_top_margin_mean` 约 0.05，比之前接近 0 的 state-gate 略好，但区分度仍弱；`answer_coverage` 均值只有 0.366，说明主要问题仍是 state/probe distribution，而不是 loss 或 actor update。
+- 下一步不应扩 20 step。更合理的路线是把 transport affinity 作为 target 诊断指标，转向 staged / longer-horizon state selection：先从 full rollout group 选 coverage 高、top-mass margin 高的 prompt/state，再对 candidate 做分阶段 probe 或 beam-style continuation，使 candidate future distribution 真正进入 support 后再做 PowerFlow matching。

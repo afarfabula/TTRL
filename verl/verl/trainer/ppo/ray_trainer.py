@@ -2688,7 +2688,10 @@ class RayPPOTrainer:
         raw_gain = future_value - source_baseline
         source_answers = [str(x) for x in state_prompts.non_tensor_batch.get("chunk_state_source_answer", [])]
         candidate_tv_rows = []
+        candidate_oov_tv_rows = []
+        candidate_affinity_rows = []
         source_tv_values = []
+        source_oov_tv_values = []
         for state_idx, support in enumerate(prompt_mass_values):
             support_total = sum(max(float(v), 0.0) for v in support.values())
             support_dist = {
@@ -2699,7 +2702,11 @@ class RayPPOTrainer:
             source_answer = source_answers[state_idx] if state_idx < len(source_answers) else "None"
             source_tv = 1.0 - support_dist.get(source_answer, 0.0)
             source_tv_values.append(source_tv)
+            source_oov_tv = source_tv
+            source_oov_tv_values.append(source_oov_tv)
             row = []
+            oov_row = []
+            affinity_row = []
             for cand_idx in range(candidates):
                 offset = (state_idx * candidates + cand_idx) * probe_samples
                 answers = answer_values[offset : offset + probe_samples]
@@ -2710,11 +2717,29 @@ class RayPPOTrainer:
                     abs((counts.get(answer, 0) / total) - support_dist.get(answer, 0.0))
                     for answer in answer_keys
                 )
+                total_with_oov = max(len(answers), 1)
+                support_mass = sum(counts.get(answer, 0) / total_with_oov for answer in support_dist.keys())
+                oov_mass = max(0.0, 1.0 - support_mass)
+                oov_tv = 0.5 * (
+                    sum(
+                        abs((counts.get(answer, 0) / total_with_oov) - support_dist.get(answer, 0.0))
+                        for answer in support_dist.keys()
+                    )
+                    + oov_mass
+                )
                 row.append(float(tv))
+                oov_row.append(float(oov_tv))
+                affinity_row.append(float(max(0.0, 1.0 - oov_tv)))
             candidate_tv_rows.append(row)
+            candidate_oov_tv_rows.append(oov_row)
+            candidate_affinity_rows.append(affinity_row)
         candidate_tv = torch.tensor(candidate_tv_rows, dtype=torch.float32)
+        candidate_oov_tv = torch.tensor(candidate_oov_tv_rows, dtype=torch.float32)
+        transport_affinity = torch.tensor(candidate_affinity_rows, dtype=torch.float32)
         source_tv = torch.tensor(source_tv_values, dtype=torch.float32).view(len(state_prompts), 1)
+        source_oov_tv = torch.tensor(source_oov_tv_values, dtype=torch.float32).view(len(state_prompts), 1)
         tv_gain = source_tv - candidate_tv
+        transport_gain = source_oov_tv - candidate_oov_tv
         if score_type == "slack_gain":
             score_matrix = (raw_gain + gain_slack).clamp(min=0.0, max=1.0)
         elif score_type == "positive_gain":
@@ -2725,6 +2750,10 @@ class RayPPOTrainer:
             score_matrix = tv_gain.clamp(min=0.0, max=1.0)
         elif score_type == "relative_tv_positive_gain":
             score_matrix = (tv_gain / source_tv.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+        elif score_type == "transport_affinity":
+            score_matrix = transport_affinity.clamp(min=0.0, max=1.0)
+        elif score_type == "transport_positive_gain":
+            score_matrix = transport_gain.clamp(min=0.0, max=1.0)
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_future_support_score_type={score_type!r}")
         pre_filter_score_matrix = score_matrix.clone()
@@ -2752,9 +2781,15 @@ class RayPPOTrainer:
         prompt_top_mass_arr = prompt_top_mass.detach().cpu().numpy().astype(np.float32)
         source_tv_arr = source_tv.reshape(-1).detach().cpu().numpy().astype(np.float32)
         candidate_tv_arr = candidate_tv.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        source_oov_tv_arr = source_oov_tv.reshape(-1).detach().cpu().numpy().astype(np.float32)
+        candidate_oov_tv_arr = candidate_oov_tv.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        transport_affinity_arr = transport_affinity.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
         filtered_raw_gain = raw_gain.masked_fill(~candidate_quality_ok, float("-inf"))
         positive_margin = filtered_raw_gain.max(dim=-1).values
         if score_type in {"tv_positive_gain", "relative_tv_positive_gain"}:
+            filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
+            positive_margin = filtered_score_gain.max(dim=-1).values
+        if score_type in {"transport_affinity", "transport_positive_gain"}:
             filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
             positive_margin = filtered_score_gain.max(dim=-1).values
         positive_margin = torch.where(torch.isfinite(positive_margin), positive_margin, torch.zeros_like(positive_margin))
@@ -2816,6 +2851,12 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/score_type_relative_tv_positive_gain": float(
                 score_type == "relative_tv_positive_gain"
             ),
+            "chunk_state_future_support_gain/score_type_transport_affinity": float(
+                score_type == "transport_affinity"
+            ),
+            "chunk_state_future_support_gain/score_type_transport_positive_gain": float(
+                score_type == "transport_positive_gain"
+            ),
             "chunk_state_future_support_gain/gain_slack": gain_slack,
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,
             "chunk_state_future_support_gain/source_prior_weight": source_prior_weight,
@@ -2849,7 +2890,19 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/candidate_tv_mean": float(candidate_tv_arr.mean())
             if len(candidate_tv_arr)
             else 0.0,
+            "chunk_state_future_support_gain/source_oov_tv_mean": float(source_oov_tv_arr.mean())
+            if len(source_oov_tv_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/candidate_oov_tv_mean": float(candidate_oov_tv_arr.mean())
+            if len(candidate_oov_tv_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/transport_affinity_mean": float(transport_affinity_arr.mean())
+            if len(transport_affinity_arr)
+            else 0.0,
             "chunk_state_future_support_gain/tv_gain_mean": float(tv_gain_arr.mean()) if len(tv_gain_arr) else 0.0,
+            "chunk_state_future_support_gain/transport_gain_mean": transport_gain.mean().item()
+            if len(transport_gain)
+            else 0.0,
             "chunk_state_future_support_gain/score_mean_before_candidate_filter": pre_filter_score_matrix.mean().item()
             if len(pre_filter_score_matrix)
             else 0.0,
