@@ -67,6 +67,11 @@ ttrl:
   # If true, physically drop zero-weight chunk samples from the actor batch.
   # This is off by default for exact backward compatibility with earlier pilots.
   chunk_state_prune_zero_weight_samples: false
+  # Optional clipping for PowerFlow sample weights after chunk target assembly.
+  # A non-positive value disables clipping. Renorm keeps nonzero mean close to 1
+  # after clipping, preserving the loss scale while limiting single-sample spikes.
+  chunk_state_powerflow_weight_clip: 0.0
+  chunk_state_powerflow_weight_clip_renorm: true
   # Optional state-level confidence gate for chunk majority-completion targets.
   # Defaults are neutral, so existing experiments keep the same training
   # semantics unless launchers opt in.

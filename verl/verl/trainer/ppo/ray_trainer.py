@@ -3204,6 +3204,17 @@ class RayPPOTrainer:
                 flat_weights = flat_weights[balanced_order]
                 flat_loss_weights = flat_loss_weights[balanced_order]
                 powerflow_flat_weights = powerflow_flat_weights[balanced_order]
+        powerflow_weight_before_clip = powerflow_flat_weights.clone()
+        powerflow_weight_clip = float(cfg.get("chunk_state_powerflow_weight_clip", 0.0))
+        powerflow_weight_clip_renorm = bool(cfg.get("chunk_state_powerflow_weight_clip_renorm", True))
+        if powerflow_weight_clip > 0.0 and len(powerflow_flat_weights) > 0:
+            powerflow_flat_weights = powerflow_flat_weights.clamp(max=powerflow_weight_clip)
+            if powerflow_weight_clip_renorm:
+                nonzero_mask = powerflow_flat_weights > 0.0
+                if bool(nonzero_mask.any()):
+                    nonzero_mean = powerflow_flat_weights[nonzero_mask].mean().clamp(min=1e-12)
+                    powerflow_flat_weights = powerflow_flat_weights / nonzero_mean
+                    powerflow_flat_weights = powerflow_flat_weights.clamp(max=powerflow_weight_clip)
         powerflow_weight_shards = torch.chunk(powerflow_flat_weights, min(shard_count, max(1, len(powerflow_flat_weights))))
         shard_means = torch.stack([shard.mean() for shard in powerflow_weight_shards if len(shard) > 0])
         shard_nonzero = torch.stack([(shard > 0.0).float().mean() for shard in powerflow_weight_shards if len(shard) > 0])
@@ -3281,6 +3292,10 @@ class RayPPOTrainer:
             "chunk_state/target_prior_max": target_prior.max().detach().item(),
             "chunk_state/weight_max": weights.max().detach().item(),
             "chunk_state/weight_min": weights.min().detach().item(),
+            "chunk_state/powerflow_weight_clip": powerflow_weight_clip,
+            "chunk_state/powerflow_weight_clip_renorm": float(powerflow_weight_clip_renorm),
+            "chunk_state/powerflow_weight_before_clip_max": powerflow_weight_before_clip.max().detach().item(),
+            "chunk_state/powerflow_weight_before_clip_mean": powerflow_weight_before_clip.mean().detach().item(),
             "chunk_state/powerflow_weight_mean": powerflow_flat_weights.mean().detach().item(),
             "chunk_state/powerflow_weight_max": powerflow_flat_weights.max().detach().item(),
             "chunk_state/powerflow_weight_min": powerflow_flat_weights.min().detach().item(),

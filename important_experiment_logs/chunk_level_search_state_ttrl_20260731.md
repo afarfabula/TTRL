@@ -5636,3 +5636,138 @@ timing_s/update_actor = 1.287        # strict FSG was about 5.8
 - 语义上仍未达到 20-step gate：OOV 仍约 0.51，support coverage 约 0.49，positive margin 平均仍为负。也就是说，真正的问题仍然是 candidate/probe 没有稳定把 future completion 推向 full group support。
 - prune 带来新的风险：target 变得更稀疏，`powerflow_weight_max` 均值约 5.56，step3 到 8.0；actor loss/grad 明显变大。这版不适合直接扩 20 step。
 - 下一步应该保留 hard filtering 的工程收益，但必须做权重平滑：加 `powerflow_weight_clip` 或改为“保留低权重样本 + zero inconsistent target”的 soft pruning，把 `powerflow_weight_max` 控制在 3-4，同时继续提高 state/probe 的 support coverage。
+
+## 2026-08-01 Future-Support-Gain Hardfilter + Clip4 3-Step Smoke
+
+目的：
+
+- 在 hardfilter2 已经把 actor batch 从 256 裁到约 40-56、actor update 降到约 1s 的基础上，验证 PowerFlow sample weight clipping 能否控制尖权重。
+- 保持训练语义不变：full rollout group support 仍是 label/value estimation 来源；source chunk 仍只是 prior / drift guard；只在 actor batch 的 `powerflow_flat_weights` 上做 clip + optional renorm。
+- 该实验只做 3-step gate，不做 validation。
+
+代码改动：
+
+```text
+ttrl.chunk_state_powerflow_weight_clip: 0.0
+ttrl.chunk_state_powerflow_weight_clip_renorm: true
+
+actor batch 组装后：
+  powerflow_weight_before_clip = powerflow_flat_weights.clone()
+  if clip > 0:
+    powerflow_flat_weights = clamp(max=clip)
+    if renorm:
+      divide by nonzero mean
+      clamp(max=clip) again
+
+新增日志：
+  chunk_state/powerflow_weight_clip
+  chunk_state/powerflow_weight_clip_renorm
+  chunk_state/powerflow_weight_before_clip_max
+  chunk_state/powerflow_weight_before_clip_mean
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_hardfilter_clip4_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_hardfilter_clip4_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_future_support_score_type=positive_gain
+ttrl.chunk_state_future_support_gain_slack=0.0
+ttrl.chunk_state_future_support_source_prior_weight=1.15
+ttrl.chunk_state_future_support_min_positive_margin=0.001
+ttrl.chunk_state_zero_inconsistent_candidates=True
+ttrl.chunk_state_prune_zero_weight_samples=True
+ttrl.chunk_state_powerflow_weight_clip=4.0
+ttrl.chunk_state_powerflow_weight_clip_renorm=True
+```
+
+产物：
+
+```text
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_hardfilter_clip4_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+raw_log = not tee'd by this wrapper; step timing/weight metrics below are from live console output, diag metrics are from jsonl
+```
+
+diag jsonl 统计：
+
+```text
+step1: source_original_correct=0.844, coverage=0.470, majority_ratio=0.405, probe_mean=0.0230, all_negative=0.531, mixed=0.438
+step2: source_original_correct=0.781, coverage=0.507, majority_ratio=0.376, probe_mean=0.0203, all_negative=0.406, mixed=0.594
+step3: source_original_correct=0.719, coverage=0.481, majority_ratio=0.367, probe_mean=0.0269, all_negative=0.469, mixed=0.531
+
+boundary_mean = 624 / 548 / 524
+boundary_zero_ratio = 0.000 / 0.031 / 0.031
+probe_mean_source_original_correct = 0.0273 / 0.0237 / 0.0374
+probe_mean_source_original_wrong = 0.0000 / 0.0081 / 0.0000
+```
+
+live console 关键指标：
+
+```text
+step1:
+  powerflow_weight_before_clip_max = 4.673
+  powerflow_weight_before_clip_mean = 1.857
+  powerflow_weight_max = 2.174
+  actor/powerflow_weight/max = 2.174
+  num_actor_samples = 56
+  update_actor = 1.501s
+  chunk_state_ref = 4.155s   # warmup
+
+step2:
+  distribution_oov_probe_ratio = 0.493
+  support_coverage_mean = 0.507
+  num_actor_samples = 48
+  pruned_sample_ratio = 0.812
+  powerflow_weight_before_clip_max = 8.000
+  powerflow_weight_before_clip_mean = 2.134
+  powerflow_weight_max = 1.956
+  actor/powerflow_weight/max = 1.956
+  actor_powerflow_loss = 1.161
+  grad_norm = 15.915
+  update_actor = 1.345s
+  chunk_state_ref = 0.387s
+
+step3:
+  distribution_oov_probe_ratio = 0.519
+  support_coverage_mean = 0.481
+  num_actor_samples = 40
+  pruned_sample_ratio = 0.844
+  powerflow_weight_before_clip_max = 8.000
+  powerflow_weight_before_clip_mean = 2.107
+  powerflow_weight_max = 2.000
+  actor/powerflow_weight/max = 2.000
+  actor_powerflow_loss = 1.567
+  grad_norm = 11.689
+  update_actor = 0.975s
+  chunk_state_ref = 0.358s
+```
+
+对比 hardfilter2：
+
+```text
+hardfilter2:
+  powerflow_weight_max_avg ~= 5.56, step3 = 8.0
+  actor_powerflow_loss_avg ~= 2.66
+  grad_norm_avg ~= 27.8
+  update_actor_avg ~= 1.29s
+  support_coverage ~= 0.49
+  OOV ~= 0.51
+
+hardfilter_clip4:
+  powerflow_weight_before_clip_max step2/3 = 8.0 / 8.0
+  powerflow_weight_max after clip+renorm = 2.17 / 1.96 / 2.00
+  actor_powerflow_loss step2/3 = 1.16 / 1.57
+  grad_norm step2/3 = 15.9 / 11.7
+  update_actor step2/3 = 1.35s / 0.98s
+  support_coverage still about 0.48-0.51
+  OOV still about 0.49-0.52
+```
+
+结论：
+
+- `powerflow_weight_clip=4 + renorm` 工程上有效：hardfilter2 中 step3 到 8.0 的尖权重被压到约 2.0，actor loss/grad 明显变稳，同时保留了 hardfilter 的 actor update 提速。
+- 这不是 target-quality fix：`support_coverage` 仍只有约 0.48-0.51，OOV 仍约 0.49-0.52。clip 只是让稀疏 target 不炸，不会让 chunk candidate 更贴近 full rollout support。
+- 这版可以作为后续 chunk PowerFlow 的默认稳定器，但不应单独扩 20 step。下一步应该把精力放在 state/candidate 的 label estimation：从 full rollout answer support 中抽更高 coverage 的 state，过滤 OOV-heavy/malformed candidate，并把 score 改成更明确的 future support mass gain / transport improvement，而不是靠 clip 掩盖 target 噪声。
