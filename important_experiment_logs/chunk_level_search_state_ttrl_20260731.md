@@ -3285,3 +3285,87 @@ timing_s/update_actor=7.801
 - 新 scoring 确实产生 answer-level reward：`raw_positive_ratio=0.396`，`state_positive_ratio=0.750`。
 - 但沿用旧的 `min_majority_ratio=0.25` 后只保留 `37.5%` state，训练信号偏稀；这和 arXiv 2504.16084 的分析相冲突，因为它强调 majority label 低精度时逐样本 reward 仍可能有用，不应过度用 majority ratio gate 丢掉样本。
 - 下一步跑 20-step gate 前应放宽 `chunk_state_min_majority_ratio`，保留 answer-consensus 的 dense reward；同时继续保持 `min_answer_coverage=0.60`，避免无可解析答案的状态进入训练。
+
+## 2026-08-01 Answer-consensus Mid-state c128 Relaxed 20-step Gate
+
+动机：
+
+- 基于 3-step smoke 的诊断，旧的 `chunk_state_min_majority_ratio=0.25` 只保留约 `37.5%` state，和 2504.16084 中“state label estimation 不必过强过滤，逐样本 reward 仍可提供信号”的叙事不一致。
+- 本轮保持 PowerFlow loss、full rollout majority-consistent source、answer-consensus scoring 不变，只把 `chunk_state_min_majority_ratio` 放宽到 `0.0`，继续保留 `chunk_state_min_answer_coverage=0.60`。
+- 目标是验证更 dense 的 answer-level reward 能否超过 hard confidence-gated c128 的 20-step gate：`mean@16=0.532500`。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_minmaj0_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_score_mode=answer_consensus
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_min_majority_ratio=0.0
+ttrl.chunk_state_min_answer_coverage=0.60
+ttrl.chunk_state_label_consistent_only=True
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.use_dynamic_bsz=False
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_minmaj0_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_answer_consensus_mid_c128_probe4_b32_r32_v64_minmaj0_20step_20260801.jsonl
+diag_jsonl_rows=640
+```
+
+Final validation：
+
+```text
+mean@16=0.521750
+maj@16=0.652016
+best@16=0.865020
+format_mean@16=0.907875
+format_maj@16=0.893966
+format_best@16=0.999918
+testing=291.520s
+```
+
+20-step 平均训练信号：
+
+```text
+answer_consensus_majority_ratio=0.371
+answer_consensus_answer_coverage=0.793
+answer_consensus_raw_positive_ratio=0.445
+answer_consensus_label_consistent_ratio=0.618
+answer_consensus_state_positive_ratio=0.780
+kept_state_ratio=0.719
+target_entropy=1.753
+actor/powerflow_loss=0.866
+actor/grad_norm=36.073
+timing_s/gen=25.684
+timing_s/chunk_state_score=9.669
+timing_s/update_actor=7.354
+```
+
+与短程 gate 对比：
+
+```text
+hard confidence-gated c128:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+teacher-anchor mid-state c128:
+  mean@16=0.525875 maj@16=0.656294 best@16=0.867390 format_mean@16=0.899000
+
+answer-consensus minmaj0 mid-state c128:
+  mean@16=0.521750 maj@16=0.652016 best@16=0.865020 format_mean@16=0.907875
+```
+
+结论：
+
+- 这轮 relaxed answer-consensus 20-step gate 没有超过 hard confidence-gated c128 的 `mean@16=0.5325`，因此不扩到 80-step。
+- 放宽 majority gate 的工程效果明确：`kept_state_ratio` 从 smoke 的 `0.375` 提高到 `0.719`，每步 32 个 state 基本都有可训练信号；但 final accuracy 没有提升，说明问题不是训练信号密度不足，而是当前 chunk target 的方向仍不够可靠。
+- actor update 不是主要瓶颈，平均 `update_actor=7.354s`；端到端训练步主要成本仍是 full rollout 生成 `gen=25.684s` 和 answer-consensus probe/scoring `chunk_state_score=9.669s`。
+- 当前 answer-consensus 的 reward 只判断 `state + next_chunk + probe` 是否落到 full-rollout prompt-level consensus answer，仍可能奖励“局部看起来能走到多数答案”的 chunk，而不是奖励真正改善后续搜索分布的 chunk。
+- 下一版不应继续只调 gate 或延长训练，应改 scoring 语义：考虑 state 内多 probe 的 answer distribution sharpening、chunk 后续 value margin、或把 source full rollout 的 mid-state 与候选 chunk 的 long-horizon success 做更直接的 distribution matching。
