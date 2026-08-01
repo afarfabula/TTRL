@@ -2657,3 +2657,100 @@ step3: kept_state=0.969 loss_weight=0.422 majority_ratio=0.321 answer_coverage=0
 - `loss_weight_mean=0.338-0.483`，没有塌到 hard gate step12 的 `0.119`。
 - `update_actor~7.4-7.7s`，仍保留 c128 对 actor update 的收益。
 - 这版比 hard gate 更适合作为 2504.16084 风格 multi-output label estimation 的最小可行实验，下一步跑 20-step final validation。
+
+## 2026-08-01 Soft-confidence Majority-completion c128 20-step
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_soft_conf_c128_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+chunk_state_chunk_size=128
+chunk_state_min_majority_ratio=0.0
+chunk_state_min_answer_coverage=0.0
+chunk_state_confidence_power=0.5
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_soft_conf_c128_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_soft_conf_c128_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+worker=1024321, 8x NVIDIA B200
+```
+
+Final validation：
+
+```text
+val-core/math/acc/mean@16=0.370000
+val-core/math/acc/maj@16/mean=0.475650
+val-core/math/acc/best@16/mean=0.810974
+val-aux/math/format_score/mean@16=0.871500
+val-aux/math/format_score/maj@16/mean=0.822820
+timing_s/testing=308.964
+```
+
+训练耗时统计（step2-step20 平均）：
+
+```text
+timing_s/gen=24.848
+timing_s/chunk_state_score=12.343
+timing_s/update_actor=7.569
+chunk_state/kept_state_ratio=0.961
+chunk_state/loss_weight_mean=0.411
+chunk_state/majority_ratio_mean=0.287
+chunk_state/answer_coverage_mean=0.658
+actor/powerflow_loss=0.251
+actor/grad_norm=5.124
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.094
+chunk_state_source/prompt_original_pass=0.906
+chunk_state_source/prompt_original_mean=0.303
+chunk_state_majority_completion/majority_ratio_mean=0.327
+chunk_state_majority_completion/answer_coverage_mean=0.686
+chunk_state_majority_completion/raw_positive_ratio=0.328
+chunk_state_diag/state_all_positive_ratio=0.188
+chunk_state_diag/state_all_negative_ratio=0.000
+chunk_state_diag/state_mixed_ratio=0.812
+chunk_state/confidence_gate_ratio=1.000
+chunk_state/kept_state_ratio=1.000
+chunk_state/loss_weight_mean=0.446
+chunk_state/target_entropy=1.249
+actor/powerflow_loss=0.191
+actor/boxed_reward/mean=0.297
+actor/grad_norm=5.178
+timing_s/gen=22.596
+timing_s/chunk_state_probe=6.668
+timing_s/chunk_state_score=9.989
+timing_s/update_actor=7.541
+```
+
+对比：
+
+```text
+raw majority-completion c256 20-step:
+  mean@16=0.521125 maj@16=0.662318 best@16=0.872676 format_mean@16=0.904125
+
+confidence-gated c128 20-step:
+  mean@16=0.532500 maj@16=0.666974 best@16=0.877136 format_mean@16=0.913625
+
+soft-confidence c128 20-step:
+  mean@16=0.370000 maj@16=0.475650 best@16=0.810974 format_mean@16=0.871500
+```
+
+结论：
+
+- 这轮完整跑完，但结果明显失败；soft-confidence 20-step 反而低于 raw majority-completion 和 hard gate。
+- smoke 阶段看到的“训练信号更连续”没有转化为最终 accuracy，说明只用连续置信权重会把大量低置信、弱对齐甚至错误的 chunk pseudo-label 一起蒸馏进 actor。
+- `kept_state_ratio` 平均达到 `0.961`，但 `majority_ratio_mean` 只有 `0.287`，`answer_coverage_mean` 只有 `0.658`；这意味着保留了太多没有稳定 pseudo-label 的 state。
+- actor update 仍然维持 `~7.6s`，证明 chunk actor update 的 infra 方向是成立的；失败主要是训练语义，不是 actor update 性能。
+- validation format 分数也下降到 `0.8715`，说明错误 target 不只是没有提升推理正确性，还伤到了输出格式稳定性。
+
+下一步：
+
+- 不扩 soft-confidence 到 80-step。
+- 转向更贴近 arXiv 2504.16084 的 state-level label estimation：同一 state 下先用多 completion 得到稳定 pseudo-label / majority reward，只对 label-consistent 的 continuation 构造 PowerFlow target。
+- 保留 PowerFlow loss 作为 chunk actor update 主路径，但 target 要从“所有候选按弱 reward 连续加权”改成“先估计 state label，再蒸馏 search-improved distribution”。
+- 优先做一个 3-step smoke：`state_label_estimation + label_consistent_powerflow`，检查 pseudo-label 覆盖率、label-consistent candidate ratio、target entropy、format 分数，再决定是否跑 20-step。
