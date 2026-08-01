@@ -1602,10 +1602,16 @@ class RayPPOTrainer:
 
         raw_probe_scores = torch.tensor(probe_scores, dtype=torch.float32)
         scores = raw_probe_scores.view(len(state_prompts), candidates, probe_samples).mean(dim=-1).reshape(-1)
+        label_consistent = (raw_probe_scores.view(len(state_prompts), candidates, probe_samples).max(dim=-1).values > 0.0).to(
+            dtype=torch.float32
+        )
         majority_ratios_arr = np.asarray(majority_ratios, dtype=np.float32)
         answer_coverage_arr = np.asarray(answer_coverage, dtype=np.float32)
         state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = majority_ratios_arr
         state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = answer_coverage_arr
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
+            np.float32
+        )
         metrics = {
             "chunk_state_majority_completion/group_size": float(group_size),
             "chunk_state_majority_completion/majority_ratio_mean": float(majority_ratios_arr.mean())
@@ -1619,6 +1625,9 @@ class RayPPOTrainer:
             else 0.0,
             "chunk_state_majority_completion/raw_positive_ratio": raw_probe_scores.mean().item()
             if len(raw_probe_scores)
+            else 0.0,
+            "chunk_state_majority_completion/label_consistent_ratio": label_consistent.mean().item()
+            if len(label_consistent)
             else 0.0,
         }
         return scores, metrics
@@ -1807,8 +1816,22 @@ class RayPPOTrainer:
         min_majority_ratio = float(cfg.get("chunk_state_min_majority_ratio", 0.0))
         min_answer_coverage = float(cfg.get("chunk_state_min_answer_coverage", 0.0))
         confidence_power = float(cfg.get("chunk_state_confidence_power", 0.0))
+        label_consistent_only = bool(cfg.get("chunk_state_label_consistent_only", False))
 
         score_matrix = scores.view(num_states, candidates).float()
+        if label_consistent_only:
+            label_consistent = torch.as_tensor(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_label_consistent",
+                    np.ones((num_states, candidates), dtype=np.float32),
+                ),
+                dtype=torch.float32,
+            )
+            if label_consistent.shape != score_matrix.shape:
+                label_consistent = label_consistent.reshape(score_matrix.shape)
+            score_matrix = score_matrix * label_consistent
+        else:
+            label_consistent = (score_matrix > 0.0).float()
         raw_weights = torch.pow(score_matrix + eps, alpha)
         weight_sums = raw_weights.sum(dim=-1, keepdim=True)
         uniform = torch.full_like(raw_weights, 1.0 / candidates)
@@ -1916,6 +1939,8 @@ class RayPPOTrainer:
             "chunk_state/majority_ratio_mean": majority_ratios.mean().detach().item(),
             "chunk_state/answer_coverage_mean": answer_coverage.mean().detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
+            "chunk_state/label_consistent_only": float(label_consistent_only),
+            "chunk_state/label_consistent_ratio": label_consistent.mean().detach().item(),
             "chunk_state/informative_ratio": informative.mean().detach().item(),
             "chunk_state/kept_state_ratio": keep_state.float().mean().detach().item(),
             "chunk_state/target_entropy": (-(weights * torch.log(weights.clamp(min=1e-12))).sum(dim=-1).mean()).detach().item(),

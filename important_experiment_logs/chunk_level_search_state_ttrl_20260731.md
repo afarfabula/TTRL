@@ -2754,3 +2754,61 @@ soft-confidence c128 20-step:
 - 转向更贴近 arXiv 2504.16084 的 state-level label estimation：同一 state 下先用多 completion 得到稳定 pseudo-label / majority reward，只对 label-consistent 的 continuation 构造 PowerFlow target。
 - 保留 PowerFlow loss 作为 chunk actor update 主路径，但 target 要从“所有候选按弱 reward 连续加权”改成“先估计 state label，再蒸馏 search-improved distribution”。
 - 优先做一个 3-step smoke：`state_label_estimation + label_consistent_powerflow`，检查 pseudo-label 覆盖率、label-consistent candidate ratio、target entropy、format 分数，再决定是否跑 20-step。
+
+## 2026-08-01 Label-consistent Majority-completion c128 3-step Smoke
+
+动机：
+
+- soft-confidence 20-step 失败说明“保留所有 informative state + 连续置信权重”会把低置信/错误 chunk target 一起蒸馏进去。
+- 按 arXiv 2504.16084 的语义，应该先对同一个 state 的多输出估计 pseudo-label，再把匹配 pseudo-label 的输出作为 reward/target。
+- 因此这轮新增 `chunk_state_label_consistent_only=True`：仍用 state 下 `candidates * probe_samples = 32` 个 completion 做 majority label estimation，但 PowerFlow target 只从至少一个 probe completion 匹配该 label 的 chunk candidate 构造。
+
+代码变更：
+
+```text
+verl/trainer/config/ppo_trainer_ttrl.yaml:
+  ttrl.chunk_state_label_consistent_only=false  # 默认关闭，保持旧实验语义
+
+verl/trainer/ppo/ray_trainer.py:
+  _score_chunk_state_majority_completion 写入 chunk_state_label_consistent[state, candidate]
+  _build_chunk_actor_batch 在开关启用时用 label_consistent mask 构造 PowerFlow target
+```
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_label_consistent_c128_probe4_b32_r32_v64_3step_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+chunk_state_chunk_size=128
+chunk_state_min_majority_ratio=0.25
+chunk_state_min_answer_coverage=0.60
+chunk_state_confidence_power=0.0
+chunk_state_label_consistent_only=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_label_consistent_c128_probe4_b32_r32_v64_3step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_label_consistent_c128_probe4_b32_r32_v64_3step_20260801.jsonl
+diag_jsonl_rows=96
+worker=1024321, 8x NVIDIA B200
+```
+
+三步关键信号：
+
+```text
+step1: kept_state=0.500 label_consistent=0.602 loss_weight=0.500 target_entropy=1.440 powerflow_loss=1.442 grad_norm=53.314 gen=51.293s chunk_state_score=11.424s update_actor=7.634s
+step2: kept_state=0.531 label_consistent=0.590 loss_weight=0.531 target_entropy=1.314 powerflow_loss=0.661 grad_norm=44.746 gen=24.316s chunk_state_score=10.014s update_actor=7.356s
+step3: kept_state=0.438 label_consistent=0.512 loss_weight=0.438 target_entropy=1.231 powerflow_loss=0.238 grad_norm=33.374 gen=22.876s chunk_state_score=10.589s update_actor=7.591s
+```
+
+结论：
+
+- smoke 成功，无 NaN、Ray/FSDP/vLLM 崩溃。
+- `label_consistent_ratio=0.512-0.602`，说明同一 state 的 majority label 能过滤掉约 40%-49% chunk candidate；这比 soft-confidence 的“全候选弱加权”更接近论文的 label-estimation reward 语义。
+- `kept_state_ratio=0.438-0.531`，比 soft-confidence 稀疏，但不像 hard gate step12 那样塌到 `0.188`。
+- `grad_norm=53.314 -> 44.746 -> 33.374` 偏高但下降，没有发散；需要 20-step final validation 判断是否带来 accuracy 改善。
+- actor update 仍保持 `~7.3-7.6s`，chunk actor update 的 infra 收益保留。
+
+下一步：
+
+- 跑同配置 20-step final validation，若 `mean@16` 明显高于 hard gate `0.5325` 或接近 raw MV 20-step 基线，再考虑 80-step。
+- 如果 20-step 仍差，下一轮不再调权重，而改 state construction：减少 prompt-only/early state，优先从 high-pass full rollout 中截取中后段 state，提升 pseudo-label 与最终正确性的相关性。

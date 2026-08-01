@@ -67,6 +67,11 @@ ttrl:
   chunk_state_min_majority_ratio: 0.0
   chunk_state_min_answer_coverage: 0.0
   chunk_state_confidence_power: 0.0
+  # If enabled with majority_completion scoring, build PowerFlow targets from
+  # candidates whose completions match the state-level majority label. This
+  # keeps the 2504.16084 label-estimation semantics separate from soft
+  # confidence weighting.
+  chunk_state_label_consistent_only: false
   chunk_state_diag_enable: false
   # Optional JSONL path for per-state chunk/probe diagnostic rows. Empty means
   # disabled. Intended for short diagnostic runs, not long training jobs.
