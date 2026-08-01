@@ -4584,3 +4584,96 @@ RuntimeError: DataLoader worker (pid 1740812) is killed by signal: Killed.
 - 去掉 `teacher_anchor_score=0.5` 的硬 floor 做对照，只保留 source chunk injection + distribution guard，判断 anchor floor 是否在错误地保护局部坏 chunk。
 - 设计 answer-boundary-aware state selection，尽量在 reasoning/answer 边界附近截 state，而不是随机 mid boundary。
 - validation 侧需要减少超长样本 stdout，避免 metrics 后 DataLoader/Ray worker 清理阶段被 kill。
+
+## 2026-08-01 Full-Answer Support Target 3-Step Smoke
+
+目的：
+
+- 接上 guard20 的失败结论，不继续微调普通 guard 阈值。
+- 更接近 arXiv 2504.16084 的拆分：先从 32 条 full rollout 估计 answer distribution，再用该 distribution 约束 chunk target。
+- 去掉 `teacher_anchor_score=0.5` 的硬 floor，只保留 source chunk injection；避免 teacher anchor floor 保护局部坏 chunk。
+- 启用 full-answer support guard：probe answer 不在 full rollout answer support 中时置零；同时把 prompt answer mass 注入 score，形成 support-constrained target。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+TEST_FREQ=2000000
+FINAL_VAL_ENABLE=False
+TTRL_RUNTIME_DIR=/tmp/cssup3
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_bad_probe_ratio=0.5
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_use_distribution_score=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+关键 step 指标：
+
+```text
+step1:
+  kept_candidate_ratio=0.422, zeroed_candidate_ratio=0.578
+  distribution_oov_probe_ratio=0.528
+  score_mean_before=0.090, score_mean_after=0.201
+  kept_state_ratio=0.438, positive_ratio=0.088
+  boxed_reward_weighted_mean=0.638
+  actor/powerflow_loss=0.629, zero_shard_ratio=0.000
+  timing_s/gen=51.530, chunk_state_probe=6.539, chunk_state_score=11.273, update_actor=5.909
+
+step2:
+  kept_candidate_ratio=0.480, zeroed_candidate_ratio=0.520
+  distribution_oov_probe_ratio=0.442
+  score_mean_before=0.090, score_mean_after=0.257
+  kept_state_ratio=0.594, positive_ratio=0.110
+  boxed_reward_weighted_mean=0.668
+  actor/powerflow_loss=1.515, zero_shard_ratio=0.000
+  timing_s/gen=22.825, chunk_state_probe=7.427, chunk_state_score=11.259, update_actor=5.081
+
+step3:
+  kept_candidate_ratio=0.520, zeroed_candidate_ratio=0.480
+  distribution_oov_probe_ratio=0.439
+  score_mean_before=0.099, score_mean_after=0.281
+  kept_state_ratio=0.531, positive_ratio=0.113
+  boxed_reward_weighted_mean=0.659
+  actor/powerflow_loss=1.631, zero_shard_ratio=0.000
+  timing_s/gen=22.548, chunk_state_probe=6.489, chunk_state_score=10.320, update_actor=5.162
+```
+
+3 step 平均：
+
+```text
+kept_candidate_ratio avg = 0.474
+zeroed_candidate_ratio avg = 0.526
+distribution_oov_probe_ratio avg = 0.470
+score_mean_before avg = 0.093
+score_mean_after avg = 0.246
+kept_state_ratio avg = 0.521
+positive_ratio avg = 0.104
+boxed_reward_weighted_mean avg = 0.655
+actor/powerflow_loss avg = 1.258
+actor/grad_norm avg = 39.546
+timing_s/update_actor avg = 5.384
+diag_jsonl_rows = 96
+```
+
+结论：
+
+- support-constrained target 路径真实生效：约 44%-53% probe 因 answer 不在 full-rollout support 中被 OOV guard 拦下，`score_mean_after` 从约 0.09 提升到 0.20-0.28。
+- 去掉 `teacher_anchor_score` 后 actor batch 仍没有打空，三步 `zero_shard_ratio=0.000`，PowerFlow loss 正常非零。
+- `boxed_reward_weighted_mean` 升到约 0.65，说明 distribution score 正在把权重集中到 full-answer support 内的 candidate。
+- 风险是 actor loss/grad norm 明显高于 guard20：`actor/powerflow_loss` 到 1.5-1.6，`grad_norm` 到 32-52。20-step gate 必须观察是否过强更新导致 mean/maj 继续塌。
+- 该 smoke 没有 final validation，不能判断效果；下一步可跑 20-step gate，但必须仍以 step20 mean/maj 为硬判据。
