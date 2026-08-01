@@ -5548,3 +5548,91 @@ timing_s/update_actor = 5.779
 - candidate score 从 `mean/max support mass - source_mass + slack` 改为更明确的 future support margin，例如 top-supported answer mass gain 或 KL/transport improvement，减少负 gain 被 slack 变成正 target。
 - source prior 继续保留，但只做弱 prior；必要时加 `powerflow_weight_clip`，把 smoke 的 `powerflow_weight_max` 稳定压到 3-4 以下。
 - 下一次 gate 仍先跑 3 step，只看四个量：target nonzero ratio、OOV ratio、repeated boxed ratio、source-correct vs wrong future score；这些过线后再跑 20 step。
+
+## 2026-08-01 Future-Support-Gain Hardfilter 3-Step Smoke
+
+目的：
+
+- 把上轮 strict FSG 的“低质量 state 只是 loss weight 置零，但仍进入 ref/logprob/update”的问题改成真实 hard filtering。
+- score 从 `slack_gain` 改为 `positive_gain`，不再用 slack 把负 gain 变成正 target。
+- 打开 `zero_inconsistent_candidates` 和 `prune_zero_weight_samples`，验证是否能减少无效 actor batch 计算，同时保持 full-rollout support driven 的 target 语义。
+
+代码改动：
+
+```text
+新增 ttrl.chunk_state_future_support_score_type:
+  - slack_gain: 兼容旧行为
+  - positive_gain: score = max(raw_gain, 0)
+  - relative_positive_gain: score = max(raw_gain / (1 - source_mass), 0)
+
+新增 ttrl.chunk_state_future_support_min_positive_margin
+新增 per-state chunk_state_future_support_keep
+新增 ttrl.chunk_state_zero_inconsistent_candidates
+新增 ttrl.chunk_state_prune_zero_weight_samples
+actor batch prune 后按 8 卡 shard 裁成可均分样本数，避免 DataProto.chunk 断言失败
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_hardfilter_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_hardfilter2_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_future_support_score_type=positive_gain
+ttrl.chunk_state_future_support_gain_slack=0.0
+ttrl.chunk_state_future_support_source_prior_weight=1.15
+ttrl.chunk_state_future_support_min_positive_margin=0.001
+ttrl.chunk_state_zero_inconsistent_candidates=True
+ttrl.chunk_state_prune_zero_weight_samples=True
+```
+
+产物：
+
+```text
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_hardfilter2_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+raw_log = not tee'd by this wrapper; step metrics below are from live console output and diag_jsonl
+```
+
+工程问题与修复：
+
+- 第一次 `hardfilter` run 在 step1 后失败：prune 后 actor batch 样本数为 70，不能被 8 卡均分，触发 `DataProto.chunk` 的 `only support equal chunk` 断言。
+- 修复：prune 后只保留 nonzero 样本，并裁到 `n_gpus_per_node * nnodes` 的倍数；如果不足一个 shard，则回退不裁剪。
+- `hardfilter2` 完整 3 step 通过，final validation 按 smoke 配置跳过。
+
+3 step 平均：
+
+```text
+support_coverage_mean = 0.490
+distribution_oov_probe_ratio = 0.510
+candidate_repeated_boxed_probe_ratio = 0.005
+num_actor_samples = 50.7        # strict/baseline 是 256
+pruned_sample_ratio = 0.802
+kept_state_ratio = 0.406
+future_support_keep_ratio = 0.552
+score_mean = 0.025
+positive_margin_mean = -0.067
+powerflow_weight_max = 5.558
+actor_powerflow_loss = 2.657
+actor_grad_norm = 27.764
+probe_mean_source_original_correct = 0.029
+probe_mean_source_original_wrong = 0.005
+```
+
+Timing：
+
+```text
+timing_s/gen = 35.483
+timing_s/chunk_state_probe = 6.452
+timing_s/chunk_state_score = 10.598
+timing_s/chunk_state_ref = 1.662     # step1 4.187, step2/3 about 0.4
+timing_s/update_actor = 1.287        # strict FSG was about 5.8
+```
+
+结论：
+
+- 工程上 hard filtering 是有效的：actor samples 从 256 降到约 40-56，`update_actor` 从约 5.8s 降到约 1.3s，`chunk_state_ref` 稳态也从约 1.7-1.9s 降到约 0.4s。
+- 语义上仍未达到 20-step gate：OOV 仍约 0.51，support coverage 约 0.49，positive margin 平均仍为负。也就是说，真正的问题仍然是 candidate/probe 没有稳定把 future completion 推向 full group support。
+- prune 带来新的风险：target 变得更稀疏，`powerflow_weight_max` 均值约 5.56，step3 到 8.0；actor loss/grad 明显变大。这版不适合直接扩 20 step。
+- 下一步应该保留 hard filtering 的工程收益，但必须做权重平滑：加 `powerflow_weight_clip` 或改为“保留低权重样本 + zero inconsistent target”的 soft pruning，把 `powerflow_weight_max` 控制在 3-4，同时继续提高 state/probe 的 support coverage。

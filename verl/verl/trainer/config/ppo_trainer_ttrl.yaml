@@ -61,6 +61,12 @@ ttrl:
   chunk_state_eps: 0.05
   chunk_state_min_informative_gap: 0.0
   chunk_state_skip_uniform: false
+  # If true, candidate entries marked inconsistent by a scorer/guard get zero
+  # target mass instead of only receiving the small epsilon floor.
+  chunk_state_zero_inconsistent_candidates: false
+  # If true, physically drop zero-weight chunk samples from the actor batch.
+  # This is off by default for exact backward compatibility with earlier pilots.
+  chunk_state_prune_zero_weight_samples: false
   # Optional state-level confidence gate for chunk majority-completion targets.
   # Defaults are neutral, so existing experiments keep the same training
   # semantics unless launchers opt in.
@@ -130,9 +136,11 @@ ttrl:
   # answer mass. The source chunk can enter as a prior, not a hard score floor.
   chunk_state_future_support_min_mass: 0.03125
   chunk_state_future_support_max_mass_coef: 0.25
+  chunk_state_future_support_score_type: slack_gain
   chunk_state_future_support_gain_slack: 0.125
   chunk_state_future_support_baseline_scale: 1.0
   chunk_state_future_support_source_prior_weight: 2.0
+  chunk_state_future_support_min_positive_margin: 0.0
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.
