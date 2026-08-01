@@ -4488,3 +4488,99 @@ infra 观察：
   - `chunk_state_target_guard_min_answer_mass > 0`，限制 chunk target 必须落在 full-rollout answer distribution 内。
   - 去掉 `teacher_anchor_score` 强行 floor，只保留 source chunk injection + distribution guard。
   - 引入 answer-boundary-aware state selection，减少 boundary=0 和无语义 mid-boundary。
+
+## 2026-08-01 Full-Answer Target Guard 20-Step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_anchor_guard20_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+TTRL_RUNTIME_DIR=/tmp/csguard20
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_value_margin=0.125
+ttrl.chunk_state_value_topk=2
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_score=0.5
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_max_boxed_count=2
+ttrl.chunk_state_target_guard_bad_probe_ratio=0.5
+ttrl.chunk_state_target_guard_min_answer_mass=0.0
+ttrl.chunk_state_target_guard_anchor=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16 = 0.455875
+val-core/math/acc/maj@16/mean = 0.573016
+val-core/math/acc/best@16/mean = 0.845844
+val-aux/math/format_score/mean@16 = 0.893625
+val-aux/math/format_score/maj@16/mean = 0.868344
+timing_s/testing = 297.691
+diag_jsonl_rows = 640
+```
+
+20 step 平均 timing：
+
+```text
+timing_s/gen avg = 25.363, min = 21.176, max = 51.145
+timing_s/chunk_state_probe avg = 6.705, min = 6.269, max = 7.208
+timing_s/chunk_state_score avg = 12.967, min = 8.758, max = 30.182
+timing_s/chunk_state_ref avg = 1.906, min = 1.481, max = 5.694
+timing_s/update_actor avg = 5.331, min = 4.550, max = 6.189
+progress avg s/it ~= 63.9
+progress avg s/it excluding warmup ~= 66.5
+```
+
+20 step 训练侧摘要：
+
+```text
+target_guard kept_candidate_ratio avg = 0.639, min = 0.480, max = 0.762
+target_guard zeroed_candidate_ratio avg = 0.361, min = 0.238, max = 0.520
+chunk_state/kept_state_ratio avg = 0.424, min = 0.188, max = 0.625
+chunk_state/positive_ratio avg = 0.079, min = 0.047, max = 0.101
+chunk_state_actor_span/response_len_mean avg = 123.644
+actor/powerflow_loss avg = 0.222, min = 0.034, max = 0.612
+actor_batch_powerflow_weight_zero_shard_ratio = 0.000 for all steps
+```
+
+尾部异常：
+
+```text
+RuntimeError: DataLoader worker (pid 1740812) is killed by signal: Killed.
+```
+
+这个异常发生在 final validation metrics 已经完整打印之后。结论上这次 gate 有可用数值，但不是干净退出的 run；后续长跑前需要降低 validation/日志内存压力，尤其是避免 validation 打印超长样本列表。
+
+结论：
+
+- guard20 训练链路稳定到 step20，PowerFlow loss 非零，`zero_shard_ratio=0.000`，说明 actor batch / FSDP shard 没有被 guard 打空。
+- 结果仍然失败：`mean@16=0.4559`、`maj@16=0.5730` 明显低于 MV step20 gate；`best@16=0.8458` 说明 sampling 里仍有正确轨迹，但训练后主分布没有变好。
+- guard 清掉了大量空答案 / 重复 boxed candidate，但只是在 candidate 层过滤坏样本，不能解决局部 chunk target 与 full-answer policy 的错配。
+- 当前端到端速度约 64-66s/step，actor update 只有约 5.3s；慢点来自 full rollout generation、probe generation 和 SymPy/answer scoring，不是短 chunk actor update。
+- 结合 arXiv 2504.16084 的处理方式，下一版不应再继续在这个 guard 上微调阈值，而应更彻底拆开两件事：
+  - label / answer distribution estimation：先从 32 条完整 rollout 估计 prompt-level answer distribution 和 state-level candidate distribution。
+  - reward / target calculation：再把 chunk probe 作为局部 evidence，用 full-answer distribution 约束 PowerFlow target，避免 probe 偶然成功、重复 boxed、prompt-copy 直接进入 actor target。
+
+下一步：
+
+- 不扩 guard20 到 80 step。
+- 优先实现 `chunk_state_target_guard_min_answer_mass > 0` 或更强的 distribution-in-support target：candidate 的 probe answer 不在 full-rollout answer support 中时，权重置零或强降权。
+- 去掉 `teacher_anchor_score=0.5` 的硬 floor 做对照，只保留 source chunk injection + distribution guard，判断 anchor floor 是否在错误地保护局部坏 chunk。
+- 设计 answer-boundary-aware state selection，尽量在 reasoning/answer 边界附近截 state，而不是随机 mid boundary。
+- validation 侧需要减少超长样本 stdout，避免 metrics 后 DataLoader/Ray worker 清理阶段被 kill。
