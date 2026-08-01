@@ -4340,3 +4340,81 @@ step3:
 - 三步 `actor/powerflow_loss` 均非零，`zero_shard_ratio=0.000`，说明 reward alignment 修复没有破坏 balanced shard 逻辑。
 - 下一步必须重新跑 20-step validation gate。此前 anchored standard 20-step 的失败结论是在 reward/sample 错位条件下得到的，不能作为修复后版本的最终判断。
 - 方法设计继续遵守 TTRL 原文 arXiv 2504.16084 的拆分：同一 state 下多样本先做 label/distribution estimation，再做 reward/target calculation；短 probe hit-rate 只能作为局部 target 的证据之一，不能直接替代最终 answer label。
+
+## 2026-08-01 Boxfix Anchored Standard 20-Step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_anchor_boxfix20_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.chunk_state_score_mode=answer_value_margin
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_value_margin=0.125
+ttrl.chunk_state_value_topk=2
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=True
+ttrl.chunk_state_teacher_anchor_score=0.5
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+final validation：
+
+```text
+val-core/math/acc/mean@16 = 0.42675
+val-core/math/acc/maj@16/mean = 0.54592
+val-core/math/acc/best@16/mean = 0.845676
+val-aux/math/format_score/mean@16 = 0.892625
+val-aux/math/format_score/maj@16/mean = 0.86140
+timing_s/testing = 303.088
+diag_jsonl_rows = 640
+```
+
+训练侧摘要：
+
+```text
+step2+ avg chunk_state/kept_state_ratio = 0.447
+step2+ avg chunk_state/boxed_reward_weighted_mean = 0.511
+step2+ avg actor/powerflow_loss = 0.214
+step2+ zero_shard_ratio = 0.000 for all steps
+step2+ avg timing_s/gen = 24.417
+step2+ avg timing_s/chunk_state_score = 9.750
+step2+ avg timing_s/chunk_state_ref = 1.769
+step2+ avg timing_s/update_actor = 5.496
+```
+
+对比：
+
+```text
+target-only 20-step:             mean@16=0.427, maj@16=0.552, best@16=0.836, format_mean=0.888
+anchored standard 20-step:       mean@16=0.501, maj@16=0.624, best@16=0.858, format_mean=0.9045
+boxfix anchored standard 20-step: mean@16=0.42675, maj@16=0.54592, best@16=0.845676, format_mean=0.892625
+```
+
+观察到的退化样本：
+
+- validation generation 中出现多条重复 `\boxed{}` 的 prompt-copy / format-copy 输出。
+- 也出现一个回答把多个题目串在一起继续解的样本，说明局部 chunk update 仍在破坏 instruction / answer boundary。
+- `format_score` 仍有 0.893，但 `mean@16/maj@16` 很低，说明重复 boxed 可以通过部分格式检查但不带来正确性。
+
+结论：
+
+- Boxed reward alignment 修复是必要的工程修复：20 步中 actor 侧 reward 和 PowerFlow loss 都正常，`zero_shard_ratio=0.000`，不再是 actor batch 传递问题。
+- 但 boxfix 后 20-step validation 明确失败，甚至低于修复前 anchored standard。不能扩到 80-step。
+- 失败已经转化为方法语义问题：`teacher_anchor_score=0.5` 只把 source chunk 当成一个候选锚点，没有把 full-answer majority distribution 作为必须保持的 label distribution；局部 probe margin 可以奖励“看似有希望”的 chunk，但不能防止 repetition/prompt-copy。
+- 后续不应继续调这个配置的 infra。下一版必须改 target construction：
+  - 显式 full-answer distribution anchor：从 32 条 full rollout 估计 prompt-level answer distribution，然后 next-chunk target 只能在不偏离 anchor answer set 的条件下 sharpen。
+  - 增加 hard negative：重复 boxed、空 boxed、prompt-copy、多题串联、超长 boxed spam 的 chunk candidate 权重置零或给负 residual。
+  - 边界从随机 mid 改为 answer-prefix-aware / reasoning-boundary-aware，避免在题面或无语义位置做 chunk actor update。
+  - 继续保持 TTRL 原文 label estimation 与 reward calculation 拆分：先从 full rollout 和 chunk probe 估计 state label/distribution，再计算 PowerFlow target。
