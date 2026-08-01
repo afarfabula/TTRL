@@ -151,6 +151,14 @@ ttrl:
   chunk_state_future_support_baseline_scale: 1.0
   chunk_state_future_support_source_prior_weight: 2.0
   chunk_state_future_support_min_positive_margin: 0.0
+  # Optional state-level learnability gates for future_support_gain. Defaults
+  # are neutral. These filter states whose chunk probes do not land inside the
+  # full-rollout answer support often enough to define a reliable target.
+  chunk_state_future_support_min_state_coverage: 0.0
+  chunk_state_future_support_max_state_oov: 1.0
+  chunk_state_future_support_min_state_mean_mass: 0.0
+  chunk_state_future_support_min_state_max_mass: 0.0
+  chunk_state_future_support_min_state_top_margin: 0.0
   # Optional candidate-level quality gate for future_support_gain. It keeps the
   # target tied to prompt-level full-rollout answer support by dropping chunks
   # whose probes rarely land inside that support.

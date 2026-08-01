@@ -1671,6 +1671,33 @@ class RayPPOTrainer:
         answer_coverage = state_prompts.non_tensor_batch.get("chunk_state_answer_coverage", None)
         if answer_coverage is not None:
             answer_coverage = np.asarray(answer_coverage, dtype=np.float32)
+        future_support_keep = state_prompts.non_tensor_batch.get("chunk_state_future_support_keep", None)
+        if future_support_keep is not None:
+            future_support_keep = np.asarray(future_support_keep, dtype=np.float32)
+        future_support_learnable_keep = state_prompts.non_tensor_batch.get(
+            "chunk_state_future_support_learnable_keep",
+            None,
+        )
+        if future_support_learnable_keep is not None:
+            future_support_learnable_keep = np.asarray(future_support_learnable_keep, dtype=np.float32)
+        future_support_state_mean_mass = state_prompts.non_tensor_batch.get(
+            "chunk_state_future_support_state_mean_mass",
+            None,
+        )
+        if future_support_state_mean_mass is not None:
+            future_support_state_mean_mass = np.asarray(future_support_state_mean_mass, dtype=np.float32)
+        future_support_state_max_mass = state_prompts.non_tensor_batch.get(
+            "chunk_state_future_support_state_max_mass",
+            None,
+        )
+        if future_support_state_max_mass is not None:
+            future_support_state_max_mass = np.asarray(future_support_state_max_mass, dtype=np.float32)
+        future_support_state_top_margin = state_prompts.non_tensor_batch.get(
+            "chunk_state_future_support_state_top_margin",
+            None,
+        )
+        if future_support_state_top_margin is not None:
+            future_support_state_top_margin = np.asarray(future_support_state_top_margin, dtype=np.float32)
         source_answer_mass = state_prompts.non_tensor_batch.get("chunk_state_source_answer_mass", None)
         if source_answer_mass is not None:
             source_answer_mass = np.asarray(source_answer_mass, dtype=np.float32)
@@ -1719,6 +1746,29 @@ class RayPPOTrainer:
                     ),
                     "majority_ratio": float(majority_ratios[state_idx]) if majority_ratios is not None else None,
                     "answer_coverage": float(answer_coverage[state_idx]) if answer_coverage is not None else None,
+                    "future_support_keep": (
+                        float(future_support_keep[state_idx]) if future_support_keep is not None else None
+                    ),
+                    "future_support_learnable_keep": (
+                        float(future_support_learnable_keep[state_idx])
+                        if future_support_learnable_keep is not None
+                        else None
+                    ),
+                    "future_support_state_mean_mass": (
+                        float(future_support_state_mean_mass[state_idx])
+                        if future_support_state_mean_mass is not None
+                        else None
+                    ),
+                    "future_support_state_max_mass": (
+                        float(future_support_state_max_mass[state_idx])
+                        if future_support_state_max_mass is not None
+                        else None
+                    ),
+                    "future_support_state_top_margin": (
+                        float(future_support_state_top_margin[state_idx])
+                        if future_support_state_top_margin is not None
+                        else None
+                    ),
                     "probe_mean": float(state_scores.mean().item()),
                     "probe_max": float(state_scores.max().item()),
                     "probe_min": float(state_scores.min().item()),
@@ -2557,6 +2607,11 @@ class RayPPOTrainer:
         baseline_scale = float(cfg.get("chunk_state_future_support_baseline_scale", 1.0))
         source_prior_weight = float(cfg.get("chunk_state_future_support_source_prior_weight", 1.0))
         min_positive_margin = float(cfg.get("chunk_state_future_support_min_positive_margin", 0.0))
+        min_state_coverage = float(cfg.get("chunk_state_future_support_min_state_coverage", 0.0))
+        max_state_oov = float(cfg.get("chunk_state_future_support_max_state_oov", 1.0))
+        min_state_mean_mass = float(cfg.get("chunk_state_future_support_min_state_mean_mass", 0.0))
+        min_state_max_mass = float(cfg.get("chunk_state_future_support_min_state_max_mass", 0.0))
+        min_state_top_margin = float(cfg.get("chunk_state_future_support_min_state_top_margin", 0.0))
         min_candidate_coverage = float(cfg.get("chunk_state_future_support_min_candidate_coverage", 0.0))
         min_candidate_mean_mass = float(cfg.get("chunk_state_future_support_min_candidate_mean_mass", 0.0))
         source_prior_idx = int(cfg.get("chunk_state_source_chunk_candidate_index", 0))
@@ -2653,13 +2708,46 @@ class RayPPOTrainer:
         filtered_raw_gain = raw_gain.masked_fill(~candidate_quality_ok, float("-inf"))
         positive_margin = filtered_raw_gain.max(dim=-1).values
         positive_margin = torch.where(torch.isfinite(positive_margin), positive_margin, torch.zeros_like(positive_margin))
+        state_coverage_tensor = valid_tensor.mean(dim=(1, 2))
+        state_oov_tensor = 1.0 - state_coverage_tensor
+        state_mean_mass_tensor = mean_mass.mean(dim=-1)
+        state_max_mass_tensor = max_mass.max(dim=-1).values
+        sorted_state_scores = torch.sort(score_matrix, dim=-1, descending=True).values
+        if sorted_state_scores.shape[-1] > 1:
+            state_top_margin = sorted_state_scores[:, 0] - sorted_state_scores[:, 1]
+        else:
+            state_top_margin = sorted_state_scores[:, 0]
+        learnable_state_keep = torch.ones(len(state_prompts), dtype=torch.bool)
+        if min_state_coverage > 0.0:
+            learnable_state_keep &= state_coverage_tensor >= min_state_coverage
+        if max_state_oov < 1.0:
+            learnable_state_keep &= state_oov_tensor <= max_state_oov
+        if min_state_mean_mass > 0.0:
+            learnable_state_keep &= state_mean_mass_tensor >= min_state_mean_mass
+        if min_state_max_mass > 0.0:
+            learnable_state_keep &= state_max_mass_tensor >= min_state_max_mass
+        if min_state_top_margin > 0.0:
+            learnable_state_keep &= state_top_margin >= min_state_top_margin
         improved_state = (positive_margin > 0.0).float().detach().cpu().numpy().astype(np.float32)
-        future_state_keep = (positive_margin >= min_positive_margin).float().detach().cpu().numpy().astype(np.float32)
+        future_state_keep_tensor = (positive_margin >= min_positive_margin) & learnable_state_keep
+        future_state_keep = future_state_keep_tensor.float().detach().cpu().numpy().astype(np.float32)
 
         state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = prompt_top_mass_arr
         state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = support_coverage
         state_prompts.non_tensor_batch["chunk_state_future_support_positive_margin"] = (
             positive_margin.detach().cpu().numpy().astype(np.float32)
+        )
+        state_prompts.non_tensor_batch["chunk_state_future_support_state_mean_mass"] = (
+            state_mean_mass_tensor.detach().cpu().numpy().astype(np.float32)
+        )
+        state_prompts.non_tensor_batch["chunk_state_future_support_state_max_mass"] = (
+            state_max_mass_tensor.detach().cpu().numpy().astype(np.float32)
+        )
+        state_prompts.non_tensor_batch["chunk_state_future_support_state_top_margin"] = (
+            state_top_margin.detach().cpu().numpy().astype(np.float32)
+        )
+        state_prompts.non_tensor_batch["chunk_state_future_support_learnable_keep"] = (
+            learnable_state_keep.float().detach().cpu().numpy().astype(np.float32)
         )
         state_prompts.non_tensor_batch["chunk_state_future_support_keep"] = future_state_keep
         state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
@@ -2678,6 +2766,11 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,
             "chunk_state_future_support_gain/source_prior_weight": source_prior_weight,
             "chunk_state_future_support_gain/min_positive_margin": min_positive_margin,
+            "chunk_state_future_support_gain/min_state_coverage": min_state_coverage,
+            "chunk_state_future_support_gain/max_state_oov": max_state_oov,
+            "chunk_state_future_support_gain/min_state_mean_mass": min_state_mean_mass,
+            "chunk_state_future_support_gain/min_state_max_mass": min_state_max_mass,
+            "chunk_state_future_support_gain/min_state_top_margin": min_state_top_margin,
             "chunk_state_future_support_gain/min_candidate_coverage": min_candidate_coverage,
             "chunk_state_future_support_gain/min_candidate_mean_mass": min_candidate_mean_mass,
             "chunk_state_future_support_gain/source_mass_mean": float(source_mass_arr.mean())
@@ -2720,6 +2813,21 @@ class RayPPOTrainer:
             else 0.0,
             "chunk_state_future_support_gain/positive_margin_mean": positive_margin.mean().item()
             if len(positive_margin)
+            else 0.0,
+            "chunk_state_future_support_gain/state_oov_mean": state_oov_tensor.mean().item()
+            if len(state_oov_tensor)
+            else 0.0,
+            "chunk_state_future_support_gain/state_mean_mass_mean": state_mean_mass_tensor.mean().item()
+            if len(state_mean_mass_tensor)
+            else 0.0,
+            "chunk_state_future_support_gain/state_max_mass_mean": state_max_mass_tensor.mean().item()
+            if len(state_max_mass_tensor)
+            else 0.0,
+            "chunk_state_future_support_gain/state_top_margin_mean": state_top_margin.mean().item()
+            if len(state_top_margin)
+            else 0.0,
+            "chunk_state_future_support_gain/learnable_state_keep_ratio": learnable_state_keep.float().mean().item()
+            if len(learnable_state_keep)
             else 0.0,
             "chunk_state_future_support_gain/state_keep_ratio": float(future_state_keep.mean())
             if len(future_state_keep)
@@ -3316,13 +3424,19 @@ class RayPPOTrainer:
         powerflow_flat_weights = flat_weights * candidates
         shard_count = max(1, int(self.config.trainer.get("n_gpus_per_node", 1)) * int(self.config.trainer.get("nnodes", 1)))
         before_prune_samples = len(powerflow_flat_weights)
+        prune_padded_to_shards = 0
         if prune_zero_weight_samples and len(powerflow_flat_weights) > 0:
             nonzero_indices = torch.nonzero(powerflow_flat_weights > 0.0, as_tuple=False).flatten()
-            if len(nonzero_indices) >= shard_count:
-                remainder = len(nonzero_indices) % shard_count
-                if remainder:
-                    order = torch.argsort(powerflow_flat_weights[nonzero_indices], descending=True)
-                    nonzero_indices = nonzero_indices[order[: len(nonzero_indices) - remainder]]
+            if len(nonzero_indices) > 0:
+                if len(nonzero_indices) < shard_count:
+                    repeat_times = (shard_count + len(nonzero_indices) - 1) // len(nonzero_indices)
+                    nonzero_indices = nonzero_indices.repeat(repeat_times)[:shard_count]
+                    prune_padded_to_shards = 1
+                else:
+                    remainder = len(nonzero_indices) % shard_count
+                    if remainder:
+                        order = torch.argsort(powerflow_flat_weights[nonzero_indices], descending=True)
+                        nonzero_indices = nonzero_indices[order[: len(nonzero_indices) - remainder]]
                 kept_states = kept_states[nonzero_indices.tolist()]
                 responses = responses[nonzero_indices]
                 response_mask = response_mask[nonzero_indices]
@@ -3429,6 +3543,7 @@ class RayPPOTrainer:
             "chunk_state/label_consistent_only": float(label_consistent_only),
             "chunk_state/zero_inconsistent_candidates": float(zero_inconsistent_candidates),
             "chunk_state/prune_zero_weight_samples": float(prune_zero_weight_samples),
+            "chunk_state/prune_padded_to_shards": float(prune_padded_to_shards),
             "chunk_state/pruned_sample_ratio": (
                 1.0 - (float(len(powerflow_flat_weights)) / max(float(before_prune_samples), 1.0))
             ),

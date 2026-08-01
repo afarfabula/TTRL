@@ -5985,3 +5985,129 @@ boundary_mean = 790.4, min = 384, max = 1024
 - 但它没有解决 chunk target 的核心问题，反而明显削弱训练信号：`support_coverage_mean` 只有 0.25-0.41，`OOV` 高达 0.59-0.75，`num_actor_samples` 只有 8/8/16。actor update 变快主要是因为样本被裁掉了，不是有效 infra 提速。
 - 这说明“full rollout support 更强的 source”不等价于“中间 state 更可学习”。强筛 source 会偏向高置信完整轨迹，但这些 state 的 chunk continuation 仍然大量落在 full group support 之外，short probe 仍不足以构造稳定的 search-improved distribution。
 - 下一步不要继续加 source mass gate。更合理的方向是：先用 full group 建 prompt-level support，再对 state 本身做可学习性过滤，例如 future support coverage、candidate OOV/malformed、top answer mass margin、source continuation transport/KL improvement；同时考虑更长 horizon 或多阶段 probe，让 score 真正表示“靠近 full-rollout group 认为好的答案分布”的未来质量提升。
+
+## 2026-08-01 Future-Support-Gain State Learnability Gate 3-Step Smoke
+
+目的：
+
+- 直接验证 state 级可学习性过滤，而不是继续筛 source：如果一个 state 的 chunk probes 大量落不回 full-rollout answer support，或者 candidate 间 target 太平，就不进入 actor update。
+- 继续基于 `hardfilter + clip4`，只新增默认关闭的 state-level learnability gate。
+- 这轮只做 3-step smoke，不做 validation。
+
+代码改动：
+
+```text
+新增默认关闭配置：
+  ttrl.chunk_state_future_support_min_state_coverage: 0.0
+  ttrl.chunk_state_future_support_max_state_oov: 1.0
+  ttrl.chunk_state_future_support_min_state_mean_mass: 0.0
+  ttrl.chunk_state_future_support_min_state_max_mass: 0.0
+  ttrl.chunk_state_future_support_min_state_top_margin: 0.0
+
+future_support_gain 内新增 state 指标：
+  state_coverage = valid_probe_mass_ratio over candidates x probe_samples
+  state_oov = 1 - state_coverage
+  state_mean_mass = mean(candidate mean support mass)
+  state_max_mass = max(candidate max support mass)
+  state_top_margin = top1(score_matrix) - top2(score_matrix)
+
+future_support_keep = positive_margin_gate AND learnable_state_keep
+
+同时修复 prune 边界：
+  之前非零 actor samples 少于 shard_count=8 时不会 prune，导致 256 个几乎全零样本进入 ref/update。
+  修复后非零样本不足 8 时重复 top nonzero 补齐到 8 个样本，并记录 chunk_state/prune_padded_to_shards。
+```
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_gain_stategate_src3_mid_c128_probe4_b32_r32_v64_20260801.sh
+RUN_ID=ttrl_chunk_state_powerflow_future_support_gain_stategate_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_future_support_min_state_coverage=0.50
+ttrl.chunk_state_future_support_max_state_oov=0.50
+ttrl.chunk_state_future_support_min_state_mean_mass=0.10
+ttrl.chunk_state_future_support_min_state_max_mass=0.12
+ttrl.chunk_state_future_support_min_state_top_margin=0.02
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_future_support_gain_stategate_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_future_support_gain_stategate_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 关键指标：
+
+```text
+step1:
+  selected_original_acc_mean = 0.844
+  support_coverage_mean = 0.470
+  state_oov_mean = 0.530
+  state_mean_mass_mean = 0.175
+  state_max_mass_mean = 0.273
+  state_top_margin_mean = 0.002
+  learnable_state_keep_ratio = 0.031
+  num_actor_samples = 256
+  actor_batch_powerflow_weight_nonzero_ratio = 0.012
+  update_actor = 6.823s
+
+step2:
+  selected_original_acc_mean = 0.719
+  support_coverage_mean = 0.367
+  state_oov_mean = 0.633
+  state_mean_mass_mean = 0.125
+  state_max_mass_mean = 0.208
+  state_top_margin_mean = 0.022
+  learnable_state_keep_ratio = 0.094
+  num_actor_samples = 8
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 0.402s
+
+step3:
+  selected_original_acc_mean = 0.844
+  support_coverage_mean = 0.489
+  state_oov_mean = 0.511
+  state_mean_mass_mean = 0.199
+  state_max_mass_mean = 0.348
+  state_top_margin_mean = 0.008
+  learnable_state_keep_ratio = 0.031
+  num_actor_samples = 256
+  actor_batch_powerflow_weight_nonzero_ratio = 0.004
+  update_actor = 5.086s
+```
+
+diag jsonl 聚合：
+
+```text
+step1:
+  answer_coverage_mean = 0.470
+  future_support_keep_mean = 0.031
+  state_mean_mass = 0.175
+  state_max_mass = 0.273
+  state_top_margin = 0.0016
+
+step2:
+  answer_coverage_mean = 0.367
+  future_support_keep_mean = 0.094
+  state_mean_mass = 0.125
+  state_max_mass = 0.208
+  state_top_margin = 0.0221
+
+step3:
+  answer_coverage_mean = 0.489
+  future_support_keep_mean = 0.031
+  state_mean_mass = 0.199
+  state_max_mass = 0.348
+  state_top_margin = 0.0078
+```
+
+结论：
+
+- 这是一个负结果，不应扩 20 step。state gate 能筛出少量“看起来可学习”的 state，但比例只有 3%-9%，训练信号过稀疏。
+- `state_top_margin_mean` 在 step1/3 接近 0，说明即使 coverage/mass 看起来不差，candidate 间 target 仍然很平，PowerFlow 分布没有稳定的 search-improved direction。
+- step1/3 暴露出一个工程 bug：非零权重样本少于 8 卡时，旧 prune 逻辑不会裁剪，导致 256 个几乎全零样本进入 ref/update，`update_actor` 到 5-7s。已修复为非零样本不足 8 时重复 top nonzero 补齐到 8 个样本，并记录 `chunk_state/prune_padded_to_shards`。
+- 下一步不应继续用硬阈值筛 state。更有希望的方向是把 score 从 `mean_mass + max_mass_coef * max_mass - source_mass` 改成更直接的 transport / distribution distance improvement，例如 candidate probe answer distribution 到 prompt full-support distribution 的 KL/TV/Wasserstein-like improvement；或者把 probe horizon 加长，让 top margin 不再接近 0。
