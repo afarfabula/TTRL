@@ -2391,3 +2391,86 @@ step3: gen=24.123s chunk_state_probe=6.954s chunk_state_score=9.907s update_acto
 - `answer_coverage=0.657-0.758`，说明多数 completion 能抽到答案；但 `majority_ratio=0.242-0.343`，state-local majority 本身还不够尖锐，后续可能需要 confidence sharpening / majority margin gate。
 - 首步 `chunk_state_score=30.783s` 受 parser/JIT/冷启动影响，step2/3 降到 `12.337s/9.907s`，与旧 short-probe 版本接近；parser timeout 仍是 infra 优化重点。
 - 可以启动 20-step gate。通过标准：至少不能出现 short-probe 版那种 `mean@16~0.44` 崩坏；若 20-step 指标仍差，下一步加 majority confidence gate，而不是回退 source chunk teacher。
+
+## 2026-08-01 Majority-completion PowerFlow 20-step Gate
+
+论文依据：
+
+- 用户补充参考 arXiv 2504.16084。原文 TTRL 把 prompt `x` 视为 state，对同一 state 重复采样多个输出 `{y_i}`，用 majority voting 得到 consensus label `y*`，再按输出是否匹配 `y*` 构造 reward。
+- 本轮实现是该语义的 chunk-state 版本：把 state 从原始 prompt 扩展为 `query + prefix`，对同一 chunk state 采多个 next chunk，并对 `state + chunk` 的后续 completions 做 state-local majority label estimation。
+- actor update 仍使用 PowerFlow loss 做 distribution matching，不切 GRPO，不切 weighted NLL。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_majority_completion_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+TTRL_RUNTIME_DIR=/tmp/cmc20
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_majority_completion_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_majority_completion_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+worker=1024321, 8x NVIDIA B200
+```
+
+最终 validation：
+
+```text
+val-core/math/acc/mean@16=0.521125
+val-core/math/acc/maj@16/mean=0.662318
+val-core/math/acc/best@16/mean=0.872676
+val-aux/math/format_score/mean@16=0.904125
+val-aux/math/format_score/maj@16/mean=0.893140
+timing_s/testing=301.144
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.188
+chunk_state_source/prompt_original_pass=0.875
+chunk_state_source/prompt_original_mean=0.415
+chunk_state_majority_completion/majority_ratio_mean=0.301
+chunk_state_majority_completion/answer_coverage_mean=0.618
+chunk_state_majority_completion/raw_positive_ratio=0.301
+chunk_state_diag/state_all_positive_ratio=0.188
+chunk_state_diag/state_all_negative_ratio=0.094
+chunk_state_diag/state_mixed_ratio=0.719
+chunk_state/kept_state_ratio=0.906
+chunk_state/target_entropy=1.390
+actor/powerflow_loss=0.345
+actor/boxed_reward/mean=0.250
+actor/grad_norm=8.056
+timing_s/gen=21.999
+timing_s/chunk_state_probe=6.878
+timing_s/chunk_state_score=11.037
+timing_s/update_actor=8.708
+```
+
+step2-20 平均耗时/信号：
+
+```text
+timing_s/gen=23.626
+timing_s/chunk_state_probe=7.074
+timing_s/chunk_state_score=11.120
+timing_s/update_actor=8.639
+chunk_state_majority_completion/majority_ratio_mean=0.263
+chunk_state_diag/state_mixed_ratio=0.867
+chunk_state/kept_state_ratio=0.972
+```
+
+结论：
+
+- 20-step gate 完整跑完，训练和 final validation 均成功，无 NaN/Ray/FSDP 崩溃。
+- 相比 sourcechunk/no-anchor、skip-all-negative、voteinfo short-probe 三个失败版本，这版明显改善：`mean@16` 从 `0.390/0.401/0.4385` 提升到 `0.521125`，`maj@16` 从 `0.500/0.506/0.560` 提升到 `0.662318`。
+- 但它仍显著低于 MV/TTRL 20-step 对齐基线（`mean@16~0.76`、`maj@16~0.82`），不能扩到 80 step 当主结果。
+- 主要问题不是链路崩溃，而是 target 仍然不够可靠：step20 `majority_ratio_mean=0.301`、`answer_coverage_mean=0.618`，说明 state-local majority 可以提供信号，但多数标签不够尖锐；如果直接 PowerFlow 蒸馏，会把相当多低置信局部偏好也学进去。
+- 工程瓶颈仍集中在 full rollout、parser/scoring 和 actor update：稳态 `gen~23.6s`、`chunk_state_score~11.1s`、`chunk_state_probe~7.1s`、`update_actor~8.6s`。日志里大量 SymPy warning/timeout 和每步 parser subprocess shutdown，后续 80/160 step 前应做 parser cache / process pool 复用。
+
+下一步：
+
+- 不继续扩大当前 raw majority-completion 到 80 step。
+- 做 confidence-gated majority-completion：只训练 `majority_ratio`、`answer_coverage`、`score margin` 足够的 state；低置信 state 要么跳过，要么降低 PowerFlow weight。
+- 同时试 `chunk_size=128`，更贴近 chunked search / PowerFlow 的局部转移粒度，并降低 actor chunk response 长度。
+- 保持 PowerFlow loss 为主路径，GRPO 只作为后续 ablation。
