@@ -2288,3 +2288,58 @@ step3: gen=23.389s chunk_state_chunks=1.479s chunk_state_probe=7.097s chunk_stat
 结论：
 
 - 可以启动 20-step gate。通过标准仍然是 step20 `mean@16` 接近 MV baseline；如果继续大幅低于 baseline，下一步应增强 target reliability，而不是回退到 source chunk teacher。
+
+## 2026-08-01 Voteinfo PowerFlow 20-step Gate
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_voteinfo_probe4_b32_r32_v64_20step_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+raw_log=important_experiment_logs/ttrl_chunk_state_powerflow_voteinfo_probe4_b32_r32_v64_20step_20260801.log
+diag_jsonl=important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_voteinfo_probe4_b32_r32_v64_20step_20260801.jsonl
+diag_jsonl_rows=640
+worker=1024321, 8x NVIDIA B200
+```
+
+最终 validation：
+
+```text
+val-core/math/acc/mean@16=0.4385
+val-core/math/acc/maj@16/mean=0.560
+val-core/math/acc/best@16/mean=0.828
+val-aux/math/format_score/mean@16=0.894
+val-aux/math/format_score/maj@16/mean=0.869392
+timing_s/testing=296.079
+```
+
+step20 诊断：
+
+```text
+chunk_state_source/selected_original_acc_mean=0.125
+chunk_state_source/prompt_original_pass=0.906
+chunk_state_source/prompt_original_mean=0.362
+chunk_state_probe/raw_positive_ratio=0.143
+chunk_state_diag/state_all_positive_ratio=0.094
+chunk_state_diag/state_all_negative_ratio=0.719
+chunk_state_diag/state_mixed_ratio=0.188
+chunk_state/kept_state_ratio=0.281
+chunk_state/powerflow_weight_mean=0.281
+actor/powerflow_loss=0.252
+actor/grad_norm=14.964
+timing_s/gen=22.132
+timing_s/chunk_state_probe=6.560
+timing_s/chunk_state_score=12.434
+timing_s/update_actor=8.489
+timing_s/testing=296.079
+```
+
+结论：
+
+- 20-step gate 完整跑完，训练链路没有 Ray/FSDP/NaN 崩溃；此前 master shell 看不到进程是因为不在 worker namespace，worker `1024321` 内训练一直在跑。
+- 这版 `mean@16=0.4385`、`maj@16=0.560`，仍然远低于 MV/TTRL 20-step 对齐目标，不可作为有效方法。
+- 相比 sourcechunk + skip-negative 版本的 `mean@16=0.401` 有小幅改善，但幅度太小；说明取消 hard source teacher 是对的，但仅靠 `K=8` next chunk + `probe_samples=4` 的 short probe 仍然不能构造可靠 target。
+- step20 `state_all_negative_ratio=0.719`、`kept_state_ratio=0.281`，有效 chunk states 太少；同时 `raw_positive_ratio=0.143`，probe 分布非常稀疏。PowerFlow loss 被正确启用，但大部分 update 信号来自少量高噪声局部转移。
+- 下一轮不应继续扩大这种 short-probe gate 到 80 step。需要把 chunk target 改成更接近 TTRL 原文 2504.16084 的同 state 多输出 label estimation：对 `query + prefix` state 采多个 next chunk 后，继续 rollout 到完整答案，用 state-level answer majority / consistency 给 next chunk 分配 search-improved weight，而不是直接用短 probe 的稀疏正确率。
