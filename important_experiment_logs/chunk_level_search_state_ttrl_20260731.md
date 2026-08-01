@@ -4678,3 +4678,123 @@ diag_jsonl_rows = 96
 - `boxed_reward_weighted_mean` 升到约 0.65，说明 distribution score 正在把权重集中到 full-answer support 内的 candidate。
 - 风险是 actor loss/grad norm 明显高于 guard20：`actor/powerflow_loss` 到 1.5-1.6，`grad_norm` 到 32-52。20-step gate 必须观察是否过强更新导致 mean/maj 继续塌。
 - 该 smoke 没有 final validation，不能判断效果；下一步先跑显式 source-chunk-injection 的 20-step gate，并必须以 step20 mean/maj 为硬判据。
+
+## 2026-08-01 Source-Chunk + Support Target 20-Step Gate
+
+背景：
+
+- 前一次 `support3` smoke 实际是 support-only target，因为 launcher wrapper 最后覆盖了 `ttrl.chunk_state_source_chunk_enable=False`。
+- 本次重新确认 Hydra final config 后运行，确保 `ttrl.chunk_state_source_chunk_enable=True`，并在 20 step 做 final validation。
+- 用户补充的 arXiv 2504.16084 实际是 TTRL 原文。对当前 chunk 方案的约束是：reward / target 仍应来自 full rollout group 的无标签分布估计，probe 只能作为局部 evidence，不能让任意 probe answer 直接主导 actor target。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support_src20b_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+TTRL_RUNTIME_DIR=/tmp/cssrc20b
+OUTPUT_DIR=/tmp/ttrl_b200/checkpoints/ttrl_chunk_state_powerflow_support_src20b_mid_c128_probe4_b32_r32_v64_20260801
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+actor_rollout_ref.rollout.val_kwargs.n=16
+actor_rollout_ref.actor.use_dynamic_bsz=False
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=True
+actor_rollout_ref.actor.powerflow_use_chunk_weights=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=standard
+ttrl.chunk_state_enable=True
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_probe_max_tokens=1024
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_max_boxed_count=2
+ttrl.chunk_state_target_guard_bad_probe_ratio=0.5
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_anchor=True
+ttrl.chunk_state_target_guard_use_distribution_score=True
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_src20b_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_src20b_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 640
+```
+
+最终 validation：
+
+```text
+val-core/math/acc/mean@16 = 0.410
+val-core/math/acc/maj@16  = 0.523
+val-core/math/acc/best@16 = 0.833
+val-aux/math/format_score/mean@16 = 0.888
+val-aux/math/format_score/maj@16  = 0.855
+timing_s/testing = 301.386s
+```
+
+训练 timing，统计 step2-step20：
+
+```text
+timing_s/gen avg = 23.990s, min = 21.540s, max = 32.348s
+timing_s/chunk_state_probe avg = 6.690s, min = 6.269s, max = 7.168s
+timing_s/chunk_state_score avg = 11.913s, min = 9.288s, max = 16.524s
+timing_s/chunk_state_ref avg = 1.745s, min = 1.548s, max = 1.953s
+timing_s/update_actor avg = 5.331s, min = 4.692s, max = 5.909s
+chunk_state_source_chunk/mean_len avg = 123.791 tokens
+```
+
+target / diagnostic 统计：
+
+```text
+chunk_state_source_chunk/injected_ratio = 1.000 throughout
+chunk_state_target_guard/kept_candidate_ratio avg = 0.393
+chunk_state_target_guard/distribution_oov_probe_ratio avg = 0.543
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio avg = 0.383
+chunk_state/positive_ratio avg = 0.087
+chunk_state/informative_ratio avg = 0.559
+chunk_state/target_entropy avg = 1.316
+
+diag source_original_correct avg = 0.720
+diag source_majority_consistent avg = 1.000
+diag answer_coverage avg = 0.734
+diag probe_mean avg = 0.192
+diag probe_max avg = 0.390
+diag all_negative_ratio = 0.397
+diag mixed_ratio = 0.481
+diag boundary avg = 546.6 tokens
+diag source_response_len avg = 1269.7 tokens
+```
+
+异常与观察：
+
+- Run 正常打印 step20 和 final validation metrics，worker shell 正常退出。
+- Validation stdout 中出现多条明显退化样本，典型是大量重复 `\boxed{}` 或重复 assistant solution，说明训练后主分布出现格式/重复退化。这个现象与 `format_score/mean@16=0.888` 一致，低于理想 gate。
+- 训练时 source chunk 注入稳定生效，actor span 长度约 124 tokens，actor update 约 5.3s，证明 chunk actor update 本身不慢。
+- 端到端 step 仍约 60s 量级，主要来自 full rollout generation、chunk probe、SymPy/answer scoring，而不是 actor update。
+- target 仍然偏稀疏：guard 后候选保留率约 39%，actor 非零 PowerFlow 权重约 38%，probe answer OOV 约 54%。这说明当前 chunk candidate/probe 很多没有落在 full-rollout answer support 上。
+
+结论：
+
+- 这是失败 gate：`mean@16=0.410`、`maj@16=0.523` 明显低于 MV / PowerFlow baseline，不能扩到 80 step。
+- Source chunk injection 没有解决 full-answer target 与局部 next-chunk target 的错配；它只是让 actor 更新在真实 source chunk 上发生。
+- 失败形态不是 actor update 不够强，而是 target 语义有毒：局部 chunk 训练把模型推向重复 boxed / 格式退化，同时只有少量 candidate 有有效 support mass。
+- 2504.16084/TTRL 语义要求 target 来自 group-level distribution estimation。下一版不能再让 probe raw correctness 直接决定局部 target，必须把 chunk candidate 的价值绑定到 full rollout answer support / answer distribution improvement 上。
+
+下一步设计：
+
+- 停止继续扩展 `support_src20b`。
+- 保留 PowerFlow loss，但重做 target construction：
+  - 先采样 32 条 full rollout，得到 prompt-level answer support、majority answer、answer mass 和 format/duplicate 统计。
+  - 对每个 chunk state 采 next-chunk candidate 后，不直接用 probe raw score；先把 probe completion 映射回 full-answer support，计算 support mass gain / majority-answer mass gain。
+  - 对 OOV、empty、repeated boxed、prompt-copy candidate 做强惩罚或置零；对 in-support 且提升 answer mass 的 candidate 才构造 PowerFlow sharpened target。
+  - 增加 anti-repetition target guard：候选 chunk 内重复 `\boxed{}` 或 assistant marker 时直接 zero，不只看最终 probe。
+  - 优先选择 reasoning 中后段 boundary，减少 boundary=0 或过早 state；这更接近 chunk-level search-state improvement，而不是从 prompt 开头制造局部捷径。
+- 先做 3-step smoke 验证 target nonzero ratio、OOV ratio、重复 boxed 率，再跑 20-step gate；硬门槛仍是 step20 `mean@16` 不低于 MV 20-step 对齐线。
