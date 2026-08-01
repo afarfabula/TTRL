@@ -2441,6 +2441,20 @@ class RayPPOTrainer:
             "prompt_mass": prompt_mass,
         }
 
+    def _chunk_state_candidate_guard_flags(self, chunk_str: str) -> dict:
+        cfg = self.config.ttrl
+        max_boxed = int(cfg.get("chunk_state_target_guard_candidate_max_boxed_count", 1))
+        repeated_boxed = max_boxed >= 0 and chunk_str.count("\\boxed") > max_boxed
+        assistant_marker = bool(cfg.get("chunk_state_target_guard_candidate_assistant_marker", True)) and bool(
+            re.search(r"\\b(assistant|user|system)\\b\\s*[:：]", chunk_str, re.IGNORECASE)
+        )
+        prompt_copy = bool(re.search(r"(problem|question)\\s*[:：]", chunk_str, re.IGNORECASE))
+        return {
+            "candidate_repeated_boxed": repeated_boxed,
+            "candidate_assistant_marker": assistant_marker,
+            "candidate_prompt_copy": prompt_copy,
+        }
+
     def _apply_chunk_state_target_guard(
         self,
         state_prompts: DataProto,
@@ -2482,6 +2496,35 @@ class RayPPOTrainer:
         max_candidate_score = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
         flag_counts = Counter()
         scored_probes = 0
+        candidate_guard_enable = bool(cfg.get("chunk_state_target_guard_candidate_enable", False))
+        use_mass_gain = bool(cfg.get("chunk_state_target_guard_use_mass_gain", False))
+        source_answer_mass = torch.as_tensor(
+            np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_answer_mass",
+                    np.zeros(len(state_prompts), dtype=np.float32),
+                ),
+                dtype=np.float32,
+            ),
+            dtype=torch.float32,
+        )
+        candidate_invalid = torch.zeros((len(state_prompts), candidates), dtype=torch.bool)
+        candidate_prompt_mass = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
+        if candidate_guard_enable:
+            for chunk_idx in range(len(chunk_output)):
+                state_idx = chunk_idx // candidates
+                candidate_idx = chunk_idx % candidates
+                chunk_len = int(chunk_mask[chunk_idx].sum().item())
+                chunk_str = self.tokenizer.decode(
+                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                    skip_special_tokens=True,
+                )
+                flags = self._chunk_state_candidate_guard_flags(chunk_str)
+                for key, value in flags.items():
+                    if value:
+                        flag_counts[key] += 1
+                if any(flags.values()):
+                    candidate_invalid[state_idx, candidate_idx] = True
         anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))
         guard_anchor = bool(cfg.get("chunk_state_target_guard_anchor", True))
         bad_probe_ratio_threshold = float(cfg.get("chunk_state_target_guard_bad_probe_ratio", 0.5))
@@ -2513,13 +2556,20 @@ class RayPPOTrainer:
             invalid = any(value for key, value in flags.items() if key != "prompt_mass")
             if invalid:
                 bad_probe_counts[state_idx, candidate_idx] += 1.0
+            candidate_prompt_mass[state_idx, candidate_idx] = torch.maximum(
+                candidate_prompt_mass[state_idx, candidate_idx],
+                torch.tensor(float(flags["prompt_mass"]), dtype=candidate_prompt_mass.dtype),
+            )
+            distribution_score = float(flags["prompt_mass"])
+            if use_mass_gain:
+                distribution_score = max(0.0, distribution_score - float(source_answer_mass[state_idx].item()))
             max_candidate_score[state_idx, candidate_idx] = torch.maximum(
                 max_candidate_score[state_idx, candidate_idx],
-                torch.tensor(float(flags["prompt_mass"]), dtype=max_candidate_score.dtype),
+                torch.tensor(distribution_score, dtype=max_candidate_score.dtype),
             )
 
         bad_probe_ratio = bad_probe_counts / max(probe_samples, 1)
-        guard_ok = bad_probe_ratio < bad_probe_ratio_threshold
+        guard_ok = (bad_probe_ratio < bad_probe_ratio_threshold) & (~candidate_invalid)
         if not guard_anchor and 0 <= anchor_idx < candidates:
             guard_ok[:, anchor_idx] = True
         guarded_score_matrix = score_matrix * guard_ok.to(dtype=score_matrix.dtype)
@@ -2537,6 +2587,12 @@ class RayPPOTrainer:
             "chunk_state_target_guard/score_mean_before": score_matrix.mean().item(),
             "chunk_state_target_guard/score_mean_after": guarded_score_matrix.mean().item(),
             "chunk_state_target_guard/prompt_mass_mean": max_candidate_score.mean().item(),
+            "chunk_state_target_guard/raw_prompt_mass_mean": candidate_prompt_mass.mean().item(),
+            "chunk_state_target_guard/source_answer_mass_mean": source_answer_mass.mean().item()
+            if len(source_answer_mass)
+            else 0.0,
+            "chunk_state_target_guard/use_mass_gain": float(use_mass_gain),
+            "chunk_state_target_guard/candidate_guard_enable": float(candidate_guard_enable),
             "chunk_state_target_guard/anchor_guarded": float(guard_anchor),
             "chunk_state_target_guard/bad_probe_ratio_mean": bad_probe_ratio.mean().item(),
             "chunk_state_target_guard/bad_probe_ratio_threshold": bad_probe_ratio_threshold,
@@ -2548,8 +2604,12 @@ class RayPPOTrainer:
             "prompt_copy",
             "multi_problem",
             "distribution_oov",
+            "candidate_repeated_boxed",
+            "candidate_assistant_marker",
+            "candidate_prompt_copy",
         ]:
-            metrics[f"chunk_state_target_guard/{key}_probe_ratio"] = flag_counts[key] / max(scored_probes, 1)
+            denom = max(len(chunk_output), 1) if key.startswith("candidate_") else max(scored_probes, 1)
+            metrics[f"chunk_state_target_guard/{key}_probe_ratio"] = flag_counts[key] / denom
         metrics["chunk_state_target_guard/zeroed_candidates"] = float((~guard_ok).sum().item())
         metrics["chunk_state_target_guard/candidates"] = float(candidate_count)
         return guarded_score_matrix.reshape(-1), metrics

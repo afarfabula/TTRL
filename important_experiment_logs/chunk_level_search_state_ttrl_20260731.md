@@ -4798,3 +4798,85 @@ diag source_response_len avg = 1269.7 tokens
   - 增加 anti-repetition target guard：候选 chunk 内重复 `\boxed{}` 或 assistant marker 时直接 zero，不只看最终 probe。
   - 优先选择 reasoning 中后段 boundary，减少 boundary=0 或过早 state；这更接近 chunk-level search-state improvement，而不是从 prompt 开头制造局部捷径。
 - 先做 3-step smoke 验证 target nonzero ratio、OOV ratio、重复 boxed 率，再跑 20-step gate；硬门槛仍是 step20 `mean@16` 不低于 MV 20-step 对齐线。
+
+## 2026-08-01 Mass-Gain + Candidate Guard 3-Step Smoke
+
+目的：
+
+- 接上 `support_src20b` 的失败结论，先不扩 80 step。
+- 增加两个默认关闭的 target 修正：
+  - candidate-level anti-repetition guard：单独检查 next chunk 自身，提前拦截重复 `\boxed{}`、assistant/user/system marker、prompt-copy。
+  - full-answer mass gain：distribution score 从 raw prompt answer mass 改成 `max(0, candidate_answer_mass - source_answer_mass)`，让 target 只奖励相对 source full answer 更高的 answer support。
+- 保持 PowerFlow loss、source chunk injection、batch32/rollout32、dynamic batch off。
+
+运行：
+
+```text
+RUN_ID=ttrl_chunk_state_powerflow_support_massgain_src3_mid_c128_probe4_b32_r32_v64_20260801
+TOTAL_TRAINING_STEPS=3
+FINAL_VAL_ENABLE=False
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_teacher_anchor_enable=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_min_answer_mass=0.03125
+ttrl.chunk_state_target_guard_use_distribution_score=True
+ttrl.chunk_state_target_guard_use_mass_gain=True
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_target_guard_candidate_max_boxed_count=1
+ttrl.chunk_state_target_guard_candidate_assistant_marker=True
+```
+
+产物：
+
+```text
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_massgain_src3_mid_c128_probe4_b32_r32_v64_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_massgain_src3_mid_c128_probe4_b32_r32_v64_20260801.jsonl
+diag_jsonl_rows = 96
+```
+
+3 step 平均：
+
+```text
+kept_candidate_ratio = 0.405
+score_mean_before = 0.082
+score_mean_after = 0.074
+prompt_mass_mean_after_mass_gain = 0.000
+raw_prompt_mass_mean = 0.224
+source_answer_mass_mean = 0.377
+distribution_oov_probe_ratio = 0.541
+candidate_repeated_boxed_ratio = 0.009
+actor_batch_powerflow_weight_nonzero_ratio = 0.406
+positive_ratio = 0.074
+informative_ratio = 0.531
+target_entropy = 1.380
+boxed_reward_weighted_mean = 0.546
+actor/powerflow_loss = 0.098
+actor/grad_norm = 6.626
+timing_s/update_actor = 5.690s
+```
+
+诊断：
+
+```text
+diag source_original_correct = 0.781
+diag source_majority_consistent = 1.000
+diag answer_coverage = 0.731
+diag probe_mean = 0.0745
+diag probe_max = 0.319
+diag all_negative_ratio = 0.469
+diag mixed_ratio = 0.458
+```
+
+结论：
+
+- 工程链路通过：新开关真实生效，3 step 正常结束，final validation 按预期跳过。
+- Candidate-level guard 有信号但占比不大：candidate 自身重复 boxed 约 0.9%。它适合作为低风险防退化 guard 保留。
+- Mass-gain 过严：`raw_prompt_mass_mean=0.224`，但减去 source answer mass 后 `prompt_mass_mean_after_mass_gain=0.000`，说明当前 source chunk 已经来自多数一致轨迹，candidate probe 很少超过 source answer mass。
+- 这版不能扩 20 step。它会把 distribution support signal 全部清掉，剩下主要是原始 `answer_value_margin` score，无法解决 `support_src20b` 的语义问题。
+
+下一步：
+
+- 保留 candidate anti-repetition guard。
+- 关闭 `chunk_state_target_guard_use_mass_gain`，回到 raw full-answer support mass 作为 distribution score。
+- 另做一个 3-step smoke：`source_chunk + support target + candidate anti-repetition`，看是否在不清零 distribution score 的情况下改善重复 boxed 风险。
+- 如果 smoke 健康，再跑 20-step gate；硬门槛仍是 step20 `mean@16` 不能低于 MV 20-step 两点以上。

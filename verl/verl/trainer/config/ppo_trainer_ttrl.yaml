@@ -104,6 +104,16 @@ ttrl:
   chunk_state_target_guard_min_answer_mass: 0.0
   chunk_state_target_guard_anchor: true
   chunk_state_target_guard_use_distribution_score: false
+  # Candidate-level guard checks the next chunk itself before probe completion.
+  # This catches local degeneration such as repeated boxed markers before it can
+  # be rescued by a later probe answer.
+  chunk_state_target_guard_candidate_enable: false
+  chunk_state_target_guard_candidate_max_boxed_count: 1
+  chunk_state_target_guard_candidate_assistant_marker: true
+  # If enabled, use max(0, candidate_answer_mass - source_answer_mass) as the
+  # distribution score. This keeps target construction tied to full-rollout
+  # answer support and rewards local transitions that improve answer mass.
+  chunk_state_target_guard_use_mass_gain: false
   # If enabled, inject the source rollout's original next chunk into one
   # candidate slot, but keep the normal probe-based PowerFlow soft target. This
   # is different from teacher_anchor: it does not force a score floor.
