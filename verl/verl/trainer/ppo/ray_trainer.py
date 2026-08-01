@@ -2754,6 +2754,11 @@ class RayPPOTrainer:
             score_matrix = transport_affinity.clamp(min=0.0, max=1.0)
         elif score_type == "transport_positive_gain":
             score_matrix = transport_gain.clamp(min=0.0, max=1.0)
+        elif score_type == "transport_support_gain":
+            score_matrix = (transport_gain.clamp(min=0.0, max=1.0) * transport_affinity).clamp(
+                min=0.0,
+                max=1.0,
+            )
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_future_support_score_type={score_type!r}")
         pre_filter_score_matrix = score_matrix.clone()
@@ -2789,7 +2794,7 @@ class RayPPOTrainer:
         if score_type in {"tv_positive_gain", "relative_tv_positive_gain"}:
             filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
             positive_margin = filtered_score_gain.max(dim=-1).values
-        if score_type in {"transport_affinity", "transport_positive_gain"}:
+        if score_type in {"transport_affinity", "transport_positive_gain", "transport_support_gain"}:
             filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
             positive_margin = filtered_score_gain.max(dim=-1).values
         positive_margin = torch.where(torch.isfinite(positive_margin), positive_margin, torch.zeros_like(positive_margin))
@@ -2856,6 +2861,9 @@ class RayPPOTrainer:
             ),
             "chunk_state_future_support_gain/score_type_transport_positive_gain": float(
                 score_type == "transport_positive_gain"
+            ),
+            "chunk_state_future_support_gain/score_type_transport_support_gain": float(
+                score_type == "transport_support_gain"
             ),
             "chunk_state_future_support_gain/gain_slack": gain_slack,
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,

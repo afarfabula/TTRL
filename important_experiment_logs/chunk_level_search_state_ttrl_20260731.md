@@ -7049,3 +7049,116 @@ state_mixed_ratio = 0.375
 - 这支持当前核心判断：最该放弃的是“局部短视可判定性”约束，而不是 PowerFlow loss、hardfilter/clip4 或 full-group label-estimation 原则。继续让 chunk target 主要由 short-horizon local answer hit / source consistency / 局部 probe 命中来定义，会把 noisy local-answer reward 当成 search-improvement target。
 - 下一步目标应改为 full-rollout group 主导 target：先由完整 32/64 rollout 定义 prompt-level support、majority/pass/coverage/value；state 优先来自高 coverage、高 top-mass margin、majority-consistent 的中后段；candidate score 计算为对该 full support 的 future distribution transport improvement。source chunk 只保留为 prior / drift guard，不再作为主要 teacher 或 hard floor。
 - 在 target 质量没有改善前，不扩这个 longctx transport 配置到 20 step。
+
+## 2026-08-01 Transport Support Gain + Full-Support Gate 设计
+
+背景：
+
+- `transport_affinity` 的真实 3k long-horizon probe 证明：单纯拉长 probe 不能解决 target 质量。`support_coverage_mean=0.479`、`candidate_oov_tv_mean=0.738`、`transport_gain_mean=-0.159` 说明 candidate future distribution 仍没有比 source baseline 更靠近 full-rollout support。
+- 因此下一步不再强化“局部 probe 命中 / source consistency / 局部短视可判定性”，而是把 full-rollout group support/value 作为主目标，低信息 state 直接跳过。
+
+实现改动：
+
+```text
+score_type = transport_support_gain
+score = relu(source_oov_tv - candidate_oov_tv) * (1 - candidate_oov_tv)
+```
+
+含义：
+
+- `source_oov_tv - candidate_oov_tv` 要求 candidate future distribution 相对 source baseline 对 full support 有净 transport improvement。
+- `(1 - candidate_oov_tv)` 是 absolute support affinity，避免“只是比很差的 source 稍好一点、但仍然离 full support 很远”的候选被当成强 teacher。
+- source chunk 继续只作为 prior / drift guard：`source_prior_weight=1.05`，不做 hard score floor。
+
+smoke 配置：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_future_support_transport_support_gain_gate_c128_probe4_b32_r32_v64_1step_20260801.sh
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+max_model_len = 4096
+score_type = transport_support_gain
+min_state_coverage = 0.50
+max_state_oov = 0.50
+min_state_top_margin = 0.02
+min_candidate_coverage = 0.25
+min_candidate_mean_mass = 0.02
+dynamic_bsz = False
+final_validation = skipped
+```
+
+Gate：
+
+- 这是 target 质量 smoke，不看最终 acc。
+- 通过标准不是 actor samples 越多越好，而是 retained state/candidate 的质量要明显高于 longctx affinity：`candidate_oov_tv_mean` 下降，`transport_gain_mean` 不再显著为负，`score_mean` 非零但不过密，`state_keep_ratio` 不能因 gate 全灭。
+- 如果 `num_actor_samples` 接近 0 或 `state_keep_ratio` 过低，说明 full-support gate 太硬，但方向仍是 target 估计问题，不回退到局部短 probe teacher。
+
+结果：
+
+```text
+run = ttrl_chunk_state_powerflow_future_support_transport_support_gain_gate_c128_probe4_b32_r32_v64_1step_20260801
+model = /models/Qwen2.5-Math-7B
+data = MATH-TTT
+batch = 32 prompts x 32 rollout
+votes = 64
+probe_samples = 4
+probe_max_tokens = 3072
+max_model_len = 4096
+score_type = transport_support_gain
+dynamic_bsz = False
+final_validation = skipped
+
+support_coverage_mean = 0.479
+candidate_coverage_mean = 0.479
+candidate_quality_keep_ratio = 0.645
+state_oov_mean = 0.521
+candidate_oov_tv_mean = 0.738
+source_oov_tv_mean = 0.579
+transport_affinity_mean = 0.262
+transport_gain_mean = -0.159
+score_mean_before_candidate_filter = 0.003
+score_mean = 0.003
+label_consistent_ratio = 0.082
+state_top_margin_mean = 0.012
+learnable_state_keep_ratio = 0.156
+state_keep_ratio = 0.156
+num_actor_samples = 8
+pruned_sample_ratio = 0.969
+target_entropy = 1.446
+powerflow_weight_max = 1.383
+grad_norm = 8.922
+
+timing_s/gen = 43.631
+timing_s/chunk_state_chunks = 1.055
+timing_s/chunk_state_probe = 17.178
+timing_s/chunk_state_score = 11.356
+timing_s/chunk_state_ref = 3.885
+timing_s/update_actor = 0.722
+```
+
+diag 聚合：
+
+```text
+jsonl_rows = 32
+answer_coverage mean = 0.479, min = 0.000, max = 0.969
+probe_mean mean = 0.003, min = 0.000, max = 0.022
+probe_max mean = 0.016, min = 0.000, max = 0.138
+source_answer_mass mean = 0.421, min = 0.048, max = 0.808
+source_original_correct mean = 0.844
+future_support_keep mean = 0.156
+future_support_state_top_margin mean = 0.012
+state_all_positive_ratio = 0.000
+state_all_negative_ratio = 0.625
+state_mixed_ratio = 0.375
+```
+
+结论：
+
+- 工程通过，配置确认为 `transport_support_gain`，full-support state/candidate gate 生效，8x B200 训练链路正常。
+- 方法 gate 没过。`score_mean=0.003`、`label_consistent_ratio=0.082`、`state_keep_ratio=0.156`、`num_actor_samples=8`，说明“必须相对 source baseline 有正 transport gain”在当前 candidate/probe 分布下过于稀疏。
+- 这轮不是简单 gate 太硬：核心信号仍是 `candidate_oov_tv_mean=0.738`、`transport_gain_mean=-0.159`，与 longctx affinity 一致，说明候选未来分布整体没有走向 full support。hard positive-gain 只会把 actor update 压到 0.7s，但训练信号几乎全灭。
+- 下一步不应回到 short-horizon local teacher，也不应继续强化 source hard constraint。更合理的是 `full-support gated soft affinity`：先用 state-level full-support coverage/top-mass/margin 过滤低信息 state；保留 candidate 的 absolute support affinity 作为 soft distribution；但不要强制 positive transport gain。目标是先得到非稀疏、由 full support 主导、且 OOV 可控的 target，再考虑 20-step。
