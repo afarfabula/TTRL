@@ -6535,3 +6535,90 @@ step 2:
 - 成本明显变重。N64 的 generate / verifier / score 都更贵，actor samples 只有 48 / 40，update_actor 约 9-10s；这不是值得扩展到 20-step 的方向。
 - 方法判断：主矛盾不是 full support N 太小，也不是 actor update 太慢，而是“局部短视可判定性”这个约束本身。后续不再要求 chunk target 主要由 short-horizon probe 的局部 answer hit、source consistency 或几条短 probe 的偶然命中定义。
 - 下一版应改成：full rollout group 先定义 prompt-level support / majority / pass / coverage / value；chunk candidate 只学习哪个 local transition 会把 future completion distribution 推向这个 support。source chunk 只作为 prior / drift guard，不作为主要 teacher；probe 只能作为长程分布估计的一部分或诊断信号，不能单独决定 target。
+
+## 2026-08-01 support_flow gain smoke
+
+目的：
+
+- 按新的方法约束，彻底跳过 short-horizon probe teacher；chunk target 不再由局部 answer hit 或 source consistency 定义。
+- 复用 full rollout group 的 answer support，把同 prompt 的 full-support next chunk 作为候选；source chunk 只作为 prior / drift guard。
+- 先用 2-step smoke 验证 TTRL 内 PowerFlow actor path、`support_flow` score path、8xB200 infra 是否能跑通。
+
+运行：
+
+```text
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_support_flow_gain_mid_c128_b32_r32_v64_2step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_gain_mid_c128_b32_r32_v64_2step_20260801.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_gain_mid_c128_b32_r32_v64_2step_20260801.jsonl
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+data.train_batch_size = 32
+ttrl.n_votes_per_prompt = 64
+actor_rollout_ref.rollout.n = 32
+trainer.total_training_steps = 2
+trainer.final_val_enable = False
+ttrl.chunk_state_score_mode = support_flow
+ttrl.chunk_state_support_flow_score_type = gain
+ttrl.chunk_state_support_flow_gain_slack = 0.03125
+ttrl.chunk_state_support_flow_baseline_scale = 1.0
+ttrl.chunk_state_support_flow_source_prior_weight = 1.0
+ttrl.chunk_state_chunk_size = 128
+ttrl.chunk_state_candidates = 8
+ttrl.chunk_state_support_anchor_count = 4
+ttrl.chunk_state_label_consistent_only = True
+ttrl.chunk_state_zero_inconsistent_candidates = True
+ttrl.chunk_state_prune_zero_weight_samples = True
+ttrl.chunk_state_powerflow_weight_clip = 4.0
+actor_rollout_ref.actor.powerflow_enable = True
+actor_rollout_ref.actor.use_kl_loss = False
+actor_rollout_ref.actor.use_dynamic_bsz = False
+```
+
+结果：
+
+```text
+step 1:
+  prompt_original_mean = 0.354
+  prompt_original_pass = 0.906
+  source_answer_mass_mean = 0.472
+  anchor_mass_mean = 0.144
+  positive_margin_mean = -0.104
+  support_flow_score_mean = 0.007
+  support_flow_score_max_mean = 0.021
+  raw_positive_ratio = 0.007
+  label_consistent_ratio = 0.238
+  answer_coverage_mean = 0.492
+  num_actor_samples = 56
+  target_entropy = 1.329
+  gen = 39.576s
+  chunk_state_chunks = 1.154s
+  chunk_state_score = 4.526s
+  chunk_state_ref = 4.672s
+  update_actor = 2.364s
+
+step 2:
+  prompt_original_mean = 0.301
+  prompt_original_pass = 0.812
+  source_answer_mass_mean = 0.446
+  anchor_mass_mean = 0.148
+  positive_margin_mean = -0.078
+  support_flow_score_mean = 0.008
+  support_flow_score_max_mean = 0.021
+  raw_positive_ratio = 0.008
+  label_consistent_ratio = 0.258
+  answer_coverage_mean = 0.492
+  num_actor_samples = 64
+  target_entropy = 1.412
+  gen = 10.520s
+  chunk_state_chunks = 1.013s
+  chunk_state_score = 4.510s
+  chunk_state_ref = 0.922s
+  update_actor = 2.245s
+```
+
+结论：
+
+- 工程正结果：`support_flow` 成功绕开 short probe，日志中 `chunk_state_probe/skipped_for_support_flow=1`；PowerFlow actor path 正常，`ref_log_prob` 缺失问题已通过开启 `powerflow_enable` 并关闭 `use_kl_loss` 修掉。
+- infra 正结果：chunk actor span 约 117-119 tokens，`update_actor` 只有 2.2-2.4s；这再次说明短 chunk actor update 不是当前主瓶颈。
+- 方法负结果：`gain = anchor_mass - source_mass + slack` 太保守。source answer mass 约 0.45-0.47，但 injected anchor 的平均 support mass 只有 0.14-0.15，导致 raw positive ratio 只有 0.7%-0.8%，target 过稀，不能扩展成长训。
+- 下一步不回到 short probe。应该把 `support_flow` 从 hard gain 改成 full-support soft target，例如直接用 support mass / relative value distribution 形成 `q_j ∝ exp(alpha * support_mass_j) * prior_j`，并继续跳过 all-negative、low coverage、flat support 的低信息 state。source chunk 只保留为 prior，不再作为主要 teacher 或 hard floor。

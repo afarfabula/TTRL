@@ -3512,6 +3512,109 @@ class RayPPOTrainer:
         }
         return scores, metrics
 
+    def _score_chunk_state_support_flow(
+        self,
+        state_prompts: DataProto,
+        candidates: int,
+    ) -> tuple[torch.Tensor, dict]:
+        if "chunk_state_support_anchor_scores" not in state_prompts.non_tensor_batch:
+            raise ValueError("chunk_state_score_mode='support_flow' requires injected support anchor scores")
+
+        cfg = self.config.ttrl
+        score_type = str(cfg.get("chunk_state_support_flow_score_type", "gain"))
+        gain_slack = float(cfg.get("chunk_state_support_flow_gain_slack", 0.0))
+        baseline_scale = float(cfg.get("chunk_state_support_flow_baseline_scale", 1.0))
+        source_prior_weight = float(cfg.get("chunk_state_support_flow_source_prior_weight", 1.0))
+        min_positive_margin = float(cfg.get("chunk_state_support_flow_min_positive_margin", 0.0))
+
+        anchor_mass = torch.as_tensor(
+            np.asarray(state_prompts.non_tensor_batch["chunk_state_support_anchor_scores"], dtype=np.float32),
+            dtype=torch.float32,
+        ).reshape(len(state_prompts), candidates)
+        source_mass = torch.as_tensor(
+            np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_answer_mass",
+                    np.zeros(len(state_prompts), dtype=np.float32),
+                ),
+                dtype=np.float32,
+            ),
+            dtype=torch.float32,
+        ).view(len(state_prompts), 1)
+        baseline = source_mass * baseline_scale
+
+        if score_type == "mass":
+            score_matrix = anchor_mass.clamp(min=0.0, max=1.0)
+        elif score_type == "gain":
+            score_matrix = (anchor_mass - baseline + gain_slack).clamp(min=0.0, max=1.0)
+        elif score_type == "relative_gain":
+            score_matrix = ((anchor_mass - baseline + gain_slack) / (1.0 - baseline).clamp(min=1e-6)).clamp(
+                min=0.0,
+                max=1.0,
+            )
+        else:
+            raise ValueError(f"Unsupported ttrl.chunk_state_support_flow_score_type={score_type!r}")
+
+        label_consistent = (score_matrix > 0.0).float()
+        positive_margin = (anchor_mass - baseline).max(dim=-1).values
+        keep_state = positive_margin >= min_positive_margin
+        score_matrix = score_matrix * keep_state.view(-1, 1).to(dtype=score_matrix.dtype)
+        label_consistent = label_consistent * keep_state.view(-1, 1).to(dtype=label_consistent.dtype)
+
+        prompt_top_mass = np.asarray(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_source_prompt_top_mass",
+                np.ones(len(state_prompts), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.numpy().astype(np.float32)
+        state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = prompt_top_mass.astype(np.float32)
+        state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = (
+            (anchor_mass > 0.0).float().mean(dim=-1).numpy().astype(np.float32)
+        )
+        state_prompts.non_tensor_batch["chunk_state_future_support_keep"] = (
+            keep_state.float().numpy().astype(np.float32)
+        )
+        if source_prior_weight > 0.0:
+            prior = torch.ones_like(score_matrix)
+            injected = torch.as_tensor(
+                np.asarray(
+                    state_prompts.non_tensor_batch.get(
+                        "chunk_state_support_anchor_injected",
+                        np.zeros((len(state_prompts), candidates), dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ),
+                dtype=torch.float32,
+            ).reshape(len(state_prompts), candidates)
+            prior = torch.where(injected > 0.0, torch.full_like(prior, source_prior_weight), prior)
+            state_prompts.non_tensor_batch["chunk_state_target_prior"] = prior.numpy().astype(np.float32)
+
+        scores = score_matrix.reshape(-1)
+        state_max = score_matrix.max(dim=-1).values
+        metrics = {
+            "chunk_state_support_flow/score_type_mass": float(score_type == "mass"),
+            "chunk_state_support_flow/score_type_gain": float(score_type == "gain"),
+            "chunk_state_support_flow/score_type_relative_gain": float(score_type == "relative_gain"),
+            "chunk_state_support_flow/gain_slack": gain_slack,
+            "chunk_state_support_flow/baseline_scale": baseline_scale,
+            "chunk_state_support_flow/source_prior_weight": source_prior_weight,
+            "chunk_state_support_flow/min_positive_margin": min_positive_margin,
+            "chunk_state_support_flow/anchor_mass_mean": anchor_mass.mean().item() if len(anchor_mass) else 0.0,
+            "chunk_state_support_flow/source_mass_mean": source_mass.mean().item() if len(source_mass) else 0.0,
+            "chunk_state_support_flow/positive_margin_mean": positive_margin.mean().item()
+            if len(positive_margin)
+            else 0.0,
+            "chunk_state_support_flow/state_keep_ratio": keep_state.float().mean().item() if len(keep_state) else 0.0,
+            "chunk_state_support_flow/score_mean": score_matrix.mean().item() if len(score_matrix) else 0.0,
+            "chunk_state_support_flow/score_max_mean": state_max.mean().item() if len(state_max) else 0.0,
+            "chunk_state_support_flow/label_consistent_ratio": label_consistent.mean().item()
+            if len(label_consistent)
+            else 0.0,
+        }
+        return scores, metrics
+
     def _build_chunk_actor_batch(
         self,
         state_prompts: DataProto,
@@ -3808,6 +3911,7 @@ class RayPPOTrainer:
             "answer_source_consistency",
             "future_support_gain",
             "support_anchor",
+            "support_flow",
         }:
             source_answer_metadata = self._compute_full_rollout_answer_metadata(full_batch)
 
@@ -3855,9 +3959,11 @@ class RayPPOTrainer:
             chunk_output = self._repeat_non_tensor_like(state_prompts, chunk_output, candidates)
             if bool(cfg.get("chunk_state_source_chunk_enable", False)):
                 metrics.update(self._apply_chunk_state_source_chunk(full_batch, state_prompts, chunk_output))
-            if score_mode == "support_anchor":
+            if score_mode in {"support_anchor", "support_flow"}:
                 if source_answer_metadata is None:
-                    raise ValueError("chunk_state_score_mode='support_anchor' requires full-rollout answer metadata")
+                    raise ValueError(
+                        f"chunk_state_score_mode={score_mode!r} requires full-rollout answer metadata"
+                    )
                 metrics.update(
                     self._apply_chunk_state_support_anchors(
                         full_batch=full_batch,
@@ -3874,8 +3980,8 @@ class RayPPOTrainer:
                 chunk_output.meta_info.pop("timing", None)
 
         probe_output = None
-        if score_mode == "support_anchor":
-            metrics["chunk_state_probe/skipped_for_support_anchor"] = 1.0
+        if score_mode in {"support_anchor", "support_flow"}:
+            metrics[f"chunk_state_probe/skipped_for_{score_mode}"] = 1.0
         else:
             with marked_timer("chunk_state_probe", timing_raw, color="red"):
                 probe_tokens = max(1, min(probe_max_tokens, max_model_len - max_prompt_len))
@@ -3993,6 +4099,15 @@ class RayPPOTrainer:
                 metrics["chunk_state_support_anchor_score/raw_positive_ratio"] = support_anchor_metrics[
                     "chunk_state_support_anchor_score/score_mean"
                 ]
+            elif score_mode == "support_flow":
+                scores, support_flow_metrics = self._score_chunk_state_support_flow(
+                    state_prompts=state_prompts,
+                    candidates=candidates,
+                )
+                metrics.update(support_flow_metrics)
+                metrics["chunk_state_support_flow/raw_positive_ratio"] = support_flow_metrics[
+                    "chunk_state_support_flow/score_mean"
+                ]
             elif score_mode == "answer_source_consistency":
                 scores, source_consistency_metrics = self._score_chunk_state_answer_source_consistency(
                     state_prompts=state_prompts,
@@ -4015,10 +4130,11 @@ class RayPPOTrainer:
             metrics["chunk_state_score/mode_answer_support_mass"] = float(score_mode == "answer_support_mass")
             metrics["chunk_state_score/mode_future_support_gain"] = float(score_mode == "future_support_gain")
             metrics["chunk_state_score/mode_support_anchor"] = float(score_mode == "support_anchor")
+            metrics["chunk_state_score/mode_support_flow"] = float(score_mode == "support_flow")
             metrics["chunk_state_score/mode_answer_source_consistency"] = float(
                 score_mode == "answer_source_consistency"
             )
-            if score_mode != "support_anchor":
+            if score_mode not in {"support_anchor", "support_flow"}:
                 metrics["chunk_state_probe/samples"] = float(probe_samples)
             if bool(cfg.get("chunk_state_teacher_anchor_enable", False)):
                 anchor_idx = int(cfg.get("chunk_state_teacher_anchor_candidate_index", 0))

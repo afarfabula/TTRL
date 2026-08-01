@@ -47,6 +47,7 @@ ttrl:
   # Experimental chunk-level search-state training. This is disabled by
   # default and only used by explicit pilot scripts.
   chunk_state_enable: false
+  chunk_state_score_mode: probe_reward
   chunk_state_candidates: 8
   chunk_state_chunk_size: 256
   chunk_state_probe_max_tokens: 3072
@@ -178,3 +179,11 @@ ttrl:
   chunk_state_support_anchor_count: 4
   chunk_state_support_anchor_candidate_start: 0
   chunk_state_support_anchor_min_mass: 0.03125
+  # support_flow uses the same full-rollout anchor candidates but scores them
+  # as distribution improvement over the selected source answer mass. This
+  # keeps short-horizon probe hits out of the teacher definition.
+  chunk_state_support_flow_score_type: gain
+  chunk_state_support_flow_gain_slack: 0.0
+  chunk_state_support_flow_baseline_scale: 1.0
+  chunk_state_support_flow_source_prior_weight: 1.0
+  chunk_state_support_flow_min_positive_margin: 0.0
