@@ -9908,3 +9908,47 @@ step 3:
 - 不能直接扩 20-step。主要问题是 source selection 太窄：`min_source_answer_mass=0.40` 导致每步只剩 `7-11` 个 real states，大量 prompt 被 `skipped_support_sources` 跳过。这个会让训练分布过窄，并且 pad state 比例过高。
 - 下一轮应保持同样 target 语义，只放宽 source gate：把 `chunk_state_min_source_answer_mass` 降到 `0.20-0.25`，保留 prompt-level support quality gate 和 mid boundary，目标是每步恢复到接近 32 个 real states，同时观察 coverage/OOV 是否仍维持在 `0.50+`。
 - 如果放宽后 coverage 下降明显，再考虑 state-level soft weight 或 prompt support quality 的连续权重，不回到 source hard gate 或 short-horizon local teacher。
+
+## 2026-08-02 chunk-state PowerFlow: full-support prior + soft keep + relaxed source gate smoke
+
+目的：
+
+- 验证上一版 full-support anchor prior 的主要瓶颈是不是 `min_source_answer_mass=0.40` 太窄。
+- 只放宽 source hard gate，不改变 target 语义：full-rollout support distribution 仍通过 `future_support_gain/support_distribution_match` 定义 score，anchor 仍只做 prior，不做 hard teacher。
+
+配置差异：
+
+```text
+base = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+chunk_state_min_source_answer_mass = 0.25
+chunk_state_min_prompt_top_mass = 0.30
+TTRL_RUNTIME_DIR = /tmp/cfsp82b
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_relaxedsrc025_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_relaxedsrc025_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_relaxedsrc025_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+逐 step 结果：
+
+```text
+step  real_state  pad_state  skipped_support  coverage  source_mass  target_prior  nonzero  update_actor
+1     15          1          17               0.488     0.490        1.387         1.000    4.831s
+2     10          6          22               0.414     0.628        1.259         1.000    3.143s
+3     11          5          21               0.334     0.417        1.389         1.000    3.411s
+```
+
+结论：
+
+- 这是一个负结果。放宽 source mass hard gate 没有把 real states 恢复到接近 32，只从上一版的 `7-11` 提到 `10-15`，仍然有大量 prompt/source 被跳过。
+- target 质量反而变差：coverage 从上一版整体约 `0.525` 掉到 step 级 `0.488/0.414/0.334`，OOV 对应上升。
+- `actor_batch_powerflow_weight_nonzero_ratio=1.0` 仍稳定，说明 soft keep / clip 后 update 不是主矛盾。
+- 当前最该放弃的是“chunk 的好坏必须由短 horizon、局部 answer hit、source consistency 这一级判清楚”的约束。短 probe 只能作为 future answer distribution estimator，不能作为 teacher；source chunk 只能作为 prior/drift guard，不能作为 hard floor 或主要监督。
+- 下一版不继续扩 source-side hard constraints：保持 full-support target + anchor prior + soft keep，取消 `min_source_answer_mass` hard gate，使用 prompt-level support quality 选择可学习 prompt，并把 source answer mass 只作为连续 loss weight / prior。目标是恢复状态覆盖，同时让 q_j 仍由 full-rollout support/value 主导。
