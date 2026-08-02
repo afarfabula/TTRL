@@ -12243,3 +12243,57 @@ mean  29.741   7.207  7.192   1.478
 - 不能依赖 token prefix match 解决 state alignment；应直接构造同源/同 trajectory 的 state-candidate pairs，或选择 source state 本身来自 high-support answer family，再从同 family 的 sibling rollouts 取 continuation。
 - 对 state selection 加更硬的 full-support质量门：例如 `anchor_mass_mean`、prompt answer entropy、real state count、source answer mass 的组合，避免 v10 step 3 这种 `anchor_mass_mean=0.036` 的 batch 更新。
 - 下一条 v11 应测试 `source_quality_weight_mode` 或更严格 source/prompt gate，而不是继续加 anchor 数；验收看三步都保持 `actor_w_nonzero=1` 且 coverage 不低于 `0.25`。
+
+## 2026-08-02 future-gain support-distribution-match highmassanchors v11 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_highmassanchors_v11_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_supportdist_highmassanchors_v11_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_highmassanchors_v11_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_highmassanchors_v11_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+相对 v10 的变化：
+
+- score 仍是 `support_distribution_match`，keep 仍是 `soft`，不回退到 short-horizon local answer hit 或 source consistency。
+- candidate 结构仍是 `candidate0=source continuation`，`candidate1-7=full rollout support anchors`。
+- `support_anchor_min_mass` 从 v10 的低门槛提高到 `0.10`，只注入 full group 中 answer mass 更高的 anchors。
+- 关闭 prefix compatibility：v10 已证明 `prefix_match_mean=0.012`，prefix prior 没有实际提供 state alignment。
+
+三步质量汇总：
+
+```text
+step  anchor_inj  anchor_mass  anchor_pos  coverage  oov    keep   score  label  improved  margin  real_state  actor_samples  zeroed  w_cov  w_margin  positive_ratio  target_entropy  actor_w_nonzero
+1     0.625       0.704        0.547       0.328     0.672  0.500  0.200  0.438  1.000     0.579   3           24             0.625   0.402  0.550     0.200           1.160           1.000
+2     0.375       0.871        0.328       0.090     0.910  0.125  0.005  0.250  0.875     0.027   2           8              0.875   0.156  0.012     0.005           1.976           1.000
+3     0.250       0.604        0.219       0.660     0.340  0.500  0.346  0.938  1.000     0.576   3           24             0.625   0.599  0.644     0.346           1.795           1.000
+mean  0.417       0.726        0.365       0.359     0.641  0.375  0.184  0.542  0.958     0.394   2.7         18.7           0.708   0.386  0.402     0.184           1.644           1.000
+```
+
+耗时：
+
+```text
+step  gen      probe  score   ref    update_actor
+1     43.579   7.042  8.114   4.153  1.433
+2     24.218   7.107  8.532   0.134  0.444
+3     22.910   7.086  7.047   0.438  1.194
+mean  30.236   7.078  7.898   1.575  1.024
+```
+
+结论：
+
+- 不扩 20-step。v11 是当前 support_distribution_match 系列里均值最好的一版，但仍不稳定。
+- 相比 v9/v10，v11 均值提升明显：`support_coverage_mean=0.359`、`state_oov_mean=0.641`，优于 v9 的 `0.125/0.875` 和 v10 的 `0.208/0.792`。
+- 单步上限有价值：step 3 达到 `coverage=0.660`、`OOV=0.340`、`label_consistent_ratio=0.938`，说明 full-group support anchors 能把 candidate distribution 拉回目标 support。
+- 但 step 2 是关键反例：即使 `anchor_mass_mean=0.871`、source/prompt original 指标很高，candidate support coverage 仍只有 `0.090`，OOV `0.910`。这说明继续提高 source/anchor mass 门槛不能从根上解决 target 质量。
+- `actor/powerflow_weight/nonzero_ratio=1.0` 每步都保持非零，`update_actor` 均值 `1.024s`，再次确认 actor update 不是主矛盾。当前主矛盾是 state/candidate target 的 label estimation 语义。
+- v11 也支持最新策略纠偏：不能再要求 chunk target 主要由短 probe 的局部命中或 source answer consistency 判定。要放弃“局部短视可判定性”这个训练约束。
+
+下一步：
+
+- 保留 PowerFlow-style actor update、soft keep、clip4 和 full rollout group support label estimation。
+- 放弃把 short-horizon probe local hit/source consistency 当 teacher 的设计；probe 只能作为 future distribution 的采样估计，不应单独定义 target。
+- target 改为由 full rollout group posterior/value/support improvement 主导：先对 prompt 采完整 rollout group，形成 answer support distribution、majority/support mass、value/posterior，再在 chunk state 上学习哪些 local transition 会把未来分布推向这个 full-group posterior。
+- source chunk/anchor 只作为 prior 或 drift guard，不能作为主要 teacher/floor；继续加 source-side 硬约束已经被 v10/v11 反例否定。
+- state selection 必须优先解决低信息样本：跳过或强降权 all-negative、support coverage 低、OOV 高、top mass 过平、malformed/repeated boxed/marker 污染的 states。
+- 下一轮应实现/测试 `posterior_support_match` 或 `posterior_value_improvement` 作为主 target，而不是继续调 anchor mass；smoke 先看 `support_coverage`、`OOV`、`label_consistent_ratio`、`actor_w_nonzero`，再决定是否跑 20-step。
