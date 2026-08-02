@@ -10444,3 +10444,82 @@ step  gen      chunk_probe  chunk_score  chunk_ref  update_actor  progress_step
 - soft prefix compatibility 解决了 hard compatibility 的工程问题：anchor set 没有被打空，`injected_ratio=0.945-0.992`，`state_keep=1.0`。
 - 但它没有解决 target 质量主矛盾：coverage 仍只有 `0.45-0.56`，均值约 `0.50`；OOV 均值约 `0.50`。这和用户纠偏一致，问题不是 source hard gate 太少，而是 target 仍然没有被 full-rollout group distribution 足够强地定义。
 - 这轮不扩 20-step。下一步不再继续加 source/local short-probe 约束，应转向：先用 full rollout group 定义 prompt-level support/value，再选择高 support 中后段 state，并让 candidate score 直接反映 future distribution 是否向 full support 靠拢；source chunk 只保留为 prior/drift guard。
+
+## 2026-08-02 high-support mid/late state selection smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softprefix_highsupport_midlate_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_highsupport_midlate_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softprefix_highsupport_midlate_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softprefix_highsupport_midlate_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+目的：
+
+- 在 soft-prefix full-support prior 的基础上，只保留 prompt-level support 更强、boundary 更偏中后段的 state。
+- 仍然遵守最新 target 语义：full-rollout group support/value 主导 `q_j`；probe 只是估计 future answer distribution；source chunk / support anchor 只做 prior 和 drift guard，不做 hard teacher / score floor。
+- 检查“选更高质量的 source/prompt + mid/late boundary”能不能提升 support coverage、降低 OOV。
+
+关键配置：
+
+```text
+ttrl.chunk_state_min_prompt_top_mass=0.35
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.75
+ttrl.chunk_state_min_prompt_top_margin=0.05
+ttrl.chunk_state_max_prompt_answer_entropy=2.2
+ttrl.chunk_state_min_boundary=128
+ttrl.chunk_state_mid_boundary_min_ratio=0.45
+ttrl.chunk_state_mid_boundary_max_ratio=0.85
+ttrl.chunk_state_future_support_min_state_coverage=0.50
+ttrl.chunk_state_future_support_max_state_oov=0.50
+ttrl.chunk_state_future_support_min_state_mean_mass=0.12
+ttrl.chunk_state_future_support_min_state_top_margin=0.02
+```
+
+运行状态：
+
+- 3-step smoke 完成，无 RuntimeError / Traceback，最后按 smoke 配置打印 `Final validation skipped`。
+- 模型、数据、venv 仍为 `/models/Qwen2.5-Math-7B`、`data/MATH-TTT`、`/mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200`。
+- 本轮继续用前台 `mlx worker login` 跑并 tee 到 raw log，避免后台进程在 login 退出后被清掉。
+
+三步质量汇总：
+
+```text
+step  real_state  pad_state  skipped_support  skipped_short  boundary_mean  coverage  oov    source_mass  prompt_top  learnable_keep  raw_positive  label_consistent  num_actor_samples
+1     15          1          17               0              592            0.492     0.508  0.546        0.546       0.312           0.231         0.742             120
+2     15          1          17               0              528            0.400     0.600  0.610        0.610       0.062           0.218         0.656             120
+3     11          5          20               1              544            0.416     0.584  0.658        0.658       0.062           0.224         0.727             88
+mean  13.7        2.3        18.0             0.3            554.7          0.436     0.564  0.605        0.605       0.145           0.224         0.708             109.3
+```
+
+耗时：
+
+```text
+step  gen      chunk_probe  chunk_score  chunk_ref  update_actor
+1     43.471   7.693        9.918        5.548      4.884
+2     23.428   8.091        7.509        1.616      4.429
+3     31.682   8.162        7.612        1.217      3.253
+```
+
+结论：
+
+- 这是负结果，不扩 20-step。高 support / mid-late state selection 提高了 source/prompt 质量：`source_mass` 均值从 soft-prefix prompt020 的约 `0.46` 提到 `0.61`，boundary 也确实避开了 prompt-only / early prefix。
+- 但它没有提升 target 质量：support coverage 均值只有 `0.436`，比 soft-prefix prompt020 的约 `0.498` 更低；OOV 均值 `0.564`，仍然太高。
+- 它还把训练分布压得太窄：每步真实 state 只有 `11-15` 个，`skipped_support_sources=17/17/20`，step 2/3 的 `learnable_keep` 只有 `0.062`。actor update 变快主要来自样本数下降，不是 target 变好。
+- 这进一步支持最新判断：主矛盾不是 actor update 慢，也不是 source 侧硬约束不够强，而是“局部短视可判定性”这个约束本身。不能再要求 chunk target 主要由 short-horizon probe 的局部命中、source consistency 或 anchor floor 来定义。
+
+下一步：
+
+- 放弃“短 horizon 局部 answer hit 能判清 chunk 好坏”的训练约束。
+- 保留 PowerFlow-style distribution matching、hardfilter/clip4 这类有效工程骨架，但重构 target：
+  - full rollout group 先定义 prompt-level answer support / value / coverage；
+  - 同一 state 下的 candidate chunk 只通过 future distribution 是否向 full support 靠拢来得分；
+  - source chunk / support anchor 只作为 prior / drift guard；
+  - low-information state 直接 skip 或 soft downweight：all-negative、高 OOV、低 coverage、support mass 太平、malformed/repeated boxed。
+- 下一轮不再继续加 sourcegate / source consistency / short-probe teacher，优先实现 full-rollout-support 主导的 per-state sharpened target，形式仍然是：
+
+```text
+q_j ∝ exp(alpha * score_j) * prior_j
+score_j = future distribution match / support value gain from full-rollout group
+prior_j = source/support-anchor drift guard, not teacher floor
+```
