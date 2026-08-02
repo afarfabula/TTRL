@@ -9245,3 +9245,81 @@ step 3: support_coverage = 0.244, state_oov = 0.756, state_keep = 0.125, num_act
 - 但 target 质量仍不达标：support coverage 均值只有 0.401，OOV 均值 0.599，step 3 甚至变成 coverage 0.244 / OOV 0.756 / keep 0.125。
 - 这进一步支持最新判断：不能让 short-horizon probe 的局部 answer hit / source consistency 主导 target，也不能通过继续加硬门控解决；probe 只能作为 future distribution estimator。
 - 下一步要把 label estimation 前移到 full rollout group：先建立 prompt-level answer support/value，再对 chunk candidate 的后续分布做 transport/KL/value-improvement 匹配；低 support coverage、高 OOV、support 太平或 malformed 的 state 直接跳过或强降权。
+
+## 2026-08-02 support-distribution-match 3-step smoke
+
+目的：
+
+- 进一步把 chunk target 从 scalar local hit / source consistency 转成 full-rollout support distribution matching。
+- 新增 `score_type=support_distribution_match`，候选 chunk 的 probe 只用来估计 future answer distribution。
+- score 由 full support distribution 主导：
+
+```text
+support_expected_value = E_{future answer distribution}[full_support_mass(answer)]
+support_overlap = overlap(future answer distribution, full_support_distribution)
+score = 0.5 * (support_expected_value + support_overlap) * smoothed_transport_affinity
+```
+
+配置：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+status = completed_failed_smoke
+
+ttrl.chunk_state_future_support_score_type = support_distribution_match
+ttrl.chunk_state_future_support_min_positive_margin = 0.04
+ttrl.chunk_state_future_support_min_state_coverage = 0.25
+ttrl.chunk_state_future_support_max_state_oov = 0.75
+ttrl.chunk_state_future_support_min_state_mean_mass = 0.04
+ttrl.chunk_state_future_support_min_state_max_mass = 0.12
+ttrl.chunk_state_future_support_min_state_top_margin = 0.005
+ttrl.chunk_state_min_answer_coverage = 0.25
+ttrl.chunk_state_min_informative_gap = 0.005
+```
+
+3-step mean diagnostics：
+
+```text
+chunk_state_future_support_gain/support_coverage_mean = 0.390667
+chunk_state_future_support_gain/state_oov_mean = 0.609333
+chunk_state_future_support_gain/state_keep_ratio = 0.291667
+chunk_state_future_support_gain/learnable_state_keep_ratio = 0.291667
+chunk_state_future_support_gain/smoothed_transport_affinity_mean = 0.628667
+chunk_state_future_support_gain/support_expected_value_mean = 0.184000
+chunk_state_future_support_gain/support_overlap_mean = 0.257667
+chunk_state_future_support_gain/candidate_entropy_mean = 0.608000
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.032333
+chunk_state_future_support_gain/positive_margin_mean = 0.293667
+chunk_state_future_support_gain/label_consistent_ratio = 0.591000
+
+chunk_state/num_actor_samples = 26.666667
+chunk_state/zeroed_state_ratio = 0.750000
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio = 1.000000
+actor/pg_loss = 0.943333
+actor/grad_norm = 6.903333
+
+timing_s/gen = 29.688333
+timing_s/chunk_state_probe = 7.758000
+timing_s/chunk_state_score = 8.227667
+timing_s/chunk_state_ref = 1.680000
+timing_s/update_actor = 1.300000
+```
+
+逐步诊断：
+
+```text
+step 1: support_coverage = 0.541, state_oov = 0.459, state_keep = 0.375, num_actor_samples = 32
+step 2: support_coverage = 0.334, state_oov = 0.666, state_keep = 0.250, num_actor_samples = 32
+step 3: support_coverage = 0.297, state_oov = 0.703, state_keep = 0.250, num_actor_samples = 16
+```
+
+结论：
+
+- support-distribution-match 代码路径跑通，且新增指标能直接观测 full support distribution matching：`support_expected_value`、`support_overlap`、`candidate_entropy`。
+- 相比 support-value-affinity，`state_keep_ratio` 略升到 0.292，`zeroed_state_ratio` 从 0.854 降到 0.750，step 2/3 没有全零更新；这说明显式分布匹配比 source/gain 硬约束更可训练。
+- 但它仍未通过扩展条件：coverage 均值 0.391、OOV 均值 0.609，step 2/3 仍然大量 future answers 不在 full-rollout support 内。
+- 不扩 20-step。主问题已经从 loss 公式转为 label estimation / state-probe distribution 质量：需要让 probe 更可靠地估计“未来分布是否靠近 full support”，而不是继续调 PowerFlow 权重或 gate。
+- 下一步优先做 state/probe 侧：减少低支持 prompt，改用 support 清晰且 coverage 高的 state；或者提高 full rollout support 样本数 / probe reuse，使 full support distribution 对 chunk state 的监督更稳定。

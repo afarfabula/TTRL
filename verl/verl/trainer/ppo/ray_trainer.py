@@ -2868,6 +2868,9 @@ class RayPPOTrainer:
         candidate_affinity_rows = []
         smoothed_candidate_oov_tv_rows = []
         smoothed_candidate_affinity_rows = []
+        support_expected_value_rows = []
+        support_overlap_rows = []
+        candidate_entropy_rows = []
         source_tv_values = []
         source_oov_tv_values = []
         for state_idx, support in enumerate(prompt_mass_values):
@@ -2887,6 +2890,9 @@ class RayPPOTrainer:
             affinity_row = []
             smoothed_oov_row = []
             smoothed_affinity_row = []
+            expected_value_row = []
+            overlap_row = []
+            entropy_row = []
             for cand_idx in range(candidates):
                 offset = (state_idx * candidates + cand_idx) * probe_samples
                 answers = answer_values[offset : offset + probe_samples]
@@ -2900,6 +2906,19 @@ class RayPPOTrainer:
                 total_with_oov = max(len(answers), 1)
                 support_mass = sum(counts.get(answer, 0) / total_with_oov for answer in support_dist.keys())
                 oov_mass = max(0.0, 1.0 - support_mass)
+                expected_value = sum(
+                    (counts.get(answer, 0) / total_with_oov) * support_dist.get(answer, 0.0)
+                    for answer in support_dist.keys()
+                )
+                overlap = sum(
+                    min(counts.get(answer, 0) / total_with_oov, support_dist.get(answer, 0.0))
+                    for answer in support_dist.keys()
+                )
+                entropy = 0.0
+                for count in counts.values():
+                    prob = count / total_with_oov
+                    if prob > 0.0:
+                        entropy -= prob * float(np.log(prob))
                 oov_tv = 0.5 * (
                     sum(
                         abs((counts.get(answer, 0) / total_with_oov) - support_dist.get(answer, 0.0))
@@ -2926,16 +2945,25 @@ class RayPPOTrainer:
                 affinity_row.append(float(max(0.0, 1.0 - oov_tv)))
                 smoothed_oov_row.append(float(smoothed_oov_tv))
                 smoothed_affinity_row.append(float(max(0.0, 1.0 - smoothed_oov_tv)))
+                expected_value_row.append(float(expected_value))
+                overlap_row.append(float(overlap))
+                entropy_row.append(float(entropy))
             candidate_tv_rows.append(row)
             candidate_oov_tv_rows.append(oov_row)
             candidate_affinity_rows.append(affinity_row)
             smoothed_candidate_oov_tv_rows.append(smoothed_oov_row)
             smoothed_candidate_affinity_rows.append(smoothed_affinity_row)
+            support_expected_value_rows.append(expected_value_row)
+            support_overlap_rows.append(overlap_row)
+            candidate_entropy_rows.append(entropy_row)
         candidate_tv = torch.tensor(candidate_tv_rows, dtype=torch.float32)
         candidate_oov_tv = torch.tensor(candidate_oov_tv_rows, dtype=torch.float32)
         transport_affinity = torch.tensor(candidate_affinity_rows, dtype=torch.float32)
         smoothed_candidate_oov_tv = torch.tensor(smoothed_candidate_oov_tv_rows, dtype=torch.float32)
         smoothed_transport_affinity = torch.tensor(smoothed_candidate_affinity_rows, dtype=torch.float32)
+        support_expected_value = torch.tensor(support_expected_value_rows, dtype=torch.float32)
+        support_overlap = torch.tensor(support_overlap_rows, dtype=torch.float32)
+        candidate_entropy = torch.tensor(candidate_entropy_rows, dtype=torch.float32)
         source_tv = torch.tensor(source_tv_values, dtype=torch.float32).view(len(state_prompts), 1)
         source_oov_tv = torch.tensor(source_oov_tv_values, dtype=torch.float32).view(len(state_prompts), 1)
         tv_gain = source_tv - candidate_tv
@@ -2971,6 +2999,13 @@ class RayPPOTrainer:
             )
         elif score_type == "support_value_affinity":
             score_matrix = (future_value.clamp(min=0.0, max=1.0) * smoothed_transport_affinity).clamp(
+                min=0.0,
+                max=1.0,
+            )
+        elif score_type == "support_distribution_match":
+            score_matrix = (
+                (0.5 * support_expected_value + 0.5 * support_overlap) * smoothed_transport_affinity
+            ).clamp(
                 min=0.0,
                 max=1.0,
             )
@@ -3010,6 +3045,9 @@ class RayPPOTrainer:
         smoothed_transport_affinity_arr = (
             smoothed_transport_affinity.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
         )
+        support_expected_value_arr = support_expected_value.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        support_overlap_arr = support_overlap.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+        candidate_entropy_arr = candidate_entropy.mean(dim=-1).detach().cpu().numpy().astype(np.float32)
         filtered_raw_gain = raw_gain.masked_fill(~candidate_quality_ok, float("-inf"))
         positive_margin = filtered_raw_gain.max(dim=-1).values
         if score_type in {"tv_positive_gain", "relative_tv_positive_gain"}:
@@ -3023,6 +3061,7 @@ class RayPPOTrainer:
             "smoothed_transport_positive_gain",
             "smoothed_transport_support_gain",
             "support_value_affinity",
+            "support_distribution_match",
         }:
             filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
             positive_margin = filtered_score_gain.max(dim=-1).values
@@ -3106,6 +3145,9 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/score_type_support_value_affinity": float(
                 score_type == "support_value_affinity"
             ),
+            "chunk_state_future_support_gain/score_type_support_distribution_match": float(
+                score_type == "support_distribution_match"
+            ),
             "chunk_state_future_support_gain/gain_slack": gain_slack,
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,
             "chunk_state_future_support_gain/source_prior_weight": source_prior_weight,
@@ -3158,6 +3200,17 @@ class RayPPOTrainer:
                 smoothed_transport_affinity_arr.mean()
             )
             if len(smoothed_transport_affinity_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/support_expected_value_mean": float(
+                support_expected_value_arr.mean()
+            )
+            if len(support_expected_value_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/support_overlap_mean": float(support_overlap_arr.mean())
+            if len(support_overlap_arr)
+            else 0.0,
+            "chunk_state_future_support_gain/candidate_entropy_mean": float(candidate_entropy_arr.mean())
+            if len(candidate_entropy_arr)
             else 0.0,
             "chunk_state_future_support_gain/tv_gain_mean": float(tv_gain_arr.mean()) if len(tv_gain_arr) else 0.0,
             "chunk_state_future_support_gain/transport_gain_mean": transport_gain.mean().item()
