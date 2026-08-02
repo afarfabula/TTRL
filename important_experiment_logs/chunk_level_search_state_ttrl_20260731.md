@@ -11911,3 +11911,53 @@ update_actor_mean               3.068s                    2.421s           4.354
 - source chunk / support anchor 保留为 prior 或 drift guard，但不能作为主要 teacher，也不能作为硬 floor。
 - 对 low-information state 直接跳过或低权重：all-negative、low support coverage、high OOV、flat support mass、malformed/repeated boxed/marker contamination。
 - 下一版应该把 target 写成 `q_j proportional exp(alpha * score_j) * prior_j`，其中 `score_j` 主要来自 full-rollout support/value/posterior improvement，而不是 raw short-probe correctness 或 source-answer consistency。
+
+## 2026-08-02 support-flow full-posterior anchor v5 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_fullposterior_spp2_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_fullposterior_spp2_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_fullposterior_spp2_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_fullposterior_spp2_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置：
+
+- `ttrl.chunk_state_score_mode=support_flow`。
+- `ttrl.chunk_state_support_flow_score_type=soft_mass`。
+- `ttrl.chunk_state_probe/skipped_for_support_flow=1.0`，确认这一版没有 short-horizon probe teacher。
+- 继承 high-support source gate，并设置 `states_per_prompt=2`。
+- support anchors: `count=4`、`candidate_start=4`、`selection_mode=answer_stratified`、`skip_source=True`。
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  anchor_mass  label_ratio  coverage  w_cov  pos_margin  w_margin  score_mean  target_entropy
+1     16          128            1.000       0.614        0.059        0.492        0.492     0.487 -0.255      -0.273    0.059       1.075
+2     20          160            1.000       0.696        0.070        0.479        0.479     0.458 -0.288      -0.385    0.070       1.037
+3     10          80             1.000       0.693        0.081        0.500        0.500     0.500 -0.178      -0.260    0.081       0.788
+mean  15.3        122.7          1.000       0.668        0.070        0.490        0.490     0.482 -0.240      -0.306    0.070       0.967
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe  score   ref     update_actor
+1     43.577   0.976   0.000  7.698   5.759   5.103
+2     22.676   1.115   0.000  6.010   2.407   5.991
+3     25.575   0.954   0.000  6.680   1.216   3.081
+mean  30.609   1.015   0.000  6.796   3.127   4.725
+```
+
+结论：
+
+- 不扩 20-step。v5 成功验证了“去掉 short probe teacher”这件事工程上可行：三步 `chunk_state_probe/skipped_for_support_flow=1.0`，没有用 short-horizon 局部命中定义 target。
+- 但这版 target 退化成少数 support-anchor trajectory 的质量蒸馏，而不是完整 answer posterior matching。`source_mass_mean=0.668`，但 `anchor_mass_mean=0.070`，说明 answer-stratified anchors 把高质量 full-group support 稀释到了低 mass alternative answers 上。
+- `positive_margin_mean=-0.240`，代表 anchor candidate 大多并没有超过 source answer mass；`target_entropy=0.967`，target 过尖，容易变成“学某几条 anchor chunk”，而不是学 full posterior distribution。
+- 这不是回到 short probe 的理由；相反，它说明下一版不能只用 trajectory-level anchor mass，而要按 answer-level posterior mass 给 candidate/anchor 分配目标概率。
+
+下一步：
+
+- 做 v6 answer-level posterior target：对每个 state 先用 full rollout group 得到 `P_good(answer)`，再把候选 chunk/anchor 映射到 answer support；同一 answer 的多个 chunks 共享该 answer posterior mass，避免 answer-stratified 后把主答案质量稀释成低 trajectory mass。
+- source chunk 只作为 drift prior；如果 source answer 是 top posterior，可给 source chunk 一个 prior multiplier，但不作为 score floor。
+- 保留 no-short-probe 主约束。probe 最多用于补全 candidate answer identity 或 future distribution 的辅助估计，不再直接决定 teacher。
