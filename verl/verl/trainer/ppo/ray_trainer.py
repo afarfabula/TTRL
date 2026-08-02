@@ -4291,6 +4291,9 @@ class RayPPOTrainer:
         softplus_temperature = float(cfg.get("chunk_state_support_flow_softplus_temperature", 0.125))
         split_mass_by_answer = bool(cfg.get("chunk_state_support_flow_split_mass_by_answer", False))
         answer_split_power = float(cfg.get("chunk_state_support_flow_answer_split_power", 1.0))
+        posterior_split_duplicates = bool(
+            cfg.get("chunk_state_support_flow_posterior_split_duplicates", True)
+        )
         if answer_split_power < 0.0:
             raise ValueError("ttrl.chunk_state_support_flow_answer_split_power must be non-negative")
 
@@ -4387,7 +4390,10 @@ class RayPPOTrainer:
                     answer_mass = float(mass_map.get(answer, 0.0))
                     if answer_mass <= 0.0:
                         continue
-                    split_mass = answer_mass / max(len(indices), 1)
+                    if posterior_split_duplicates:
+                        split_mass = answer_mass / max(len(indices), 1)
+                    else:
+                        split_mass = answer_mass
                     for candidate_idx in indices:
                         posterior_mass[state_idx, candidate_idx] = split_mass
             posterior_answer_duplicate_ratio = float(np.mean(duplicate_ratios)) if duplicate_ratios else 0.0
@@ -4480,6 +4486,7 @@ class RayPPOTrainer:
             "chunk_state_support_flow/softplus_temperature": softplus_temperature,
             "chunk_state_support_flow/split_mass_by_answer": float(split_mass_by_answer),
             "chunk_state_support_flow/answer_split_power": answer_split_power,
+            "chunk_state_support_flow/posterior_split_duplicates": float(posterior_split_duplicates),
             "chunk_state_support_flow/answer_duplicate_ratio": answer_duplicate_ratio,
             "chunk_state_support_flow/posterior_answer_duplicate_ratio": posterior_answer_duplicate_ratio,
             "chunk_state_support_flow/raw_anchor_mass_mean": raw_anchor_mass.mean().item()

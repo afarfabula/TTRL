@@ -275,6 +275,11 @@ ttrl:
   # full answer distribution onto chunk anchors rather than counting duplicate
   # chunks from the same answer multiple times.
   chunk_state_support_flow_split_mass_by_answer: false
+  # Posterior score types map full-rollout answer posterior mass onto support
+  # anchors. Keep historical exact answer-mass projection by default; smoke
+  # scripts can disable this to test whether repeated high-posterior chunks
+  # should each retain the answer-level target mass.
+  chunk_state_support_flow_posterior_split_duplicates: true
   # Exponent on the number of same-answer anchors when split_mass_by_answer is
   # enabled. 1.0 is an exact split; values in (0, 1) partially preserve the
   # margin of repeated high-support transitions while still penalizing

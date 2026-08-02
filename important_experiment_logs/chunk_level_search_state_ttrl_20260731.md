@@ -12019,3 +12019,61 @@ mean  29.915   0.968   0.000  6.685   2.922   4.608
 - 改 candidate 侧而不是加 source gate：让候选 chunk 来自 full group 高 posterior answer 的多条 trajectory，或从同一 state 重新采样后用 longer-horizon support gain 映射到 full posterior。
 - 对 low-information state 做硬跳过或低权重：flat support、低 valid answer coverage、高 OOV、malformed/repeated boxed、posterior max 过低、candidate 无法映射到 group support。
 - 下一版优先验证 `q_j proportional exp(alpha * full_group_value_gain_j) * prior_j`，其中 prior 只做 drift guard，不能重新变成 source answer floor。
+
+## 2026-08-02 support-flow answer-posterior massrank nosplit v7 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_answerposterior_massrank_nosplit_spp2_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_answerposterior_massrank_nosplit_spp2_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_answerposterior_massrank_nosplit_spp2_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_answerposterior_massrank_nosplit_spp2_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码变化：
+
+- 新增 `ttrl.chunk_state_support_flow_posterior_split_duplicates`，默认 `true` 保持 v6 语义。
+- v7 显式设置 `posterior_split_duplicates=False`：同一 answer 的多个 support anchors 不再平分 answer posterior mass。
+- v7 同时设置 `chunk_state_support_anchor_selection_mode=mass_ranked`，把 support anchors 从 answer-stratified 改成高 mass answer 优先。
+
+关键配置：
+
+- `ttrl.chunk_state_score_mode=support_flow`。
+- `ttrl.chunk_state_support_flow_score_type=posterior_mass`。
+- `ttrl.chunk_state_support_anchor_selection_mode=mass_ranked`。
+- `ttrl.chunk_state_support_flow_posterior_split_duplicates=False`。
+- `chunk_state_probe/skipped_for_support_flow=1.0`，确认仍然没有 short-horizon probe teacher。
+- batch / rollout 仍是 `data.train_batch_size=32`、`rollout.n=32`、`n_votes_per_prompt=64`、`states_per_prompt=2`。
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  posterior_mean  posterior_max  dup_ratio  label_ratio  coverage  w_cov  pos_margin  w_margin  positive_ratio  target_entropy
+1     16          128            1.000       0.614        0.093           0.359          0.125      0.492        0.492     0.487 -0.255      -0.273    0.093           1.249
+2     10          80             1.000       0.659        0.077           0.235          0.109      0.492        0.492     0.478 -0.424      -0.351    0.077           1.611
+3     12          96             1.000       0.666        0.076           0.191          0.156      0.469        0.492     0.487 -0.475      -0.500    0.076           1.694
+mean  12.7        101.3          1.000       0.646        0.082           0.262          0.130      0.484        0.492     0.484 -0.385      -0.375    0.082           1.518
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe  score   ref     update_actor
+1     43.559   1.125   0.000  7.625   5.828   4.978
+2     22.669   0.962   0.000  6.370   1.219   3.113
+3     22.402   0.970   0.000  5.696   1.419   3.569
+mean  29.543   1.019   0.000  6.564   2.822   3.887
+```
+
+结论：
+
+- 不扩 20-step。v7 证明“高 posterior answer 多 chunk + 不平分 posterior mass”不是当前主解。
+- 相比 v6，`posterior_mass_mean` 从 `0.064` 提到 `0.082`，但 `posterior_mass_max_mean` 从 `0.394` 降到 `0.262`，`positive_margin_weighted_mean` 从 `-0.218` 变差到 `-0.375`。这说明只是增加高 mass answer 的重复 chunk 密度，并没有得到比 source 更强的 search-improved transition。
+- `target_entropy=1.518` 明显更高，target 更分散；`num_actor_samples=101.3` 低于 v6 的 117.3。actor update 更快（`3.887s`），但这是样本减少和 target 变散的副作用，不是有效优化。
+- 这轮进一步支持“不能把 full group 高 posterior trajectory replay 直接当 improvement target”。如果 source 本身已经是 majority-consistent/high-mass，候选来自同一分布的高 mass chunk 很难在 `posterior_mass - source_mass` 上产生正 margin。
+- 末尾出现 `DataLoader worker ... killed by signal: Killed` 的 Ray worker traceback，但日志包含 3 个训练 step、48 行 diag，且进程最终返回 0；本轮按完整 smoke 记录。后续若扩长实验，需要关注这个退出阶段 worker 清理问题。
+
+下一步：
+
+- 不继续调 `mass_ranked` / `answer_stratified` / duplicate split 这类 anchor replay 细节。
+- score 要从“候选 answer posterior mass”转为“相对 source 的 future value gain / support improvement”。也就是 candidate 必须回答：这个 chunk 会不会把后续 completion 分布推向 full group 认可的好答案，而不是它自己属于哪个 high-mass answer。
+- 可以保留 no-short-probe 主约束，但需要引入 longer-horizon future distribution estimator 或从完整 rollout group 构造 state-level value label；short probe 只统计 `p_j(a)`，不能直接当 teacher。
