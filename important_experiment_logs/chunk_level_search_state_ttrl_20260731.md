@@ -9952,3 +9952,79 @@ step  real_state  pad_state  skipped_support  coverage  source_mass  target_prio
 - `actor_batch_powerflow_weight_nonzero_ratio=1.0` 仍稳定，说明 soft keep / clip 后 update 不是主矛盾。
 - 当前最该放弃的是“chunk 的好坏必须由短 horizon、局部 answer hit、source consistency 这一级判清楚”的约束。短 probe 只能作为 future answer distribution estimator，不能作为 teacher；source chunk 只能作为 prior/drift guard，不能作为 hard floor 或主要监督。
 - 下一版不继续扩 source-side hard constraints：保持 full-support target + anchor prior + soft keep，取消 `min_source_answer_mass` hard gate，使用 prompt-level support quality 选择可学习 prompt，并把 source answer mass 只作为连续 loss weight / prior。目标是恢复状态覆盖，同时让 q_j 仍由 full-rollout support/value 主导。
+
+## 2026-08-02 chunk-state PowerFlow: no source hard gate + source continuous weight smoke
+
+目的：
+
+- 执行上一节结论：取消 `min_source_answer_mass` 对 source rollout 的 hard gate。
+- source answer mass 只作为连续 state loss weight，不再决定 state 是否存在；full-rollout support distribution 仍主导 `q_j`。
+- 保留 prompt-level support gate，避免低信息 prompt 直接进入训练。
+
+配置：
+
+```text
+base = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+chunk_state_min_source_answer_mass = 0.0
+chunk_state_min_prompt_top_mass = 0.30
+chunk_state_source_select_by_mass = True
+chunk_state_source_quality_weight_mode = source_mass
+chunk_state_source_quality_weight_floor = 0.05
+chunk_state_source_quality_weight_power = 0.5
+```
+
+启动说明：
+
+- 新 wrapper 文件已落盘：`verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourceweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`。
+- worker 文件视图当时未看到这个新 wrapper，所以实际运行用已存在 base launcher 加同等 CLI overrides。
+- 由于 shell 展开顺序问题，worker 侧原始 diag 先写到了 `chunk_state_diag/.jsonl`；已归档为标准 run id 文件。
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourceweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourceweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourceweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+逐 step 结果：
+
+```text
+step  rows  real_state  pad_state  skipped_support  coverage  oov     source_mass  probe_mean  loss_weight
+1     24    24          0          8                0.509115  0.4909  0.491254     0.203030    1.000
+2     16    16          0          16               0.527344  0.4727  0.602963     0.295374    1.000
+3     24    18          6          14               0.454427  0.5456  0.483652     0.210829    0.750
+```
+
+训练侧关键指标：
+
+```text
+step 1:
+  source_quality_weight_mean = 0.694
+  answer_coverage_mean = 0.509
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 7.303s
+
+step 2:
+  source_quality_weight_mean = 0.769
+  answer_coverage_mean = 0.527
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 4.674s
+
+step 3:
+  source_quality_weight_mean = 0.685
+  answer_coverage_mean = 0.454
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 5.350s
+```
+
+结论：
+
+- 这是正向 smoke。相比 relaxed-source025 的 `real_state=15/10/11`、coverage `0.488/0.414/0.334`，取消 source hard gate + 连续 source weight 提升到 `real_state=24/16/18`、coverage `0.509/0.527/0.454`。
+- 说明主矛盾确实不是 source 侧 hard constraint 不够强，而是 hard constraint 把训练状态分布压窄了。
+- `source_quality_weight_mean=0.685-0.769`，说明 source mass 作为连续权重在起作用，但没有把样本清零；`actor_batch_powerflow_weight_nonzero_ratio=1.0` 继续稳定。
+- 仍不能直接宣称已解决：step 2/3 仍只有 16/18 real states，主要剩余瓶颈是 `chunk_state_min_prompt_top_mass=0.30` 仍是 prompt-level hard gate。下一版应把 prompt support 也从 hard gate 改成连续权重，或把 `min_prompt_top_mass` 降到 `0.0-0.2` 后用 `prompt_top_mass` / coverage / entropy 组成 state quality weight。
+- 方法方向保持：full-rollout support/value 定义 target，probe 仅估计 future distribution，source/anchor 只做 prior 和连续 drift guard。

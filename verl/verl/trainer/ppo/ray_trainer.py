@@ -4284,6 +4284,20 @@ class RayPPOTrainer:
             ),
             dtype=torch.float32,
         ).clamp(min=0.0, max=1.0)
+        source_answer_mass = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_source_answer_mass",
+                np.ones(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        ).clamp(min=0.0, max=1.0)
+        source_prompt_top_mass = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_source_prompt_top_mass",
+                np.ones(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        ).clamp(min=0.0, max=1.0)
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
         confidence_gate = (majority_ratios >= min_majority_ratio) & (answer_coverage >= min_answer_coverage)
         confidence_weight = torch.ones(num_states, dtype=torch.float32)
@@ -4309,11 +4323,34 @@ class RayPPOTrainer:
                 "Unsupported ttrl.chunk_state_future_support_keep_mode="
                 f"{future_support_keep_mode!r}; expected hard, soft, or off"
             )
+        source_quality_weight_mode = str(cfg.get("chunk_state_source_quality_weight_mode", "off"))
+        source_quality_weight_floor = float(cfg.get("chunk_state_source_quality_weight_floor", 0.0))
+        source_quality_weight_power = float(cfg.get("chunk_state_source_quality_weight_power", 1.0))
+        if source_quality_weight_mode == "off":
+            source_quality_weight = torch.ones(num_states, dtype=torch.float32)
+        elif source_quality_weight_mode == "source_mass":
+            source_quality_weight = source_answer_mass
+        elif source_quality_weight_mode == "prompt_top_mass":
+            source_quality_weight = source_prompt_top_mass
+        elif source_quality_weight_mode == "product":
+            source_quality_weight = source_answer_mass * source_prompt_top_mass
+        else:
+            raise ValueError(
+                "Unsupported ttrl.chunk_state_source_quality_weight_mode="
+                f"{source_quality_weight_mode!r}; expected off, source_mass, prompt_top_mass, or product"
+            )
+        if source_quality_weight_power != 1.0:
+            source_quality_weight = torch.pow(source_quality_weight.clamp(min=0.0, max=1.0), source_quality_weight_power)
+        source_quality_weight = source_quality_weight.clamp(
+            min=source_quality_weight_floor,
+            max=1.0,
+        )
         effective_state_loss_weights = (
             state_loss_weights
             * keep_state.to(dtype=state_loss_weights.dtype)
             * confidence_weight
             * future_support_state_weight
+            * source_quality_weight
         )
         keep_indices = list(range(len(chunk_output)))
 
@@ -4451,6 +4488,17 @@ class RayPPOTrainer:
             "chunk_state/future_support_state_weight_mean": future_support_state_weight.mean().detach().item(),
             "chunk_state/future_support_soft_weight_floor": soft_weight_floor,
             "chunk_state/future_support_keep_ratio": (future_support_keep > 0.0).float().mean().detach().item(),
+            "chunk_state/source_quality_weight_mode_off": float(source_quality_weight_mode == "off"),
+            "chunk_state/source_quality_weight_mode_source_mass": float(source_quality_weight_mode == "source_mass"),
+            "chunk_state/source_quality_weight_mode_prompt_top_mass": float(
+                source_quality_weight_mode == "prompt_top_mass"
+            ),
+            "chunk_state/source_quality_weight_mode_product": float(source_quality_weight_mode == "product"),
+            "chunk_state/source_quality_weight_mean": source_quality_weight.mean().detach().item(),
+            "chunk_state/source_quality_weight_floor": source_quality_weight_floor,
+            "chunk_state/source_quality_weight_power": source_quality_weight_power,
+            "chunk_state/source_answer_mass_mean": source_answer_mass.mean().detach().item(),
+            "chunk_state/source_prompt_top_mass_mean": source_prompt_top_mass.mean().detach().item(),
             "chunk_state/majority_ratio_mean": majority_ratios.mean().detach().item(),
             "chunk_state/answer_coverage_mean": answer_coverage.mean().detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),

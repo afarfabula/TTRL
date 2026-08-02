@@ -99,6 +99,12 @@ ttrl:
   chunk_state_min_prompt_top_margin: 0.0
   chunk_state_max_prompt_answer_entropy: 0.0
   chunk_state_min_source_answer_mass: 0.0
+  # Optional continuous state weighting from full-rollout support metadata.
+  # This keeps source/support quality as a drift guard without hard-skipping
+  # states. Defaults are neutral.
+  chunk_state_source_quality_weight_mode: "off"  # off | source_mass | prompt_top_mass | product
+  chunk_state_source_quality_weight_floor: 0.0
+  chunk_state_source_quality_weight_power: 1.0
   # If enabled, candidate source rollouts are ranked by their answer mass under
   # the prompt-level full-rollout support before cycling. This keeps the
   # selected state path closer to high-support answers without hard-coding GT.
