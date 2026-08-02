@@ -1133,18 +1133,30 @@ class RayPPOTrainer:
 
         response_mask = batch.batch["response_mask"].bool()
         decoded_answers = []
+        source_clean_mask = []
+        pollution_counts = Counter()
         for idx in range(len(batch)):
             response_len = int(response_mask[idx].sum().item())
             response_ids = batch.batch["responses"][idx, :response_len]
             response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            pollution_flags = self._chunk_state_full_rollout_guard_flags(response_str)
+            is_clean = not any(pollution_flags.values())
+            for key, value in pollution_flags.items():
+                if value:
+                    pollution_counts[key] += 1
+            source_clean_mask.append(1.0 if is_clean else 0.0)
             answer = extract_answer(response_str)
             if answer is not None:
                 answer = simplify_expression_string(answer)
-            decoded_answers.append(answer if answer is not None else "None")
+            if bool(cfg.get("chunk_state_full_rollout_guard_enable", False)) and not is_clean:
+                decoded_answers.append("None")
+            else:
+                decoded_answers.append(answer if answer is not None else "None")
 
         prompt_answer_counts = []
         prompt_answer_mass = []
         prompt_valid_answer_coverage = []
+        prompt_clean_rollout_ratio = []
         prompt_answer_entropy = []
         prompt_answer_top_margin = []
         source_answers = []
@@ -1152,6 +1164,7 @@ class RayPPOTrainer:
         for prompt_idx in range(len(batch) // n):
             start = prompt_idx * n
             prompt_answers = decoded_answers[start : start + n]
+            prompt_clean = source_clean_mask[start : start + n]
             valid_answers = [answer for answer in prompt_answers if answer != "None"]
             counts = Counter(valid_answers)
             total = max(len(valid_answers), 1)
@@ -1163,20 +1176,42 @@ class RayPPOTrainer:
             prompt_answer_counts.append(json.dumps(count_items, ensure_ascii=True))
             prompt_answer_mass.append(json.dumps(mass_map, ensure_ascii=True, sort_keys=True))
             prompt_valid_answer_coverage.append(len(valid_answers) / max(n, 1))
+            prompt_clean_rollout_ratio.append(float(sum(prompt_clean)) / max(n, 1))
             prompt_answer_top_margin.append(top_mass - second_mass)
             prompt_answer_entropy.append(float(-sum(mass * math.log(max(mass, 1e-12)) for mass in masses)))
-            for answer in prompt_answers:
+            for answer, clean in zip(prompt_answers, prompt_clean):
                 source_answers.append(answer)
-                source_answer_mass.append(float(mass_map.get(answer, 0.0)) if answer != "None" else 0.0)
+                source_answer_mass.append(
+                    float(mass_map.get(answer, 0.0)) if clean > 0.0 and answer != "None" else 0.0
+                )
+
+        total_rollouts = max(len(batch), 1)
+        pollution_metrics = {
+            f"source_pollution_{key}_ratio": pollution_counts[key] / total_rollouts
+            for key in [
+                "repeated_boxed",
+                "empty_boxed",
+                "assistant_marker",
+                "human_marker",
+                "document_marker",
+                "asy_repeat",
+                "ngram_repeat",
+                "prompt_copy",
+            ]
+        }
 
         return {
             "source_answer": source_answers,
             "source_answer_mass": source_answer_mass,
+            "source_clean_mask": source_clean_mask,
             "prompt_answer_counts": prompt_answer_counts,
             "prompt_answer_mass": prompt_answer_mass,
             "prompt_valid_answer_coverage": prompt_valid_answer_coverage,
+            "prompt_clean_rollout_ratio": prompt_clean_rollout_ratio,
             "prompt_answer_entropy": prompt_answer_entropy,
             "prompt_answer_top_margin": prompt_answer_top_margin,
+            "source_clean_rollout_ratio": float(sum(source_clean_mask)) / total_rollouts,
+            **pollution_metrics,
         }
 
     def _make_chunk_state_prompts(
@@ -1205,6 +1240,7 @@ class RayPPOTrainer:
         source_mixed_low_ratio = float(cfg.get("chunk_state_source_mixed_low_ratio", 0.75))
         source_low_max_answer_mass = float(cfg.get("chunk_state_source_low_max_answer_mass", 0.35))
         source_min_valid_answer_mass = float(cfg.get("chunk_state_source_min_valid_answer_mass", 0.0))
+        source_only_clean = bool(cfg.get("chunk_state_full_rollout_guard_source_only_clean", False))
         mid_require_nonzero_boundary = bool(cfg.get("chunk_state_mid_require_nonzero_boundary", False))
         if (
             min_prompt_top_mass > 0.0
@@ -1239,8 +1275,14 @@ class RayPPOTrainer:
         prompt_valid_answer_coverage_arr = None
         prompt_answer_top_margin_arr = None
         prompt_answer_entropy_arr = None
+        source_clean_mask_arr = None
+        prompt_clean_rollout_ratio_arr = None
         if source_answer_metadata is not None:
             source_answer_mass_arr = np.asarray(source_answer_metadata["source_answer_mass"], dtype=np.float32)
+            source_clean_mask_arr = np.asarray(
+                source_answer_metadata.get("source_clean_mask", [1.0] * len(batch)),
+                dtype=np.float32,
+            )
             prompt_top_mass_arr = np.asarray(
                 [
                     max((float(v) for v in json.loads(str(value)).values()), default=0.0)
@@ -1260,6 +1302,10 @@ class RayPPOTrainer:
             )
             prompt_answer_entropy_arr = np.asarray(
                 source_answer_metadata.get("prompt_answer_entropy", [0.0] * prompt_count),
+                dtype=np.float32,
+            )
+            prompt_clean_rollout_ratio_arr = np.asarray(
+                source_answer_metadata.get("prompt_clean_rollout_ratio", [1.0] * prompt_count),
                 dtype=np.float32,
             )
 
@@ -1306,6 +1352,17 @@ class RayPPOTrainer:
                     prompt_response_lens >= min_required_response_len,
                     as_tuple=False,
                 ).flatten()
+                clean_locals = None
+                if source_only_clean and source_clean_mask_arr is not None:
+                    prompt_clean = torch.as_tensor(
+                        source_clean_mask_arr[prompt_start:prompt_stop],
+                        dtype=torch.float32,
+                    )
+                    clean_locals = torch.nonzero(prompt_clean > 0.0, as_tuple=False).flatten()
+                    long_locals = _intersect_locals(long_locals, clean_locals)
+                    if clean_locals.numel() == 0:
+                        skipped_support_sources += 1
+                        continue
                 if prompt_top_mass_arr is not None and min_prompt_top_mass > 0.0:
                     if float(prompt_top_mass_arr[prompt_idx]) < min_prompt_top_mass:
                         skipped_support_sources += 1
@@ -1343,6 +1400,7 @@ class RayPPOTrainer:
                     ).flatten()
                     if min_required_response_len > 0 and long_locals.numel() > 0:
                         mass_good_locals = _intersect_locals(mass_good_locals, long_locals)
+                    mass_good_locals = _intersect_locals(mass_good_locals, clean_locals)
                 if source_mode in {"support_low", "support_mixed"}:
                     prompt_source_masses = torch.as_tensor(
                         source_answer_mass_arr[prompt_start:prompt_stop],
@@ -1354,6 +1412,7 @@ class RayPPOTrainer:
                     ).flatten()
                     if min_required_response_len > 0 and long_locals.numel() > 0:
                         valid_locals = _intersect_locals(valid_locals, long_locals)
+                    valid_locals = _intersect_locals(valid_locals, clean_locals)
                     low_locals = valid_locals[
                         prompt_source_masses[valid_locals] <= source_low_max_answer_mass
                     ]
@@ -1390,6 +1449,7 @@ class RayPPOTrainer:
                         if long_good_locals.numel() > 0:
                             good_locals = long_good_locals
                     good_locals = _intersect_locals(good_locals, mass_good_locals)
+                    good_locals = _intersect_locals(good_locals, clean_locals)
                     good_locals = _rank_locals_by_mass(good_locals, prompt_start)
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
@@ -1412,6 +1472,7 @@ class RayPPOTrainer:
                         if long_good_locals.numel() > 0:
                             good_locals = long_good_locals
                     good_locals = _intersect_locals(good_locals, mass_good_locals)
+                    good_locals = _intersect_locals(good_locals, clean_locals)
                     good_locals = _rank_locals_by_mass(good_locals, prompt_start)
                     if good_locals.numel() > 0:
                         source_local = int(good_locals[source_offset % good_locals.numel()].item())
@@ -1584,8 +1645,19 @@ class RayPPOTrainer:
                 [source_answer_metadata["source_answer_mass"][idx] for idx in selected_source_indices],
                 dtype=np.float32,
             )
+            state_non_tensor["chunk_state_source_clean_mask"] = np.asarray(
+                [
+                    source_answer_metadata.get("source_clean_mask", [1.0] * len(batch))[idx]
+                    for idx in selected_source_indices
+                ],
+                dtype=np.float32,
+            )
             state_non_tensor["chunk_state_source_prompt_top_mass"] = np.asarray(
                 [prompt_top_mass_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
+                dtype=np.float32,
+            )
+            state_non_tensor["chunk_state_prompt_clean_rollout_ratio"] = np.asarray(
+                [prompt_clean_rollout_ratio_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
                 dtype=np.float32,
             )
             state_non_tensor["chunk_state_prompt_valid_answer_coverage"] = np.asarray(
@@ -1710,6 +1782,13 @@ class RayPPOTrainer:
         source_answer_mass = state_prompts.non_tensor_batch.get("chunk_state_source_answer_mass", None)
         if source_answer_mass is not None:
             source_answer_mass = np.asarray(source_answer_mass, dtype=np.float32)
+            source_clean_mask = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_source_clean_mask",
+                    np.ones_like(source_answer_mass),
+                ),
+                dtype=np.float32,
+            )
             source_prompt_top_mass = np.asarray(
                 state_prompts.non_tensor_batch.get(
                     "chunk_state_source_prompt_top_mass",
@@ -1738,6 +1817,13 @@ class RayPPOTrainer:
                 ),
                 dtype=np.float32,
             )
+            prompt_clean_rollout_ratio = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_prompt_clean_rollout_ratio",
+                    np.ones_like(source_answer_mass),
+                ),
+                dtype=np.float32,
+            )
             metrics.update(
                 {
                     "chunk_state_diag/source_answer_mass_mean": float(source_answer_mass.mean())
@@ -1762,6 +1848,14 @@ class RayPPOTrainer:
                     else 0.0,
                     "chunk_state_diag/prompt_answer_entropy_mean": float(prompt_answer_entropy.mean())
                     if prompt_answer_entropy.size
+                    else 0.0,
+                    "chunk_state_diag/source_clean_mask_mean": float(source_clean_mask.mean())
+                    if source_clean_mask.size
+                    else 0.0,
+                    "chunk_state_diag/prompt_clean_rollout_ratio_mean": float(
+                        prompt_clean_rollout_ratio.mean()
+                    )
+                    if prompt_clean_rollout_ratio.size
                     else 0.0,
                 }
             )
@@ -3833,6 +3927,44 @@ class RayPPOTrainer:
                 overlap += 1
         return overlap
 
+    def _chunk_state_full_rollout_guard_flags(self, response_str: str) -> dict:
+        cfg = self.config.ttrl
+        if not bool(cfg.get("chunk_state_full_rollout_guard_enable", False)):
+            return {
+                "repeated_boxed": False,
+                "empty_boxed": False,
+                "assistant_marker": False,
+                "human_marker": False,
+                "document_marker": False,
+                "asy_repeat": False,
+                "ngram_repeat": False,
+                "prompt_copy": False,
+            }
+        max_boxed = int(cfg.get("chunk_state_full_rollout_guard_max_boxed_count", 4))
+        prompt_copy_enable = bool(cfg.get("chunk_state_full_rollout_guard_prompt_copy", True))
+        prompt_copy_min_count = int(cfg.get("chunk_state_full_rollout_guard_prompt_copy_min_count", 2))
+        return {
+            "repeated_boxed": max_boxed >= 0 and response_str.count("\\boxed") > max_boxed,
+            "empty_boxed": bool(cfg.get("chunk_state_full_rollout_guard_empty_boxed", True))
+            and bool(re.search(r"\\boxed\s*\{\s*\}", response_str)),
+            "assistant_marker": bool(cfg.get("chunk_state_full_rollout_guard_assistant_marker", True))
+            and bool(re.search(r"\b(assistant|user|system)\b\s*[:：]", response_str, re.IGNORECASE)),
+            "human_marker": bool(cfg.get("chunk_state_full_rollout_guard_human_marker", True))
+            and bool(re.search(r"\b(human|assistant)\b\s*:", response_str, re.IGNORECASE)),
+            "document_marker": bool(cfg.get("chunk_state_full_rollout_guard_document_marker", True))
+            and bool(re.search(r"\\(?:begin|end)\s*\{\s*document\s*\}", response_str, re.IGNORECASE)),
+            "asy_repeat": bool(cfg.get("chunk_state_full_rollout_guard_asy_repeat", True))
+            and (response_str.count("[asy]") > 1 or response_str.count("\\text{[asy]}") > 1),
+            "ngram_repeat": bool(cfg.get("chunk_state_full_rollout_guard_ngram_repeat", True))
+            and self._chunk_state_has_ngram_repeat(
+                response_str,
+                int(cfg.get("chunk_state_full_rollout_guard_ngram_size", 12)),
+                int(cfg.get("chunk_state_full_rollout_guard_ngram_max_count", 4)),
+            ),
+            "prompt_copy": prompt_copy_enable
+            and len(re.findall(r"(?:Please provide a step-by-step explanation|Please reason step by step)", response_str)) >= prompt_copy_min_count,
+        }
+
     def _chunk_state_candidate_guard_flags(self, chunk_str: str, prompt_str: str = "") -> dict:
         cfg = self.config.ttrl
         max_boxed = int(cfg.get("chunk_state_target_guard_candidate_max_boxed_count", 1))
@@ -4152,6 +4284,10 @@ class RayPPOTrainer:
         prompt_indices = np.asarray(state_prompts.non_tensor_batch["chunk_state_source_prompt_index"], dtype=np.int64)
         full_response_mask = full_batch.batch["response_mask"].bool()
         source_answer_mass = np.asarray(source_answer_metadata["source_answer_mass"], dtype=np.float32)
+        source_clean_mask = np.asarray(
+            source_answer_metadata.get("source_clean_mask", [1.0] * len(full_batch)),
+            dtype=np.float32,
+        )
         source_answers = source_answer_metadata["source_answer"]
         prompt_mass_values = [
             json.loads(str(value)) if str(value) else {}
@@ -4188,6 +4324,8 @@ class RayPPOTrainer:
             for full_idx in range(prompt_start, prompt_stop):
                 if skip_source and int(full_idx) == source_idx:
                     skipped_source += 1
+                    continue
+                if float(source_clean_mask[full_idx]) <= 0.0:
                     continue
                 mass = float(source_answer_mass[full_idx])
                 if mass < min_mass:
@@ -5057,6 +5195,28 @@ class RayPPOTrainer:
             "support_flow",
         }:
             source_answer_metadata = self._compute_full_rollout_answer_metadata(full_batch)
+            metrics["chunk_state_full_rollout_guard/enabled"] = float(
+                bool(cfg.get("chunk_state_full_rollout_guard_enable", False))
+            )
+            metrics["chunk_state_full_rollout_guard/source_only_clean"] = float(
+                bool(cfg.get("chunk_state_full_rollout_guard_source_only_clean", False))
+            )
+            metrics["chunk_state_full_rollout_guard/clean_rollout_ratio"] = float(
+                source_answer_metadata.get("source_clean_rollout_ratio", 1.0)
+            )
+            for key in [
+                "repeated_boxed",
+                "empty_boxed",
+                "assistant_marker",
+                "human_marker",
+                "document_marker",
+                "asy_repeat",
+                "ngram_repeat",
+                "prompt_copy",
+            ]:
+                metrics[f"chunk_state_full_rollout_guard/{key}_ratio"] = float(
+                    source_answer_metadata.get(f"source_pollution_{key}_ratio", 0.0)
+                )
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
             try:

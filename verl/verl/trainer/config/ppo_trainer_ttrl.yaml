@@ -126,6 +126,24 @@ ttrl:
   chunk_state_source_mixed_low_ratio: 0.75
   chunk_state_source_low_max_answer_mass: 0.35
   chunk_state_source_min_valid_answer_mass: 0.03125
+  # Optional full-rollout pollution guard for chunk-state support construction.
+  # When enabled, malformed full responses are excluded from prompt answer
+  # support and receive zero source mass. source_only_clean additionally
+  # restricts state/source selection to clean full rollouts. Defaults are off
+  # so existing baselines keep identical training semantics.
+  chunk_state_full_rollout_guard_enable: false
+  chunk_state_full_rollout_guard_source_only_clean: false
+  chunk_state_full_rollout_guard_max_boxed_count: 4
+  chunk_state_full_rollout_guard_empty_boxed: true
+  chunk_state_full_rollout_guard_assistant_marker: true
+  chunk_state_full_rollout_guard_human_marker: true
+  chunk_state_full_rollout_guard_document_marker: true
+  chunk_state_full_rollout_guard_asy_repeat: true
+  chunk_state_full_rollout_guard_ngram_repeat: true
+  chunk_state_full_rollout_guard_ngram_size: 12
+  chunk_state_full_rollout_guard_ngram_max_count: 4
+  chunk_state_full_rollout_guard_prompt_copy: true
+  chunk_state_full_rollout_guard_prompt_copy_min_count: 2
   # If enabled with majority_completion scoring, build PowerFlow targets from
   # candidates whose completions match the state-level majority label. This
   # keeps the 2504.16084 label-estimation semantics separate from soft

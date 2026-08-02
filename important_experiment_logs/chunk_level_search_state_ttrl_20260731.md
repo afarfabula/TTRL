@@ -13113,3 +13113,96 @@ zeroed_candidate_ratio ~= 2.27%
 - 下一步不应继续堆 source hard gate，也不应回到 short-horizon local hit teacher。
 - 更合理的 v19 方向：把 pollution/value filter 前移到 full rollout group 和 source/support pool 层面。完整 rollout 一旦出现 prompt echo、重复 boxed、marker 污染、过长复制，应从 group posterior / anchor pool 中剔除或强降权；否则污染轨迹仍会通过 source/support anchor 进入 chunk target。
 - 同时应把 target 从纯 `posterior_mass` 改到更接近 search improvement 的 `posterior_gain` 或 support-value margin：保留 full-group posterior，但要求 candidate chunk 提升未来分布相对 source 的质量，而不是只匹配已有高 mass answer。
+
+## 2026-08-02 support-flow posterior-mass no-split v19 full-rollout guard target-only 3-step smoke
+
+目的：
+
+- 验证 v19 的 full-rollout pollution guard 是否能在工程上稳定跑通，并确认 guard 指标会写入每个 step。
+- 把污染过滤从 128-token candidate 前移到 full rollout group / source / support pool：污染完整回答不进入 answer support mass，source mass 置零；`source_only_clean=True` 时 source/state 选择也只允许 clean rollout。
+- 仍保持 v18 的训练语义：full-rollout group posterior/support 定义 target，PowerFlow target-only loss 更新 chunk span，不回到 short-horizon probe hit 或 source-consistency teacher。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v19_fullguard_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v19_fullguard_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v19_fullguard_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v19_fullguard_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增默认关闭的 full rollout guard 配置项。
+  - 默认 off，确保已有 MV / v18 baseline 语义不变。
+- `verl/trainer/ppo/ray_trainer.py`
+  - 新增 `_chunk_state_full_rollout_guard_flags(...)`，检测 repeated boxed、empty boxed、assistant/human/document marker、asy repeat、ngram repeat、prompt-copy。
+  - `_compute_full_rollout_answer_metadata(...)` 对 dirty full rollout 输出 `source_clean_mask=0`，启用 guard 时把其 answer 视作 `None`，并从 source answer mass 中剔除。
+  - `_make_chunk_state_prompts(...)` 增加 `chunk_state_full_rollout_guard_source_only_clean`，用于只从 clean full rollout 选 state/source。
+  - `_apply_chunk_state_support_anchors(...)` 过滤 dirty full rollout，不让污染轨迹作为 support anchor。
+  - step metrics 增加 full-rollout guard clean/pollution ratio 和 source clean/prompt clean ratio。
+
+关键配置：
+
+```text
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+actor_rollout_ref.rollout.val_kwargs.n=16
+ttrl.n_votes_per_prompt=64
+ttrl.n_samples_per_prompt=32
+ttrl.chunk_state_score_mode=support_flow
+ttrl.chunk_state_support_flow_score_type=posterior_mass
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_mid_require_nonzero_boundary=True
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                    1        2        3
+clean_rollout_ratio                  0.730    0.767    0.731
+repeated_boxed_ratio                 0.056    0.061    0.074
+empty_boxed_ratio                    0.093    0.073    0.104
+assistant_marker_ratio               0.152    0.131    0.140
+human_marker_ratio                   0.148    0.125    0.138
+ngram_repeat_ratio                   0.031    0.033    0.031
+prompt_copy_ratio                    0.002    0.001    0.000
+prompt_valid_answer_coverage_mean    0.781    0.805    0.750
+prompt_clean_rollout_ratio_mean      0.879    0.824    0.844
+source_clean_mask_mean               1.000    1.000    1.000
+real_states                          2        5        1
+pad_states                           6        3        7
+num_actor_samples                    8        32       8
+skipped_support_sources              30       25       29
+support_flow_posterior_mass_mean     0.722    0.601    0.717
+target_guard_zeroed_candidate_ratio  0.000    0.000    0.000
+update_actor                         0.702s   1.300s   0.498s
+gen                                  43.472s  23.673s  22.721s
+chunk_state_score                    7.607s   7.176s   5.663s
+```
+
+观察：
+
+- v19 3-step smoke 工程跑通，Ray/vLLM/FSDP 没有崩溃，final validation 按 smoke 配置跳过。
+- 启动日志确认当前 B200 快链路生效：8 卡、`/models/Qwen2.5-Math-7B`、vLLM `attention_config.backend=FLASH_ATTN`、CUDA graph capture、NCCL P2P/NVLS、actor fused kernels/remove padding、dynamic batch off。
+- full-rollout guard 不再是 no-op：约 23%-27% full rollouts 被识别为 dirty。主要污染来自 assistant/human marker、empty boxed、repeated boxed 和 ngram repeat。
+- source 选择被清洁化后，最终被选中的 source 都是 clean：`source_clean_mask_mean=1.0`。
+- 但 `source_only_clean=True` 叠加原 support gate 过于保守：3 step 只得到 2/5/1 个 real states，skipped support sources 高达 30/25/29，actor samples 只有 8/32/8。直接扩 20-step 会让训练信号太稀疏。
+- candidate-level guard 在 v19 中几乎不触发，说明污染确实主要在完整 rollout/source/support 层，而不是当前 128-token candidate 层。
+
+结论：
+
+- v19 full-rollout guard 的工程实现有效，值得保留为默认关闭的可选机制。
+- v19 当前配置不能直接作为 20-step gate：它解决了污染进入 source/support 的问题，但同时把 state utilization 打得太低。
+- 下一步应做 v20：保留 full-rollout clean support pool，但放松 source/state 选择或改成 soft weighting。优先方向是 `chunk_state_full_rollout_guard_enable=True`、`source_only_clean=False`，同时让 dirty rollout 仍不进入 support posterior/anchor；如果 real states 仍低，再降低 `min_prompt_valid_answer_coverage` 或从 hard gate 改为 per-state loss weight。
+- 另一个方向是把 `posterior_mass` 切到 `posterior_gain` / value margin，让 target 更像 search improvement，而不是只追随已有高 mass answer；但这应在 state utilization 先恢复后再做 20-step 对比。
