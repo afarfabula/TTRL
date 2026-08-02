@@ -70,6 +70,10 @@ ttrl:
   # Keep 0 by default for backward compatibility. Diagnostic scripts can set a
   # positive value to prefer true mid-reasoning states over prompt-only states.
   chunk_state_min_boundary: 0
+  # Defaults are conservative for compatibility. Experiments can require true
+  # nonzero mid states and skip low-information batches that have no valid state.
+  chunk_state_mid_require_nonzero_boundary: false
+  chunk_state_skip_empty_state_batch: false
   chunk_state_alpha: 2.0
   chunk_state_eps: 0.05
   chunk_state_min_informative_gap: 0.0

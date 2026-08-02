@@ -66,6 +66,10 @@ from verl.utils.tracking import ValidationGenerationsLogger
 WorkerType = Type[Worker]
 
 
+class EmptyChunkStateBatchError(RuntimeError):
+    """Raised when chunk-state filtering leaves no trainable state in a batch."""
+
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -1201,6 +1205,7 @@ class RayPPOTrainer:
         source_mixed_low_ratio = float(cfg.get("chunk_state_source_mixed_low_ratio", 0.75))
         source_low_max_answer_mass = float(cfg.get("chunk_state_source_low_max_answer_mass", 0.35))
         source_min_valid_answer_mass = float(cfg.get("chunk_state_source_min_valid_answer_mass", 0.0))
+        mid_require_nonzero_boundary = bool(cfg.get("chunk_state_mid_require_nonzero_boundary", False))
         if (
             min_prompt_top_mass > 0.0
             or min_prompt_valid_answer_coverage > 0.0
@@ -1215,7 +1220,14 @@ class RayPPOTrainer:
             )
         if not boundaries:
             boundaries = [0]
-        min_required_response_len = max([b for b in boundaries if b >= min_boundary], default=min_boundary)
+        candidate_required_boundaries = [b for b in boundaries if b >= min_boundary]
+        if boundary_mode == "mid" and mid_require_nonzero_boundary:
+            candidate_required_boundaries = [b for b in candidate_required_boundaries if b > 0]
+        min_required_response_len = (
+            min(candidate_required_boundaries)
+            if candidate_required_boundaries
+            else min_boundary
+        )
 
         prompt_count = len(batch) // n
         prompt_len = batch.batch["prompts"].shape[-1]
@@ -1456,6 +1468,9 @@ class RayPPOTrainer:
                     ]
                     if mid_boundaries:
                         allowed_boundaries = mid_boundaries
+                    elif mid_require_nonzero_boundary:
+                        skipped_short_sources += 1
+                        continue
                 boundary = allowed_boundaries[(self.global_steps + prompt_idx + state_idx) % len(allowed_boundaries)]
                 prefix_ids = batch.batch["responses"][source_index, :boundary]
                 state_ids = torch.cat([prompt_ids, prefix_ids], dim=0)
@@ -1480,7 +1495,7 @@ class RayPPOTrainer:
                 state_loss_weights.append(1.0)
 
         if not state_input_ids:
-            raise RuntimeError(
+            raise EmptyChunkStateBatchError(
                 "chunk-state source selection produced no valid states; "
                 f"min_required_response_len={min_required_response_len}, boundaries={boundaries}"
             )
@@ -4963,14 +4978,20 @@ class RayPPOTrainer:
             source_answer_metadata = self._compute_full_rollout_answer_metadata(full_batch)
 
         with marked_timer("chunk_state_make_states", timing_raw, color="cyan"):
-            state_prompts, _ = self._make_chunk_state_prompts(
-                full_batch,
-                source_correctness=source_correctness,
-                source_majority_consistent=source_majority_consistent,
-                source_majority_ratios=source_majority_ratios,
-                source_majority_labels=source_majority_labels,
-                source_answer_metadata=source_answer_metadata,
-            )
+            try:
+                state_prompts, _ = self._make_chunk_state_prompts(
+                    full_batch,
+                    source_correctness=source_correctness,
+                    source_majority_consistent=source_majority_consistent,
+                    source_majority_ratios=source_majority_ratios,
+                    source_majority_labels=source_majority_labels,
+                    source_answer_metadata=source_answer_metadata,
+                )
+            except EmptyChunkStateBatchError:
+                if not bool(cfg.get("chunk_state_skip_empty_state_batch", False)):
+                    raise
+                metrics["chunk_state/empty_state_batch_skipped"] = 1.0
+                return
             if source_correctness is not None:
                 n = int(cfg.n_samples_per_prompt)
                 prompt_count = len(full_batch) // n

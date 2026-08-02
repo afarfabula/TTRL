@@ -12363,3 +12363,346 @@ update_actor            1.024s           0.974s
 - 先跑 20-step pilot：`posterior_support_match + highmassanchors + soft keep`，每 20 step 做一次 val 或先 final val，观察 mean@16/maj@16 是否开始超过 MV baseline。
 - 同时准备 v13 小改：posterior-aware learnable gate，去掉对 `state_top_margin` 的硬依赖，强制 nonzero mid/late boundary，保留 low-information skip/downweight。
 - 若 20-step target 指标稳定，再扩到 80-step pilot；若 20-step 仍差，优先改 state selection，不回退到 short-probe local teacher。
+
+## 2026-08-02 posterior-support-match highmassanchors v12 20-step pilot partial
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_highmassanchors_v12_mid_c128_probe1536x4_b32_r32_v64_20step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_highmassanchors_v12_20step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_highmassanchors_v12_mid_c128_probe1536x4_b32_r32_v64_20step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_highmassanchors_v12_mid_c128_probe1536x4_b32_r32_v64_20step_20260802.jsonl`
+
+状态：
+
+- 计划 20 step，但在 step 9 后人工中止。
+- 没有产生 step 20 validation；本次只作为 target 质量诊断，不作为最终 acc 实验。
+- 中止原因不是 actor update 慢，而是 target 质量反复塌陷，继续跑会浪费 GPU 时间。
+
+1-9 step 聚合：
+
+```text
+step  coverage  oov    score  keep   actor_samples  actor_w_nonzero  update_actor  gen     probe  score_t
+1     0.328     0.672  0.338  0.500  24             1.000            1.361         43.377  7.093  9.689
+2     0.664     0.336  0.467  0.375  8              1.000            0.470         33.230  7.105  8.141
+3     0.785     0.215  0.490  0.625  24             1.000            1.069         22.690  6.774  7.339
+4     0.402     0.598  0.411  0.750  32             1.000            1.378         23.830  6.987  6.546
+5     0.012     0.988  0.201  0.000  64             0.000            2.395         21.644  9.472  5.895
+6     0.043     0.957  0.194  0.000  64             0.000            2.555         23.144  7.104  7.777
+7     0.277     0.723  0.312  0.750  24             1.000            1.099         23.387  6.940  8.676
+8     0.688     0.312  0.502  0.125  16             1.000            0.888         22.608  7.028  6.235
+9     0.070     0.930  0.272  0.000  8              1.000            0.477         22.786  7.210  6.797
+mean  0.363     0.637  0.354  0.347  29.3           0.778            1.299         26.300  7.301  7.455
+```
+
+关键结论：
+
+- v12 smoke 的三步好转没有延续到 20-step pilot；step 5/6 连续出现 `actor_batch_powerflow_weight_nonzero_ratio=0`，实际是零权重 update。
+- `support_coverage_mean` 均值只有 `0.363`，`state_oov_mean` 均值 `0.637`；step 5/6/9 分别掉到 `coverage=0.012/0.043/0.070`。
+- `label_consistent_ratio=1.0` 在这里不再足以说明 target 好，因为 posterior smoothing 能把 label 做成 consistent，但 candidate future distribution 仍可能大面积 OOV。
+- `update_actor` 均值 `1.299s`，即使塌陷 step 也只是 2.4-2.6s；所以 infra/actor update 不是当前主矛盾。
+- 更准确的失败归因：`posterior_support_match` 仍然从 candidate probe answers/counts 出发，再用 full-rollout posterior 做 smoothing。它比 raw short-probe teacher 好，但结构上还没有真正放弃“局部 probe 分布主导 target”的约束。
+- 这和最新策略纠偏一致：应放弃“局部短视可判定性”，不再让 short-horizon probe/local answer hit/source consistency 直接定义 chunk teacher。
+
+下一步 v13：
+
+- 不继续加 source gate 或 anchor mass gate。
+- 切到 `chunk_state_score_mode=support_flow`，使用 full-rollout support anchors 和 `chunk_state_support_flow_score_type=posterior_mass`。
+- target 直接由 prompt-level full-rollout answer posterior mass 映射到 support anchors；source chunk/anchor 只作为 proposal/prior/drift guard，不作为 teacher floor。
+- probe 不再参与 teacher 定义；先跑 3-step smoke 看 `support_flow/score_mean`、`nonzero_state_ratio`、`actor_w_nonzero`、`target_entropy` 和 `update_actor`。
+
+## 2026-08-02 support-flow posterior-mass v13 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_v13_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_v13_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_v13_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_v13_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+相对 v12 的关键变化：
+
+- `ttrl.chunk_state_score_mode=support_flow`
+- `ttrl.chunk_state_support_flow_score_type=posterior_mass`
+- `chunk_state_probe/skipped_for_support_flow=1.0`，不再让 probe answers/counts 定义 teacher。
+- target 由 full-rollout group answer posterior 映射到 injected support anchors；source/anchor 是 proposal/prior，不是 short-probe teacher。
+
+三步质量汇总：
+
+```text
+step  anchor_inj  anchor_mass  uniq_answer  post_mean  post_max  source_mass  margin   score  label  answer_cov  pos_ratio  entropy  samples  actor_w_nz  update_actor
+1     1.000       0.298        0.732        0.096      0.311     0.708        -0.397   0.096  0.875  0.875       0.096      1.360    24       1.000       1.318
+2     0.286       0.031        1.000        0.008      0.031     0.531        -0.500   0.008  0.250  0.250       0.008      1.969    8        1.000       0.481
+3     0.964       0.504        0.357        0.089      0.258     0.642        -0.384   0.089  0.844  0.844       0.089      1.588    32       1.000       1.419
+mean  0.750       0.278        0.696        0.064      0.200     0.627        -0.427   0.064  0.656  0.656       0.064      1.639    21.3     1.000       1.073
+```
+
+耗时：
+
+```text
+step  gen      chunks  score  ref    update_actor
+1     43.477   1.075   7.555  4.291  1.318
+2     22.366   1.040   6.076  0.148  0.481
+3     22.686   1.045   6.427  0.526  1.419
+mean  29.510   1.053   6.686  1.655  1.073
+```
+
+结论：
+
+- v13 完成了最重要的语义修正：teacher 不再由 short-horizon probe/local answer hit 定义。
+- 三步 `actor_batch_powerflow_weight_nonzero_ratio=1.0`，没有 v12 step 5/6 那种零权重 update。
+- 但 target 强度偏弱：`posterior_mass_mean=0.064`、`positive_ratio=0.064`，step 2 只有 `score_mean=0.008`。
+- 主要原因是 `posterior_split_duplicates=True`：如果同一个 answer 下有多个 support anchors，answer posterior mass 被拆分到多个 candidate，导致单个 chunk target mass 过小；step 3 的 `posterior_answer_duplicate_ratio=0.643` 说明重复 answer 很常见。
+- 这不是回到 source gate 的问题，而是 full-posterior target 在 chunk-candidate 分布上的 mass allocation 问题。
+
+下一步：
+
+- 跑 v14 smoke：保持 `support_flow + posterior_mass`，但设置 `chunk_state_support_flow_posterior_split_duplicates=False`。
+- 目标是测试“每个来自高 posterior answer 的 chunk 都可作为有效 local transition”时，target score/positive ratio/grad 是否恢复，同时仍不使用 short-probe teacher。
+- 如果 v14 稳定，再扩 20-step；如果 v14 过尖或过强，再考虑 partial split（`answer_split_power`）或按 chunk diversity 分配 mass。
+
+## 2026-08-02 support-flow posterior-mass no-split v14 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v14_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v14_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v14_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v14_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+相对 v13 的唯一核心变化：
+
+- `ttrl.chunk_state_support_flow_posterior_split_duplicates=False`
+- 同一 full-rollout support answer 下的多个 anchor chunk 不再平分 answer posterior mass；每个来自高 posterior answer 的 chunk 都可作为有效 local transition target。
+- 仍然保持 `chunk_state_probe/skipped_for_support_flow=1.0`，不回到 short-probe teacher。
+
+三步质量汇总：
+
+```text
+step  split  anchor_inj  anchor_mass  uniq_answer  post_mean  post_max  source_mass  margin  score  label  answer_cov  pos_ratio  entropy  samples  actor_w_nz  update_actor
+1     0      1.000       0.298        0.732        0.261      0.625     0.708        -0.083  0.261  0.875  0.875       0.261      1.217    24       1.000       1.350
+2     0      0.982       0.388        0.571        0.334      0.613     0.698        -0.085  0.334  0.859  0.859       0.334      1.502    24       1.000       0.995
+3     0      1.000       0.351        0.661        0.307      0.706     0.706         0.000  0.307  0.875  0.875       0.307      1.282    16       1.000       0.767
+mean  0      0.994       0.346        0.655        0.301      0.648     0.704        -0.056  0.301  0.870  0.870       0.301      1.334    21.3     1.000       1.037
+```
+
+耗时：
+
+```text
+step  gen      chunks  score  ref    update_actor
+1     43.480   1.140   7.634  4.262  1.350
+2     23.011   0.939   5.995  0.373  0.995
+3     22.359   1.045   5.712  0.289  0.767
+mean  29.617   1.041   6.447  1.641  1.037
+```
+
+与 v13 对比：
+
+```text
+metric                       v13 split  v14 no-split
+posterior_mass_mean          0.064      0.301
+posterior_mass_max_mean      0.200      0.648
+label_consistent_ratio       0.656      0.870
+answer_coverage_mean         0.656      0.870
+positive_ratio               0.064      0.301
+target_entropy               1.639      1.334
+actor_w_nonzero              1.000      1.000
+update_actor                 1.073s     1.037s
+```
+
+结论：
+
+- v14 是当前最好的 chunk-level search-state TTRL target 版本。
+- 它真正放弃了 short-probe teacher，同时比 v13 修复了 target 过弱问题。
+- 三步都没有 v12 的零权重 update，`answer_coverage_mean=0.870`，`positive_ratio=0.301`，target 强度足够进入 20-step pilot。
+- no-split 的解释是合理的：训练目标是 local transition improvement，不是 prompt-level answer probability conservation；同一个高 posterior answer 下的多个不同 chunk 都可能是有效的下一段推理转移。
+- 注意：末尾有 `Exception ignored in atexit callback ... DataLoader worker ... killed`，但主进程 exit code 为 0，且 `Final validation skipped` 是预期 smoke 配置。先记录为非阻塞退出清理噪声。
+
+下一步：
+
+- 扩 v14 到 20-step pilot，保留 batch32/rollout32/votes64、8 卡、dynamic bsz off。
+- step 20 做 final validation，观察 mean@16/maj@16 是否优于 MV 对齐链路。
+- 若 20-step 中 `posterior_mass_mean` 保持 0.25-0.35、`actor_w_nonzero=1.0`，再扩 80-step。
+
+## 2026-08-02 v14 20-step partial 与 v15 nonzero-mid 修复
+
+背景：
+
+- 用户明确要求放弃“局部短视可判定性”：chunk target 不应主要由 short-horizon probe 的局部命中、source answer consistency 或短 probe answer distribution 来定义。
+- 因此 v13/v14 后续都保持 `chunk_state_score_mode=support_flow` + `posterior_mass`，并且 `chunk_state_probe/skipped_for_support_flow=1.0`。
+- source chunk / support anchor 只作为 proposal/prior/drift guard；teacher target 来自 prompt-level full-rollout answer posterior/support，而不是 short-probe hit。
+
+### v14 no-split 20-step partial
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v14_mid_c128_b32_r32_v64_20step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v14_20step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v14_mid_c128_b32_r32_v64_20step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v14_mid_c128_b32_r32_v64_20step_20260802.jsonl`
+
+结果：
+
+- 运行到 step 18 后失败，未产出 final validation。
+- 失败点：
+
+```text
+RuntimeError: chunk-state source selection produced no valid states;
+min_required_response_len=1024, boundaries=[0, 256, 512, 768, 1024]
+```
+
+v14 partial 聚合：
+
+```text
+steps                                      18
+posterior_mass_mean                       0.2710
+posterior_mass_max_mean                   0.5793
+source_mass_mean                          0.7359
+label_consistent_ratio                    0.7301
+boundary_zero_ratio                       0.0486
+real_state_count                          3.2222
+answer_coverage_mean                      0.7396
+positive_ratio                            0.2710
+num_actor_samples                         25.7778
+actor_batch_powerflow_weight_nonzero      1.0000
+gen                                       25.5223s
+chunk_state_chunks                         0.9713s
+chunk_state_score                          7.4726s
+chunk_state_ref                            0.6088s
+update_actor                               1.1842s
+```
+
+结论：
+
+- v14 的 full-posterior no-split target 语义仍然正确：全程 `skipped_for_support_flow=1.0`，没有回到 short-probe teacher。
+- 但工程实现有一个不合理硬约束：`mid` boundary 预筛用了最大 boundary 1024 作为 `min_required_response_len`，导致某些 batch 明明有 256/512 这类可用中间 state，却被认为没有 valid state。
+- 另一个问题是 `mid` fallback 仍可能退回 boundary 0，和“中后段 search state”的实验设计不一致。
+- 低信息 / 无有效 state batch 不应该杀掉训练；它应该被跳过并记录。
+
+### v15 nonzero-mid + skip-empty 20-step
+
+代码修复：
+
+- `verl/trainer/ppo/ray_trainer.py`
+  - 新增 `EmptyChunkStateBatchError`，将“没有可训练 chunk state”从普通 `RuntimeError` 区分出来。
+  - 新增 `ttrl.chunk_state_mid_require_nonzero_boundary`：mid mode 下要求使用非零 chunk boundary；如果没有非零 mid boundary，该 source 被跳过。
+  - 修正 `min_required_response_len`：从“最大 boundary”改为“可用最小 boundary”，避免要求所有 source 都长到 1024。
+  - 新增 `ttrl.chunk_state_skip_empty_state_batch`：当整个 batch 没有有效 state 时，记录 `chunk_state/empty_state_batch_skipped=1.0` 并跳过 actor update，而不是中断实验。
+- `verl/trainer/config/ppo_trainer_ttrl.yaml`
+  - 新增上述两个配置项，默认关闭，保持历史兼容。
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v15_nonzeromid_skipempty_c128_b32_r32_v64_20step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v15_nonzeromid_skipempty_20step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v15_nonzeromid_skipempty_c128_b32_r32_v64_20step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v15_nonzeromid_skipempty_c128_b32_r32_v64_20step_20260802.jsonl`
+- val json: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v15_nonzeromid_skipempty_c128_b32_r32_v64_20step_20260802_val_metrics.json`
+
+关键配置：
+
+```text
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.n_votes_per_prompt=64
+ttrl.n_samples_per_prompt=32
+ttrl.chunk_state_score_mode=support_flow
+ttrl.chunk_state_support_flow_score_type=posterior_mass
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_mid_require_nonzero_boundary=True
+ttrl.chunk_state_skip_empty_state_batch=True
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_use_chunk_weights=True
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+v15 训练聚合：
+
+```text
+steps                                      20
+trainable chunk steps                      19
+empty_state_batch_skipped                   1
+posterior_mass_mean                       0.4724
+posterior_mass_max_mean                   0.6928
+source_mass_mean                          0.7222
+label_consistent_ratio                    0.8692
+boundary_zero_ratio                       0.0000
+real_state_count                          3.8947
+answer_coverage_mean                      0.8733
+positive_ratio                            0.4724
+num_actor_samples                         31.1579
+actor_batch_powerflow_weight_nonzero      1.0000
+gen                                       25.0278s
+chunk_state_chunks                         1.0574s
+chunk_state_score                          6.4636s
+chunk_state_ref                            0.6486s
+update_actor                               1.2274s
+final_validation                         301.4090s
+```
+
+v15 validation：
+
+```text
+mean@16        0.398375
+maj@16         0.502288
+best@16        0.804986
+format mean@16 0.877750
+format maj@16  0.837458
+```
+
+与 v14 partial 对比：
+
+```text
+metric                       v14 partial  v15 nonzero-mid
+posterior_mass_mean          0.2710       0.4724
+posterior_mass_max_mean      0.5793       0.6928
+label_consistent_ratio       0.7301       0.8692
+answer_coverage_mean         0.7396       0.8733
+boundary_zero_ratio          0.0486       0.0000
+real_state_count             3.2222       3.8947
+num_actor_samples            25.7778      31.1579
+update_actor                 1.1842s      1.2274s
+```
+
+结论：
+
+- v15 工程修复是有效的：真正消除了 boundary 0，避免了 no-valid-state crash，并且 target 质量指标显著高于 v14。
+- 但 v15 的最终 acc 很差，20-step 后 `mean@16=0.398`、`maj@16=0.502`、`best@16=0.805`，明显不接近 MV / PowerFlow 参考轨迹。
+- final validation 日志出现大量重复 `\boxed{}`，说明当前 PowerFlow chunk actor update 虽然 target 更干净，但训练行为破坏了输出分布或格式稳定性。
+- 因此，下一步不应简单扩 80-step。当前版本适合作为“full-posterior target + nonzero-mid infra”正交组件保留，但 loss/weighting 需要重新设计。
+
+下一步判断：
+
+- 保留：`support_flow + posterior_mass`、`posterior_split_duplicates=False`、nonzero mid boundary、empty-state skip、dynamic bsz off。
+- 暂停扩展：当前 `powerflow_use_boxed_reward=True` + chunk weights 的直接 PowerFlow 更新。
+- 优先排查：
+  - 为什么 PowerFlow chunk update 诱发重复 boxed 污染。
+  - 是否需要改成 target-only KL/distillation 或 supervised distribution matching，而不是当前 `boxed_reward` 注入式 PowerFlow loss。
+  - 是否要对 chunk update 加格式/重复 marker guard，或让 source chunk 仅作为 prior 而不是 response span 的高权重训练样本。
+  - 20-step smoke 的准入门槛不能只看 target 质量，还必须看 validation format collapse。
+
+### 当前策略纠偏
+
+这条线下一步要明确放弃的不是 PowerFlow 骨架、hardfilter/clip4、full-rollout label estimation，也不是 chunk-level search-state training 本身，而是“局部短视可判定性”这个训练约束：
+
+```text
+不要再要求 chunk target 主要由 short-horizon probe 的局部 answer hit、
+source answer consistency、或短 probe answer distribution 来定义。
+```
+
+原因：
+
+- v12/v13/v14/v15 已经反复显示，训练更新速度不是主矛盾。hardfilter/clip4/nonzero-mid 后 `update_actor` 可以稳定在约 `1.0-1.5s`。
+- 真正没有解决的是 target 质量和训练行为：support/OOV/format collapse 指向同一个问题，即局部 probe 信号不是可靠的 search-improvement target。
+- sourcegate/source consistency 方向更强时会把 support coverage 拉低、OOV 拉高，说明继续加 source 侧硬约束不是主解。
+- v13-v15 的 `support_flow + posterior_mass` 方向之所以更合理，是因为它让 full-rollout group posterior/support 主导 target，probe 被跳过或降级为 future distribution estimator，而不是 teacher。
+
+下一版 target 原则：
+
+- full rollout group 先定义 prompt-level answer support posterior/value。
+- chunk state 只学习哪个 local transition 会把未来分布推向这个 full-group posterior/value。
+- source chunk / support anchor 只作为 proposal、prior 或 drift guard，不作为 teacher floor。
+- low-information state 直接跳过或强降权，包括 all-negative、low support coverage、high OOV、flat posterior、malformed/repeated boxed/marker contamination。
+- probe 如继续使用，只能用于估计 future distribution 或 longer-horizon value，不再单独决定 teacher。
+
+因此 v16 不应简单扩展 v15，也不应回退到 short-probe local hit。优先方向是把当前 `boxed_reward` 注入式 PowerFlow 更新替换为更稳定的 full-posterior distribution matching / target-only KL / guarded PowerFlow variant，并把 validation format collapse 作为 smoke 准入指标。
