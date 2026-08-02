@@ -11238,3 +11238,66 @@ mean  29.536   1.015   6.264   3.697   6.174
   - `prompt_answer_top_margin` 太低、support 太平的 state 跳过或降权。
   - `prompt_answer_entropy` 过高的 state 跳过或降权。
 - 目标是保留 `power=0.5` 的 partial answer split，同时提高可训练 state 的 support coverage 稳定性，再跑 3-step smoke；只有 `answer_coverage >= 0.75` 且 `positive_margin > 0.20` 稳定后再扩 20-step。
+
+## 2026-08-02 support_flow fractional answer-split + group-quality weight smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_groupq_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_massprop_answersplit05_groupq_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_groupq_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_groupq_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- 扩展 `ttrl.chunk_state_source_quality_weight_mode`，新增基于 full-rollout group metadata 的 opt-in 权重：
+  - `prompt_valid_answer_coverage`
+  - `prompt_top_margin`
+  - `coverage_margin_product`
+  - `group_quality`
+- 本轮使用 `coverage_margin_product`，不是 hard filter：低 coverage / 低 top-margin 的 state 降权，但不直接丢弃，避免再次把 actor batch 打得太碎。
+- 仍保持 `chunk_state_probe/skipped_for_support_flow=1.0`，不让 short-horizon probe/local answer hit/source consistency 主导 target。
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_support_flow_answer_split_power=0.5
+ttrl.chunk_state_source_quality_weight_mode=coverage_margin_product
+ttrl.chunk_state_source_quality_weight_floor=0.25
+ttrl.chunk_state_source_quality_weight_power=0.5
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  src_q_w  source_mass  pos_margin  ans_cov  anchor_inject  uniq_ans  dup_ans  target_entropy
+1     24          192            0.583    0.092        0.116       0.734    0.857          0.805     0.196    1.993
+2     16          128            0.593    0.067        0.120       0.703    0.821          0.922     0.081    2.011
+3     18          144            0.527    0.077        0.204       0.781    0.917          0.809     0.186    1.938
+mean  19.3        154.7          0.568    0.079        0.147       0.739    0.865          0.845     0.154    1.981
+```
+
+耗时：
+
+```text
+step  gen      chunks  score   ref     update_actor
+1     43.516   0.968   7.379   6.798   7.509
+2     32.528   0.941   5.860   1.875   4.836
+3     22.425   0.976   5.966   2.099   5.327
+mean  32.823   0.962   6.402   3.591   5.891
+```
+
+结论：
+
+- 不扩 20-step。`answer_coverage_mean=0.739`，已经明显好于上一轮 `0.703`，但还没有稳定超过 `0.75`；`positive_margin_mean=0.147` 仍低于希望的 `0.20`。
+- 这轮是正向信号：第 2 step 的 coverage 从上一轮 `0.599` 拉到 `0.703`，第 3 step 达到 `answer_coverage=0.781`、`positive_margin=0.204`，说明 full-group quality soft weight 在减少低信息 state 干扰。
+- `update_actor_mean=5.89s`，训练更新不是主矛盾；target 质量仍是主矛盾。
+- `source_quality_weight_mean=0.568`，说明当前 weight 主要是降权而不是过滤。这个符合“full rollout group 先定义 support/value，chunk 只学习把未来分布推向好答案”的方向。
+
+下一步：
+
+- 需要补充 quality-weighted target 诊断，而不是只看未加权的 `answer_coverage_mean/positive_margin_mean`。当前 actor 实际看到的是 `source_quality_weight * target weight`，但日志里还没有加权 coverage/margin。
+- 如果加权后的 coverage/margin 已经达标，可以用这版扩 20-step；如果仍不够，下一版优先尝试：
+  - `group_quality`，加入 entropy penalty。
+  - 或轻量 hard gate：`chunk_state_min_prompt_top_margin` / `chunk_state_min_prompt_valid_answer_coverage`，只跳过 full group support 明显太散的 prompt。
+  - 不回到 short-horizon probe teacher，不增加 source-side hard teacher。

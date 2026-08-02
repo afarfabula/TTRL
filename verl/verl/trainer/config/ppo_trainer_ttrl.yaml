@@ -102,9 +102,14 @@ ttrl:
   # Optional continuous state weighting from full-rollout support metadata.
   # This keeps source/support quality as a drift guard without hard-skipping
   # states. Defaults are neutral.
-  chunk_state_source_quality_weight_mode: "off"  # off | source_mass | prompt_top_mass | product
+  # Supported modes: off, source_mass, prompt_top_mass, product,
+  # prompt_valid_answer_coverage, prompt_top_margin, coverage_margin_product,
+  # and group_quality. group_quality combines full-rollout valid-answer
+  # coverage, answer top-margin, and an optional entropy penalty.
+  chunk_state_source_quality_weight_mode: "off"
   chunk_state_source_quality_weight_floor: 0.0
   chunk_state_source_quality_weight_power: 1.0
+  chunk_state_source_quality_max_entropy: 0.0
   # If enabled, candidate source rollouts are ranked by their answer mass under
   # the prompt-level full-rollout support before cycling. This keeps the
   # selected state path closer to high-support answers without hard-coding GT.

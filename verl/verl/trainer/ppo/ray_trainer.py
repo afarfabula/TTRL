@@ -4522,6 +4522,27 @@ class RayPPOTrainer:
             ),
             dtype=torch.float32,
         ).clamp(min=0.0, max=1.0)
+        prompt_valid_answer_coverage = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_prompt_valid_answer_coverage",
+                np.ones(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        ).clamp(min=0.0, max=1.0)
+        prompt_answer_top_margin = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_prompt_answer_top_margin",
+                np.ones(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        ).clamp(min=0.0, max=1.0)
+        prompt_answer_entropy = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_prompt_answer_entropy",
+                np.zeros(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        ).clamp(min=0.0)
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
         confidence_gate = (majority_ratios >= min_majority_ratio) & (answer_coverage >= min_answer_coverage)
         confidence_weight = torch.ones(num_states, dtype=torch.float32)
@@ -4550,6 +4571,7 @@ class RayPPOTrainer:
         source_quality_weight_mode = str(cfg.get("chunk_state_source_quality_weight_mode", "off"))
         source_quality_weight_floor = float(cfg.get("chunk_state_source_quality_weight_floor", 0.0))
         source_quality_weight_power = float(cfg.get("chunk_state_source_quality_weight_power", 1.0))
+        source_quality_max_entropy = float(cfg.get("chunk_state_source_quality_max_entropy", 0.0))
         if source_quality_weight_mode == "off":
             source_quality_weight = torch.ones(num_states, dtype=torch.float32)
         elif source_quality_weight_mode == "source_mass":
@@ -4558,10 +4580,25 @@ class RayPPOTrainer:
             source_quality_weight = source_prompt_top_mass
         elif source_quality_weight_mode == "product":
             source_quality_weight = source_answer_mass * source_prompt_top_mass
+        elif source_quality_weight_mode == "prompt_valid_answer_coverage":
+            source_quality_weight = prompt_valid_answer_coverage
+        elif source_quality_weight_mode == "prompt_top_margin":
+            source_quality_weight = prompt_answer_top_margin
+        elif source_quality_weight_mode == "coverage_margin_product":
+            source_quality_weight = prompt_valid_answer_coverage * prompt_answer_top_margin
+        elif source_quality_weight_mode == "group_quality":
+            source_quality_weight = prompt_valid_answer_coverage * prompt_answer_top_margin
+            if source_quality_max_entropy > 0.0:
+                entropy_weight = (1.0 - (prompt_answer_entropy / source_quality_max_entropy)).clamp(
+                    min=0.0,
+                    max=1.0,
+                )
+                source_quality_weight = source_quality_weight * entropy_weight
         else:
             raise ValueError(
                 "Unsupported ttrl.chunk_state_source_quality_weight_mode="
-                f"{source_quality_weight_mode!r}; expected off, source_mass, prompt_top_mass, or product"
+                f"{source_quality_weight_mode!r}; expected off, source_mass, prompt_top_mass, product, "
+                "prompt_valid_answer_coverage, prompt_top_margin, coverage_margin_product, or group_quality"
             )
         if source_quality_weight_power != 1.0:
             source_quality_weight = torch.pow(source_quality_weight.clamp(min=0.0, max=1.0), source_quality_weight_power)
@@ -4718,11 +4755,27 @@ class RayPPOTrainer:
                 source_quality_weight_mode == "prompt_top_mass"
             ),
             "chunk_state/source_quality_weight_mode_product": float(source_quality_weight_mode == "product"),
+            "chunk_state/source_quality_weight_mode_prompt_valid_answer_coverage": float(
+                source_quality_weight_mode == "prompt_valid_answer_coverage"
+            ),
+            "chunk_state/source_quality_weight_mode_prompt_top_margin": float(
+                source_quality_weight_mode == "prompt_top_margin"
+            ),
+            "chunk_state/source_quality_weight_mode_coverage_margin_product": float(
+                source_quality_weight_mode == "coverage_margin_product"
+            ),
+            "chunk_state/source_quality_weight_mode_group_quality": float(
+                source_quality_weight_mode == "group_quality"
+            ),
             "chunk_state/source_quality_weight_mean": source_quality_weight.mean().detach().item(),
             "chunk_state/source_quality_weight_floor": source_quality_weight_floor,
             "chunk_state/source_quality_weight_power": source_quality_weight_power,
+            "chunk_state/source_quality_max_entropy": source_quality_max_entropy,
             "chunk_state/source_answer_mass_mean": source_answer_mass.mean().detach().item(),
             "chunk_state/source_prompt_top_mass_mean": source_prompt_top_mass.mean().detach().item(),
+            "chunk_state/prompt_valid_answer_coverage_mean": prompt_valid_answer_coverage.mean().detach().item(),
+            "chunk_state/prompt_answer_top_margin_mean": prompt_answer_top_margin.mean().detach().item(),
+            "chunk_state/prompt_answer_entropy_mean": prompt_answer_entropy.mean().detach().item(),
             "chunk_state/majority_ratio_mean": majority_ratios.mean().detach().item(),
             "chunk_state/answer_coverage_mean": answer_coverage.mean().detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
