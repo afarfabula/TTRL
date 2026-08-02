@@ -10028,3 +10028,77 @@ step 3:
 - `source_quality_weight_mean=0.685-0.769`，说明 source mass 作为连续权重在起作用，但没有把样本清零；`actor_batch_powerflow_weight_nonzero_ratio=1.0` 继续稳定。
 - 仍不能直接宣称已解决：step 2/3 仍只有 16/18 real states，主要剩余瓶颈是 `chunk_state_min_prompt_top_mass=0.30` 仍是 prompt-level hard gate。下一版应把 prompt support 也从 hard gate 改成连续权重，或把 `min_prompt_top_mass` 降到 `0.0-0.2` 后用 `prompt_top_mass` / coverage / entropy 组成 state quality weight。
 - 方法方向保持：full-rollout support/value 定义 target，probe 仅估计 future distribution，source/anchor 只做 prior 和连续 drift guard。
+
+## 2026-08-02 chunk-state PowerFlow: no source/prompt hard gates + product weight smoke
+
+目的：
+
+- 进一步测试是否可以完全取消 source/prompt hard gate，用连续质量权重保持样本覆盖。
+- 这版将 `source_answer_mass * prompt_top_mass` 作为 state loss weight 的基础，仍保持 full-support target + anchor prior + soft keep。
+
+配置：
+
+```text
+base = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+chunk_state_min_source_answer_mass = 0.0
+chunk_state_min_prompt_top_mass = 0.0
+chunk_state_source_select_by_mass = True
+chunk_state_source_quality_weight_mode = product
+chunk_state_source_quality_weight_floor = 0.05
+chunk_state_source_quality_weight_power = 0.5
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourcepromptweight_nogates_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourcepromptweight_nogates_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_sourcepromptweight_nogates_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+注意：
+
+- 训练主体完成并打印 `Final validation skipped`。
+- 退出阶段有 `DataLoader worker ... killed by signal: Killed` 的 weakref cleanup traceback；发生在训练完成后，指标和 diag 已落盘。
+- 由于临时 diag 文件混入上一轮 source-soft 的 64 行，标准归档文件已修正为只保留本轮后 96 行。
+
+逐 step 结果：
+
+```text
+step  rows  real_state  pad_state  skipped_support  coverage  oov     source_correct  source_mass  probe_mean  loss_weight
+1     32    32          0          0                0.464844  0.5352  0.843750        0.416713     0.169265    1.000
+2     32    32          0          0                0.395508  0.6045  0.687500        0.402151     0.145902    1.000
+3     32    32          0          0                0.444336  0.5557  0.750000        0.340878     0.154012    1.000
+```
+
+训练侧关键指标：
+
+```text
+step 1:
+  source_quality_weight_mean = 0.418
+  answer_coverage_mean = 0.465
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 9.519s
+
+step 2:
+  source_quality_weight_mean = 0.403
+  answer_coverage_mean = 0.396
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 9.388s
+
+step 3:
+  source_quality_weight_mean = 0.343
+  answer_coverage_mean = 0.444
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  update_actor = 9.183s
+```
+
+结论：
+
+- 这版实现了覆盖目标：`real_state=32/32/32`、`skipped_support=0`，说明 prompt/source hard gate 都不是必须的。
+- 但 target 质量明显变脏：coverage 只有 `0.465/0.396/0.444`，source original correct 降到 `0.844/0.688/0.750`，比 source-soft 的 `0.509/0.527/0.454` 和 source correct `1.0/0.938/0.958` 更差。
+- 不建议直接扩 20-step。更合理的下一版是折中：保留 source hard gate off，但 prompt 侧不要完全放开；用 `min_prompt_top_mass=0.20` 或连续 weight 加强低质量 prompt 降权，同时保持 real states 尽量接近 24-32。
+- 如果要扩 20-step，当前优先级仍是 source-soft no-source-gate 版，而不是 no-gates product 版。
