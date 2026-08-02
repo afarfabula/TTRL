@@ -95,6 +95,9 @@ ttrl:
   # Defaults are neutral. When enabled, they skip prompts/source rollouts whose
   # full-rollout answer support is too weak to define a reliable state target.
   chunk_state_min_prompt_top_mass: 0.0
+  chunk_state_min_prompt_valid_answer_coverage: 0.0
+  chunk_state_min_prompt_top_margin: 0.0
+  chunk_state_max_prompt_answer_entropy: 0.0
   chunk_state_min_source_answer_mass: 0.0
   # If enabled, candidate source rollouts are ranked by their answer mass under
   # the prompt-level full-rollout support before cycling. This keeps the

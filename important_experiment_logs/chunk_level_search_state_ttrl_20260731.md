@@ -9396,3 +9396,138 @@ probe3072 support_coverage = 0.403000, state_oov = 0.597000, state_keep = 0.2916
 - source 质量不是主问题：diag 里 `source_majority_consistent` 均值 1.0，`source_original_correct` 均值约 0.975，`source_answer_mass` 均值约 0.553。
 - 失败仍然是 candidate/probe future distribution 与 full-rollout support 的重叠不够；继续依赖更长的 local probe 或更强 source gate 不是主线。
 - 下一步应按最新约束改设计：full rollout group 先定义 prompt-level support/value；chunk candidate 只学习是否把 future distribution 推向该 support；source chunk 只做 prior/drift guard；低信息 state 直接跳过或降权。不要再让 short-horizon local hit / source consistency 主导 teacher。
+
+## 2026-08-02 prompt-level support-quality supportq2 3-step smoke
+
+目的：
+
+- 验证最新方法约束：不要再用 short-horizon local hit / source consistency / source hard gate 主导 chunk target。
+- 在 support-distribution-match 基础上，只做 prompt-level full-rollout support quality 过滤：full rollout group 先定义 support/value；candidate probe 只估计 future answer distribution。
+- 修正第一版 supportq 的问题：第一版仍继承 `chunk_state_min_source_answer_mass=0.4` / `chunk_state_source_select_by_mass=True`，且 top-margin/entropy 曾用 raw count 而非 mass。supportq2 已显式关闭 source mass hard gate，并修复 mass 计算。
+
+配置：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+status = completed_positive_smoke_not_yet_20step
+
+ttrl.chunk_state_future_support_score_type = support_distribution_match
+ttrl.chunk_state_min_source_answer_mass = 0.0
+ttrl.chunk_state_source_select_by_mass = False
+ttrl.chunk_state_min_prompt_valid_answer_coverage = 0.75
+ttrl.chunk_state_min_prompt_top_mass = 0.45
+ttrl.chunk_state_min_prompt_top_margin = 0.05
+ttrl.chunk_state_max_prompt_answer_entropy = 1.4
+ttrl.chunk_state_probe_max_tokens = 1536
+ttrl.chunk_state_probe_samples = 4
+```
+
+3-step mean diagnostics：
+
+```text
+answer_coverage_mean = 0.609375
+state_oov_mean = 0.390625
+future_support_keep = 0.291667
+future_support_learnable_keep = 0.291667
+future_support_state_mean_mass = 0.375190
+future_support_state_max_mass = 0.616268
+future_support_state_top_margin = 0.051783
+
+prompt_valid_answer_coverage = 0.933594
+prompt_answer_top_margin = 0.527915
+prompt_answer_entropy = 1.073852
+source_answer_mass = 0.673708
+source_prompt_top_mass = 0.673708
+source_original_correct = 0.958333
+source_majority_consistent = 1.000000
+
+probe_mean = 0.358529
+probe_max = 0.540050
+probe_positive_count = 6.291667
+
+real_state_count = 5.333333
+pad_state_count = 2.666667
+skipped_support_sources = 26.666667
+loss_weight = 0.666667
+```
+
+逐步诊断：
+
+```text
+step 1:
+  answer_coverage = 0.554688
+  state_oov = 0.445312
+  future_support_keep = 0.250000
+  prompt_valid_answer_coverage = 0.906250
+  prompt_answer_top_margin = 0.670177
+  prompt_answer_entropy = 1.170663
+  probe_mean = 0.340326
+  timing_s/gen = 43.397
+  timing_s/chunk_state_probe = 7.114
+  timing_s/chunk_state_score = 8.362
+  timing_s/chunk_state_ref = 4.062
+  timing_s/update_actor = 0.990
+
+step 2:
+  answer_coverage = 0.535156
+  state_oov = 0.464844
+  future_support_keep = 0.250000
+  prompt_valid_answer_coverage = 0.953125
+  prompt_answer_top_margin = 0.664928
+  prompt_answer_entropy = 0.936970
+  probe_mean = 0.355401
+  timing_s/gen = 23.099
+  timing_s/chunk_state_probe = 7.120
+  timing_s/chunk_state_score = 8.049
+  timing_s/chunk_state_ref = 0.275
+  timing_s/update_actor = 0.771
+
+step 3:
+  answer_coverage = 0.738281
+  state_oov = 0.261719
+  future_support_keep = 0.375000
+  prompt_valid_answer_coverage = 0.941406
+  prompt_answer_top_margin = 0.248642
+  prompt_answer_entropy = 1.113922
+  probe_mean = 0.379859
+  timing_s/gen = 22.369
+  timing_s/chunk_state_probe = 6.911
+  timing_s/chunk_state_score = 6.529
+  timing_s/chunk_state_ref = 0.273
+  timing_s/update_actor = 0.814
+```
+
+对 supportdist/probe3072 的直接对比：
+
+```text
+supportdist probe1536:
+  support_coverage = 0.390667
+  state_oov = 0.609333
+  state_keep = 0.291667
+  probe_time = 7.758000s
+  update_actor = 1.300000s
+
+supportdist probe3072:
+  support_coverage = 0.403000
+  state_oov = 0.597000
+  state_keep = 0.291667
+  probe_time = 14.763667s
+  update_actor = 0.949000s
+
+supportq2 prompt-quality:
+  support_coverage = 0.609375
+  state_oov = 0.390625
+  state_keep = 0.291667
+  probe_time ~= 7.048333s
+  update_actor ~= 0.858333s
+```
+
+结论：
+
+- 这是一个正向 smoke：prompt-level full-rollout support quality 过滤把 support coverage 从约 0.39/0.40 提到 0.61，OOV 从约 0.60 降到 0.39，且没有增加 probe 成本。
+- 这个改善来自 full-rollout group support/value 的 prompt-level label estimation，而不是 source answer hard gate。`chunk_state_min_source_answer_mass=0`、`chunk_state_source_select_by_mass=False` 已生效。
+- 代价是 state 供给变稀：每 step 8 个 state 里只保留 2-3 个 learnable state，`skipped_support_sources` 均值 26.7。它更像“高置信 target 入口”，不是最终完整训练方案。
+- 不应回退到更强 source gate。source chunk 只保留为 prior / drift guard；继续加 source 侧 hard constraint 已被 sourcegate/supportq 第一版证明会降低 coverage、抬高 OOV。
+- 下一步可以进入 20-step pilot，但目标应明确：验证高质量 prompt support filter 是否能改善 validation；同时设计 candidate/proposal 侧补强，例如混入 high-support rollout suffix/replay proposal，使保留下来的 state 数量增加，而不是降低 target 质量去追求样本量。

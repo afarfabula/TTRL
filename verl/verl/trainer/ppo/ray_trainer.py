@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import re
 import uuid
@@ -1139,6 +1140,9 @@ class RayPPOTrainer:
 
         prompt_answer_counts = []
         prompt_answer_mass = []
+        prompt_valid_answer_coverage = []
+        prompt_answer_entropy = []
+        prompt_answer_top_margin = []
         source_answers = []
         source_answer_mass = []
         for prompt_idx in range(len(batch) // n):
@@ -1149,8 +1153,14 @@ class RayPPOTrainer:
             total = max(len(valid_answers), 1)
             count_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
             mass_map = {answer: count / total for answer, count in count_items}
+            masses = [float(mass_map[answer]) for answer, _ in count_items]
+            top_mass = masses[0] if masses else 0.0
+            second_mass = masses[1] if len(masses) > 1 else 0.0
             prompt_answer_counts.append(json.dumps(count_items, ensure_ascii=True))
             prompt_answer_mass.append(json.dumps(mass_map, ensure_ascii=True, sort_keys=True))
+            prompt_valid_answer_coverage.append(len(valid_answers) / max(n, 1))
+            prompt_answer_top_margin.append(top_mass - second_mass)
+            prompt_answer_entropy.append(float(-sum(mass * math.log(max(mass, 1e-12)) for mass in masses)))
             for answer in prompt_answers:
                 source_answers.append(answer)
                 source_answer_mass.append(float(mass_map.get(answer, 0.0)) if answer != "None" else 0.0)
@@ -1160,6 +1170,9 @@ class RayPPOTrainer:
             "source_answer_mass": source_answer_mass,
             "prompt_answer_counts": prompt_answer_counts,
             "prompt_answer_mass": prompt_answer_mass,
+            "prompt_valid_answer_coverage": prompt_valid_answer_coverage,
+            "prompt_answer_entropy": prompt_answer_entropy,
+            "prompt_answer_top_margin": prompt_answer_top_margin,
         }
 
     def _make_chunk_state_prompts(
@@ -1180,9 +1193,18 @@ class RayPPOTrainer:
         source_mode = str(cfg.get("chunk_state_source_mode", "random"))
         boundary_mode = str(cfg.get("chunk_state_boundary_mode", "cycle"))
         min_prompt_top_mass = float(cfg.get("chunk_state_min_prompt_top_mass", 0.0))
+        min_prompt_valid_answer_coverage = float(cfg.get("chunk_state_min_prompt_valid_answer_coverage", 0.0))
+        min_prompt_top_margin = float(cfg.get("chunk_state_min_prompt_top_margin", 0.0))
+        max_prompt_answer_entropy = float(cfg.get("chunk_state_max_prompt_answer_entropy", 0.0))
         min_source_answer_mass = float(cfg.get("chunk_state_min_source_answer_mass", 0.0))
         source_select_by_mass = bool(cfg.get("chunk_state_source_select_by_mass", False))
-        if (min_prompt_top_mass > 0.0 or min_source_answer_mass > 0.0) and source_answer_metadata is None:
+        if (
+            min_prompt_top_mass > 0.0
+            or min_prompt_valid_answer_coverage > 0.0
+            or min_prompt_top_margin > 0.0
+            or max_prompt_answer_entropy > 0.0
+            or min_source_answer_mass > 0.0
+        ) and source_answer_metadata is None:
             raise ValueError(
                 "chunk-state support source gates require full-rollout answer metadata; "
                 "enable a support-based score/guard path or pass source_answer_metadata"
@@ -1198,6 +1220,9 @@ class RayPPOTrainer:
         full_response_lens = batch.batch["response_mask"].bool().sum(dim=-1).detach().cpu()
         source_answer_mass_arr = None
         prompt_top_mass_arr = None
+        prompt_valid_answer_coverage_arr = None
+        prompt_answer_top_margin_arr = None
+        prompt_answer_entropy_arr = None
         if source_answer_metadata is not None:
             source_answer_mass_arr = np.asarray(source_answer_metadata["source_answer_mass"], dtype=np.float32)
             prompt_top_mass_arr = np.asarray(
@@ -1207,6 +1232,18 @@ class RayPPOTrainer:
                     else 0.0
                     for value in source_answer_metadata["prompt_answer_mass"]
                 ],
+                dtype=np.float32,
+            )
+            prompt_valid_answer_coverage_arr = np.asarray(
+                source_answer_metadata.get("prompt_valid_answer_coverage", [0.0] * prompt_count),
+                dtype=np.float32,
+            )
+            prompt_answer_top_margin_arr = np.asarray(
+                source_answer_metadata.get("prompt_answer_top_margin", [0.0] * prompt_count),
+                dtype=np.float32,
+            )
+            prompt_answer_entropy_arr = np.asarray(
+                source_answer_metadata.get("prompt_answer_entropy", [0.0] * prompt_count),
                 dtype=np.float32,
             )
 
@@ -1249,6 +1286,27 @@ class RayPPOTrainer:
                     if float(prompt_top_mass_arr[prompt_idx]) < min_prompt_top_mass:
                         skipped_support_sources += 1
                         continue
+                if (
+                    prompt_valid_answer_coverage_arr is not None
+                    and min_prompt_valid_answer_coverage > 0.0
+                    and float(prompt_valid_answer_coverage_arr[prompt_idx]) < min_prompt_valid_answer_coverage
+                ):
+                    skipped_support_sources += 1
+                    continue
+                if (
+                    prompt_answer_top_margin_arr is not None
+                    and min_prompt_top_margin > 0.0
+                    and float(prompt_answer_top_margin_arr[prompt_idx]) < min_prompt_top_margin
+                ):
+                    skipped_support_sources += 1
+                    continue
+                if (
+                    prompt_answer_entropy_arr is not None
+                    and max_prompt_answer_entropy > 0.0
+                    and float(prompt_answer_entropy_arr[prompt_idx]) > max_prompt_answer_entropy
+                ):
+                    skipped_support_sources += 1
+                    continue
                 mass_good_locals = None
                 if source_answer_mass_arr is not None and min_source_answer_mass > 0.0:
                     prompt_source_masses = torch.as_tensor(
@@ -1462,6 +1520,18 @@ class RayPPOTrainer:
                 [prompt_top_mass_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
                 dtype=np.float32,
             )
+            state_non_tensor["chunk_state_prompt_valid_answer_coverage"] = np.asarray(
+                [prompt_valid_answer_coverage_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
+                dtype=np.float32,
+            )
+            state_non_tensor["chunk_state_prompt_answer_top_margin"] = np.asarray(
+                [prompt_answer_top_margin_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
+                dtype=np.float32,
+            )
+            state_non_tensor["chunk_state_prompt_answer_entropy"] = np.asarray(
+                [prompt_answer_entropy_arr[prompt_idx] for prompt_idx in selected_prompt_indices],
+                dtype=np.float32,
+            )
             state_non_tensor["chunk_state_prompt_answer_counts"] = np.asarray(
                 [source_answer_metadata["prompt_answer_counts"][idx] for idx in selected_prompt_indices],
                 dtype=object,
@@ -1574,6 +1644,27 @@ class RayPPOTrainer:
                 ),
                 dtype=np.float32,
             )
+            prompt_valid_answer_coverage = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_prompt_valid_answer_coverage",
+                    np.zeros_like(source_answer_mass),
+                ),
+                dtype=np.float32,
+            )
+            prompt_answer_top_margin = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_prompt_answer_top_margin",
+                    np.zeros_like(source_answer_mass),
+                ),
+                dtype=np.float32,
+            )
+            prompt_answer_entropy = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_prompt_answer_entropy",
+                    np.zeros_like(source_answer_mass),
+                ),
+                dtype=np.float32,
+            )
             metrics.update(
                 {
                     "chunk_state_diag/source_answer_mass_mean": float(source_answer_mass.mean())
@@ -1587,6 +1678,17 @@ class RayPPOTrainer:
                     else 0.0,
                     "chunk_state_diag/source_prompt_top_mass_min": float(source_prompt_top_mass.min())
                     if source_prompt_top_mass.size
+                    else 0.0,
+                    "chunk_state_diag/prompt_valid_answer_coverage_mean": float(
+                        prompt_valid_answer_coverage.mean()
+                    )
+                    if prompt_valid_answer_coverage.size
+                    else 0.0,
+                    "chunk_state_diag/prompt_answer_top_margin_mean": float(prompt_answer_top_margin.mean())
+                    if prompt_answer_top_margin.size
+                    else 0.0,
+                    "chunk_state_diag/prompt_answer_entropy_mean": float(prompt_answer_entropy.mean())
+                    if prompt_answer_entropy.size
                     else 0.0,
                 }
             )
@@ -1724,6 +1826,18 @@ class RayPPOTrainer:
         source_prompt_top_mass = state_prompts.non_tensor_batch.get("chunk_state_source_prompt_top_mass", None)
         if source_prompt_top_mass is not None:
             source_prompt_top_mass = np.asarray(source_prompt_top_mass, dtype=np.float32)
+        prompt_valid_answer_coverage = state_prompts.non_tensor_batch.get(
+            "chunk_state_prompt_valid_answer_coverage",
+            None,
+        )
+        if prompt_valid_answer_coverage is not None:
+            prompt_valid_answer_coverage = np.asarray(prompt_valid_answer_coverage, dtype=np.float32)
+        prompt_answer_top_margin = state_prompts.non_tensor_batch.get("chunk_state_prompt_answer_top_margin", None)
+        if prompt_answer_top_margin is not None:
+            prompt_answer_top_margin = np.asarray(prompt_answer_top_margin, dtype=np.float32)
+        prompt_answer_entropy = state_prompts.non_tensor_batch.get("chunk_state_prompt_answer_entropy", None)
+        if prompt_answer_entropy is not None:
+            prompt_answer_entropy = np.asarray(prompt_answer_entropy, dtype=np.float32)
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         rows = 0
@@ -1758,6 +1872,17 @@ class RayPPOTrainer:
                     ),
                     "source_prompt_top_mass": (
                         float(source_prompt_top_mass[state_idx]) if source_prompt_top_mass is not None else None
+                    ),
+                    "prompt_valid_answer_coverage": (
+                        float(prompt_valid_answer_coverage[state_idx])
+                        if prompt_valid_answer_coverage is not None
+                        else None
+                    ),
+                    "prompt_answer_top_margin": (
+                        float(prompt_answer_top_margin[state_idx]) if prompt_answer_top_margin is not None else None
+                    ),
+                    "prompt_answer_entropy": (
+                        float(prompt_answer_entropy[state_idx]) if prompt_answer_entropy is not None else None
                     ),
                     "source_prompt_majority_ratio": (
                         float(source_prompt_majority_ratios[state_idx])
