@@ -13619,3 +13619,76 @@ chunk_state_ref                    5.049s   1.232s   0.991s
 - v25 是比 v24 更好的工程 smoke：保留正 margin，同时恢复了大部分 actor sample。
 - 但 v25 还不是可直接扩 20-step 的最终门槛版本，因为 `num_actor_samples` 第 3 step 低于 80，且 `posterior_mass_mean` 偏低。
 - 下一步不应回到 short-probe/local teacher，也不应加重 source hard gate。更合理的 v26 是在保持 `posterior_gain + soft keep` 的基础上提高候选利用率，例如轻量增加 candidate 数或降低 `prune_zero_weight_samples` 对 actor sample 的冲击，同时继续用 `positive_margin_mean > 0.20` 和 `num_actor_samples >=80` 做 gate。
+
+## 2026-08-02 support-flow posterior-gain no-split v26 soft-keep candidate-12 3-step smoke
+
+目的：
+
+- 承接 v25：soft keep 能恢复一部分 actor samples，但第 3 step 仍只有 72。
+- 本次只加宽 candidate：`chunk_state_candidates=12`，利用 B200 显存/吞吐验证更多 next-chunk candidate 是否能稳定提升有效 actor samples。
+- 训练语义仍保持 v25：`posterior_gain`、full-rollout guard、source chunk/anchor 只作 prior/drift guard、PowerFlow target-only、dynamic batch off。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v26_softkeep_c12_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriorgain_nosplit_v26_softkeep_c12_fullguard_balanced_sourceweight_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v26_softkeep_c12_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v26_softkeep_c12_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_candidates=12
+ttrl.chunk_state_support_flow_score_type=posterior_gain
+ttrl.chunk_state_support_flow_baseline_scale=0.5
+ttrl.chunk_state_support_flow_gain_slack=0.05
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.20
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                  1        2        3
+clean_rollout_ratio                0.730    0.760    0.679
+real_states                        13       10       15
+num_candidates                     192      192      192
+num_actor_samples                  88       56       88
+support_anchor_injected_ratio      0.955    1.000    0.964
+posterior_mass_mean                0.259    0.281    0.197
+posterior_mass_max_mean            0.512    0.685    0.493
+source_mass_mean                   0.566    0.695    0.566
+positive_margin_mean               0.229    0.337    0.211
+score_mean                         0.148    0.152    0.104
+score_max_mean                     0.297    0.387    0.277
+state_keep_ratio                   0.875    1.000    0.812
+label_consistent_ratio             0.438    0.396    0.297
+answer_coverage_mean               0.557    0.583    0.562
+positive_ratio                     0.148    0.148    0.102
+pruned_sample_ratio                0.542    0.708    0.542
+actor_weight_nonzero_ratio         1.000    1.000    1.000
+update_actor                       3.656s   1.869s   3.189s
+gen                                43.701s  22.688s  21.838s
+chunk_state_score                  7.718s   6.169s   5.663s
+chunk_state_ref                    5.349s   0.736s   1.214s
+```
+
+观察：
+
+- v26 没有通过稳定性 gate：日志在退出阶段出现 `RuntimeError: DataLoader worker (pid 1246318) is killed by signal: Killed.`，虽然 step3 指标已经打印，不能作为稳定可扩展版本。
+- 加宽 candidate 没有稳定解决 actor sample：step1/3 是 88，但 step2 掉到 56，比 v25 更不稳。
+- `positive_margin_mean=0.229/0.337/0.211` 仍为正，但 `posterior_mass_mean=0.259/0.281/0.197` 更低，说明更宽的局部 next-chunk proposal 并没有自然带来更好的 posterior support。
+- `pruned_sample_ratio=0.542/0.708/0.542` 明显偏高，更多候选被 zero-inconsistent/target guard/prune 机制剪掉；这说明问题不只是候选数量不够，而是局部 128-token continuation 本身的信息量不足。
+- actor update 仍然不是瓶颈：1.9-3.7s；主要瓶颈仍在 full rollout、reward/support scoring 和训练语义本身。
+
+结论：
+
+- v26 是一个负向工程 datapoint：简单加宽 next-chunk candidate 不值得继续扩 20-step。
+- 更重要的算法结论：当前 `next 128-token chunk + support anchor` 容易退化成局部 continuation distillation，不能充分形成同一 state 下的 counterfactual search-improvement。
+- 下一阶段切换为 suffix-level counterfactual TTRL：先从已有完整轨迹里选择中后段 search state，再从该 state 重采多条 suffix 一直 rollout 到 EOS，用完整 completion 的最终 answer/support/pass/majority 改善定义 target。chunk 只作为 actor update 的 span 或 state boundary，不再由 short local probe 或 source continuation 决定 teacher。
