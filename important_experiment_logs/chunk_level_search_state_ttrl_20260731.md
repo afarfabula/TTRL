@@ -8973,3 +8973,122 @@ Timeout during parsing                            0             0
 - 可以扩到 20-step validation gate，优先验证 mean/maj/best trajectory 是否真正优于 MV 复现线。
 - 20-step 前建议保持语义不变，只做工程层面的日志解析和 timeout 统计；不要重新引入 staged short-probe top-k。
 - 如果 20-step 训练稳定但速度偏慢，再考虑用 B200 大显存做并行 candidate probe batching 或更长 max_num_batched_tokens，而不是改变 target 语义。
+
+## 2026-08-02 20-step gate 修正与方法约束更新
+
+本轮方法约束更新：
+
+- 明确放弃“局部短视可判定性”作为主监督假设。
+- 不再要求 chunk target 主要由 short-horizon probe 的局部命中、局部 answer hit 或 source consistency 决定。
+- full-rollout group support/value 必须先定义 prompt-level 的好答案分布；chunk 只学习哪个 local transition 会把未来 completion distribution 推向该 support。
+- source chunk / teacher anchor 只能作为 prior 或 drift guard，不能作为主要 teacher，也不能用更强 source hard gate 继续收紧 target。
+- probe 的角色降级为 future distribution estimator：可以拉长、分阶段或用于估计 candidate future support，但不能单独把短 probe local hit 当成最终 label。
+- 低信息 state 仍应跳过或降权：all-negative、高 OOV、support coverage 低、support mass 太平、malformed/repeated boxed/marker 污染等。
+
+20-step gate 第一次运行状态：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801.log
+status = incomplete_15_of_20_no_final_val
+```
+
+根因：
+
+- 配置里 `trainer.total_training_steps=20` 生效，但训练循环仍由 `for epoch in total_epochs` 和 dataloader 驱动。
+- MATH-TTT train set 长度 500，batch 32 时 `Size of train dataloader: 15`。
+- 第一次 20-step launcher 继承 `TOTAL_EPOCHS=1`，所以第 15 个 batch 后 dataloader 耗尽，训练自然退出，没有进入 `is_last_step`，因此没有 final validation。
+- 另外 final validation 分支要求 `trainer.test_freq > 0`；之前 `TEST_FREQ=-1` 即使 `final_val_enable=True` 也不会触发最后验证。
+
+修正：
+
+```text
+TOTAL_EPOCHS=2
+TOTAL_TRAINING_STEPS=20
+TEST_FREQ=20
+FINAL_VAL_ENABLE=True
+SAVE_FREQ=-1
+```
+
+rerun：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801_rerun1
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801_rerun1.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801_rerun1.jsonl
+output_dir = /tmp/ttrl_b200/checkpoints/ttrl_chunk_state_powerflow_futuregain_fullcand_mid_c128_probe1536x4_b32_r32_v64_20step_20260801_rerun1
+status = completed_failed_gate
+```
+
+当前工程确认：
+
+```text
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+venv = /mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200
+dynamic_bsz = false
+vLLM attention_config.backend = FLASH_ATTN
+NCCL NVLS = enabled
+NCCL P2P/CUMEM = observed
+```
+
+rerun1 final validation：
+
+```text
+val-core/math/acc/mean@16 = 0.468875
+val-core/math/acc/best@16/mean = 0.826982
+val-core/math/acc/maj@16/mean = 0.593118
+val-aux/math/format_score/mean@16 = 0.895750
+val-aux/math/format_score/maj@16/mean = 0.875520
+timing_s/testing = 301.784s
+```
+
+20-step mean diagnostics：
+
+```text
+chunk_state_future_support_gain/support_coverage_mean = 0.419250
+chunk_state_future_support_gain/state_oov_mean = 0.580750
+chunk_state_future_support_gain/state_keep_ratio = 0.224950
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.051350
+chunk_state_future_support_gain/improved_state_ratio = 0.803100
+chunk_state_future_support_gain/positive_margin_mean = 0.130500
+chunk_state_future_support_gain/label_consistent_ratio = 0.633550
+
+chunk_state/num_actor_samples = 26.400000
+chunk_state/zeroed_state_ratio = 0.806200
+chunk_state/positive_ratio = 0.078400
+actor/pg_loss = 0.260050
+
+timing_s/gen = 25.980400
+timing_s/chunk_state_probe = 7.391450
+timing_s/chunk_state_score = 7.605300
+timing_s/chunk_state_ref = 0.630900
+timing_s/update_actor = 1.127300
+training_progress_s_per_it_all = 64.141
+training_progress_s_per_it_step2_to_19 = 61.668
+```
+
+逐步诊断要点：
+
+```text
+state_keep_ratio == 0 的 step = 9, 15, 17
+support_coverage_mean range = 0.203 - 0.662
+state_oov_mean range = 0.338 - 0.797
+num_actor_samples range = 8 - 64
+```
+
+结论：
+
+- 这次 corrected 20-step gate 没有通过，final mean@16 只有 0.468875，明显低于 MV/PowerFlow 对齐目标。
+- 失败不是 actor update 慢导致的：update_actor 均值约 1.13s，端到端主要仍在 full rollout generation、probe 和 score。
+- 真正主矛盾是 target 质量和可学习 state 覆盖：20-step 的 support coverage 均值只有 0.419，OOV 均值 0.581，state keep 均值 0.225，且 9/15/17 三个 step 的 keep 直接为 0。
+- 3-step smoke 的高 coverage/高 keep 没能在 20-step 上稳定复现，说明 full-candidate long-probe 虽然比 support/source hard gate 好，但仍没有解决 full-rollout group support/value 到 chunk target 的稳定投影问题。
+- 不能回退到 short-horizon local answer hit / source consistency 当主 teacher，也不能继续加 source hard gate；下一轮应把 target 改成更明确的 full-rollout support/value 主导形式，让 probe 只估计 future distribution，低 coverage / 高 OOV / flat support / malformed state 直接跳过或强降权。
+
+下一轮建议：
+
+- 先实现 per-prompt full rollout support/value cache：answer support distribution、top mass、coverage、majority answer、source rollout future distribution。
+- state 采样优先来自 support 清晰且 majority-consistent 的中后段，低信息 state 直接不进 actor batch。
+- candidate score 改为相对 full group support 的 future distribution improvement，例如 support mass gain、transport/KL improvement、value margin；source chunk 只作为 prior/drift guard。
+- 保留 PowerFlow-style distribution matching 和 hardfilter+clip4 的工程骨架，但不让 short probe local hit 或 source answer consistency 决定 teacher。
