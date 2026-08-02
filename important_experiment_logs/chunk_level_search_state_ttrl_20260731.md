@@ -12077,3 +12077,65 @@ mean  29.543   1.019   0.000  6.564   2.822   3.887
 - 不继续调 `mass_ranked` / `answer_stratified` / duplicate split 这类 anchor replay 细节。
 - score 要从“候选 answer posterior mass”转为“相对 source 的 future value gain / support improvement”。也就是 candidate 必须回答：这个 chunk 会不会把后续 completion 分布推向 full group 认可的好答案，而不是它自己属于哪个 high-mass answer。
 - 可以保留 no-short-probe 主约束，但需要引入 longer-horizon future distribution estimator 或从完整 rollout group 构造 state-level value label；short probe 只统计 `p_j(a)`，不能直接当 teacher。
+
+## 2026-08-02 future-gain support-distribution-match v8 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_v8_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_supportdist_v8_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_v8_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_v8_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置：
+
+- `ttrl.chunk_state_score_mode=future_support_gain`。
+- `ttrl.chunk_state_future_support_score_type=support_distribution_match`。
+- `ttrl.chunk_state_probe_samples=4`，`ttrl.chunk_state_probe_max_tokens=1536`。
+- `ttrl.chunk_state_future_support_min_positive_margin=0.04`。
+- `ttrl.chunk_state_future_support_min_state_coverage=0.25`，`max_state_oov=0.75`。
+- `data.train_batch_size=32`、`rollout.n=32`、`n_votes_per_prompt=64`、`states_per_prompt=2`。
+- `actor_rollout_ref.actor.use_dynamic_bsz=False`，保持训练语义不引入 dynamic batch。
+
+设计意图：
+
+- 这版不再让 short-horizon probe 的局部命中直接定义 teacher。
+- full rollout group 先定义 prompt-level answer support distribution。
+- 对每个 candidate chunk 只用 longer probe 估计它的 future answer distribution `p_j(a)`，再用 `support_distribution_match` 判断它是否把未来分布推向 full group support。
+- source chunk / support anchor 只保留为 prior 和 drift guard，不作为主要 teacher/floor。
+
+三步质量汇总：
+
+```text
+step  coverage  oov    keep  score  label  improved  margin  raw_gain  transport_gain  real_state  actor_samples  zeroed  w_cov  w_margin  positive_ratio  target_entropy  actor_w_nonzero
+1     0.152     0.848  0.125 0.082  0.188  0.375     0.234   -0.586    -0.601          3           8              0.875   0.250  0.730     0.082           1.674           1.000
+2     0.070     0.930  0.125 0.032  0.141  0.750     0.156   -0.530    -0.533          4           8              0.875   0.250  0.711     0.032           1.558           1.000
+3     0.484     0.516  0.125 0.317  0.719  1.000     0.618   -0.252    -0.319          3           64             1.000   0.000  0.000     0.317           1.520           0.000
+mean  0.235     0.765  0.125 0.144  0.349  0.708     0.336   -0.456    -0.484          3.3         26.7           0.917   0.167  0.480     0.144           1.584           0.667
+```
+
+耗时：
+
+```text
+step  gen      probe  score   update_actor
+1     43.547   7.022  8.665   0.707
+2     23.345   7.170  7.047   0.479
+3     32.088   6.917  11.332  2.466
+mean  32.993   7.036  9.015   1.217
+```
+
+结论：
+
+- 不扩 20-step。v8 方向比 v6/v7 更接近目标语义，但当前配置不是有效训练。
+- 这版证明 `support_distribution_match` 链路能跑，且 target 语义已经从局部 answer hit 转向 full-rollout support distribution。
+- 失败点非常明确：prompt 级 full group 质量不差，`prompt_valid_answer_coverage_mean=0.922`；但 candidate/probe future distribution 和 full support 对不上，`support_coverage_mean=0.235`、`state_oov_mean=0.765`。
+- hard keep 太窄：每步 `learnable_state_keep_ratio=0.125`，平均只有 `3.3` 个 real states，且 `skipped_support_sources=28.7/32`。
+- 第 3 step 虽然 coverage 回到 `0.484`，但 `zeroed_state_ratio=1.0`、`actor/powerflow_weight/nonzero_ratio=0.0`、`actor/powerflow_loss=0.0`，说明 hard gate / actor batch weight 组合会把一次看似有信号的 step 清成无效更新。
+- update_actor 很快，均值 `1.217s`，但这是强剪枝和局部全零权重的副作用，不能当作 infra 优化成果。
+
+下一步：
+
+- 保留 `future_support_gain + support_distribution_match` 作为主线，不回退到 short-probe local hit/source consistency。
+- 放松 hard keep 为 soft weighting：低 coverage/high OOV state 可以低权重，但不能让整步 actor weight 归零；需要设置最小有效 state 或 fallback 到 soft target。
+- 提高 candidate/probe 和 full support 的重合，而不是加 source-side 硬约束：优先从 full rollout group 的 mid/late state 构造同 boundary candidate，或增加 probe 分支数/候选质量，再计算 support match。
+- 下一版 smoke 的通过标准：`actor/powerflow_weight/nonzero_ratio` 每步非零，`support_coverage_mean` 至少接近 v6/v7 的 `0.48-0.50`，`state_oov_mean` 明显低于 `0.5`，且不能靠 source answer floor 获得这些数。
