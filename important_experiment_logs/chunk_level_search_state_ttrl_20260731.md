@@ -10660,3 +10660,70 @@ mean  29.609   9.360        8.976        7.993
 - 不再继续沿 source hard gate、source consistency 或 short-probe teacher 加约束。
 - 保留 `posterior_support_match + PowerFlow weighted distillation` 作为骨架，但要改 candidate/state 侧：优先做更可靠的 full-support future estimator，例如 state-compatible staged longer-horizon proposal、按 full-rollout support 高 coverage / top margin 选择 state、以及对低 support/OOV candidate 做 soft downweight 或跳过。
 - 20-step 前的最小 gate 仍然是：`state_top_margin > 0.03`，`coverage` 明显高于 `0.55` 或 `OOV` 明显低于 `0.45`，同时 `label_consistent_ratio` 不坍缩。
+
+## 2026-08-02 posterior support quality-gate a6/s8 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_posterior_support_qualitygate_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_posterior_support_qualitygate_a6s8_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_posterior_support_qualitygate_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_posterior_support_qualitygate_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- 上一轮 `posterior_support_match sharp a6/s8` 证明 target 不再过平，但 support coverage / OOV 未改善。
+- 本轮只加 full-support future distribution 质量门控，不引入 sourcegate、source consistency 或 short-probe local teacher。
+- 目标是验证：事后过滤 low-support candidate/state，能否在不改变 target 语义的情况下同时提高 `state_top_margin` 与 support alignment。
+
+关键配置：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_future_support_prior_smoothing=8.0
+ttrl.chunk_state_alpha=6.0
+ttrl.chunk_state_eps=0.01
+ttrl.chunk_state_future_support_min_candidate_coverage=0.25
+ttrl.chunk_state_future_support_min_state_coverage=0.50
+ttrl.chunk_state_future_support_max_state_oov=0.50
+ttrl.chunk_state_future_support_min_state_max_mass=0.35
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.05
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  coverage  oov    cand_keep  learnable_keep  label_consistent  top_margin  target_entropy  weight_max  all_pos  all_neg
+1     29          232            0.482     0.518  0.699      0.531           0.699             0.037       1.477           1.000       0.188    0.000
+2     26          208            0.352     0.648  0.531      0.281           0.531             0.078       1.376           1.000       0.156    0.156
+3     24          192            0.376     0.624  0.646      0.208           0.646             0.035       1.466           1.000       0.292    0.042
+mean  26.3        210.7          0.403     0.597  0.625      0.340           0.625             0.050       1.440           1.000       0.212    0.066
+```
+
+耗时：
+
+```text
+step  gen      chunk_probe  chunk_score  update_actor
+1     43.491   9.365        10.283       9.123
+2     23.347   10.862       8.670        7.567
+3     22.844   8.913        7.860        6.957
+mean  29.894   9.713        8.938        7.882
+```
+
+结论：
+
+- 这是负结果，不扩 20-step。
+- 正向部分：事后 quality gate 确实把 `state_top_margin` 拉到了 `0.035-0.078`，三步都超过 `0.03` gate；target entropy 进一步降到约 `1.44`。
+- 关键问题：它没有提升 support alignment，反而让 coverage/OOV 从上一轮 sharp 的约 `0.511/0.489` 恶化到 `0.403/0.597`。这说明 target 变尖主要来自把低 coverage candidate 置零，而不是 candidate future distribution 真正靠近 full-rollout support。
+- 训练信号变窄：`label_consistent_ratio` 只有 `0.53-0.70`，`learnable_state_keep_ratio` 掉到 `0.21-0.53`，step2 还出现 `state_all_negative_ratio=0.156`。这已经接近“用硬过滤制造局部 teacher”，不符合最新约束。
+- 因此不能把这版作为 20-step 绿灯。它是一个有用反证：post-hoc quality gate 可以制造 margin，但不能解决 support coverage / OOV 主矛盾。
+
+下一步：
+
+- 不再继续单纯加事后 gate 或调 sharpness。
+- 需要改 candidate/probe 生成本身，让 candidate future distribution 更容易进入 full-rollout support：
+  - 方案 A：state-compatible longer-horizon estimator。对同一 state 的全部 candidates 做更长 horizon probe，减少 4 条 probe 的 OOV 偶然性。
+  - 方案 B：support-aware proposal prior。不是直接 copy high-support continuation，而是在当前 state 下用 high-support answer support 引导 resampling / continuation probe，再做 posterior support match。
+  - 方案 C：两阶段宽后深，但第一阶段不能用 short-probe local hit 决定 teacher；只能用 full-support posterior 的 coarse transport score 分配更多 probe budget。
+- 下一轮 gate 应同时要求：`top_margin > 0.03`，`coverage >= 0.50`，`OOV <= 0.50`，`label_consistent_ratio >= 0.75`，否则不扩 20-step。
