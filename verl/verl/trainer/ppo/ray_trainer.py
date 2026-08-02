@@ -2915,6 +2915,8 @@ class RayPPOTrainer:
         gain_slack = float(cfg.get("chunk_state_future_support_gain_slack", 0.125))
         baseline_scale = float(cfg.get("chunk_state_future_support_baseline_scale", 1.0))
         source_prior_weight = float(cfg.get("chunk_state_future_support_source_prior_weight", 1.0))
+        anchor_prior_weight = float(cfg.get("chunk_state_future_support_anchor_prior_weight", 0.0))
+        anchor_prior_power = float(cfg.get("chunk_state_future_support_anchor_prior_power", 1.0))
         support_prior_smoothing = float(cfg.get("chunk_state_future_support_prior_smoothing", 0.0))
         min_positive_margin = float(cfg.get("chunk_state_future_support_min_positive_margin", 0.0))
         min_state_coverage = float(cfg.get("chunk_state_future_support_min_state_coverage", 0.0))
@@ -3149,6 +3151,19 @@ class RayPPOTrainer:
         prior = torch.ones_like(score_matrix)
         if source_prior_weight > 0.0 and 0 <= source_prior_idx < candidates:
             prior[:, source_prior_idx] = source_prior_weight
+        anchor_prior_mean = 1.0
+        anchor_prior_max = 1.0
+        if anchor_prior_weight > 0.0 and "chunk_state_support_anchor_scores" in state_prompts.non_tensor_batch:
+            anchor_scores = torch.as_tensor(
+                np.asarray(state_prompts.non_tensor_batch["chunk_state_support_anchor_scores"], dtype=np.float32),
+                dtype=torch.float32,
+            ).reshape(len(state_prompts), candidates)
+            if anchor_prior_power != 1.0:
+                anchor_scores = torch.pow(anchor_scores.clamp(min=0.0, max=1.0), anchor_prior_power)
+            anchor_prior = 1.0 + anchor_prior_weight * anchor_scores.clamp(min=0.0, max=1.0)
+            prior = prior * anchor_prior
+            anchor_prior_mean = anchor_prior.mean().item()
+            anchor_prior_max = anchor_prior.max().item()
         state_prompts.non_tensor_batch["chunk_state_target_prior"] = prior.cpu().numpy().astype(np.float32)
 
         support_coverage = valid_tensor.mean(dim=(1, 2)).detach().cpu().numpy().astype(np.float32)
@@ -3283,6 +3298,10 @@ class RayPPOTrainer:
             "chunk_state_future_support_gain/gain_slack": gain_slack,
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,
             "chunk_state_future_support_gain/source_prior_weight": source_prior_weight,
+            "chunk_state_future_support_gain/anchor_prior_weight": anchor_prior_weight,
+            "chunk_state_future_support_gain/anchor_prior_power": anchor_prior_power,
+            "chunk_state_future_support_gain/anchor_prior_mean": anchor_prior_mean,
+            "chunk_state_future_support_gain/anchor_prior_max": anchor_prior_max,
             "chunk_state_future_support_gain/prior_smoothing": support_prior_smoothing,
             "chunk_state_future_support_gain/min_positive_margin": min_positive_margin,
             "chunk_state_future_support_gain/min_state_coverage": min_state_coverage,

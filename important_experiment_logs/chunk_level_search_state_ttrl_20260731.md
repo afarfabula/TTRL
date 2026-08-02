@@ -9747,3 +9747,164 @@ step 3:
 - support-anchor proposal 没有破坏 full-support target 语义：它只是把 high-support rollout suffix 注入 candidate 集合，最终 score 仍由 `support_distribution_match` 和 full-rollout support distribution 定义。
 - 这版不应该直接扩 80-step。虽然零更新问题被解决，但 step 3 的 `answer_coverage=0.203`，candidate support 仍明显不稳。下一步应继续改 proposal：增加 replay/suffix anchor 覆盖、降低无效 base-policy chunk 比例，或切到 `support_flow soft_mass` 先验证纯 full-support proposal 的训练曲线。
 - 后续 20-step 应使用 soft keep，但必须同时提高 candidate support coverage，否则只是“有梯度地学噪声”。
+
+## 2026-08-02 full-support anchor prior + soft keep 3-step smoke
+
+目的：
+
+- 按最新纠偏，放弃“短 horizon 局部命中必须直接判定 teacher”的约束。
+- 保留 PowerFlow-style distribution matching，但把 full-rollout support anchor 只作为 `target_prior`，不作为 score floor。
+- 目标形式变成：
+
+```text
+q_j ∝ exp(alpha * future_support_score_j) * prior_j
+
+future_support_score_j:
+  由 probe future answer distribution 和 prompt-level full-rollout support distribution 的 match 定义。
+prior_j:
+  对注入的 high-support suffix/replay anchor 乘以 1 + anchor_prior_weight * anchor_mass。
+```
+
+代码改动：
+
+```text
+ray_trainer.py:
+  新增 ttrl.chunk_state_future_support_anchor_prior_weight
+  新增 ttrl.chunk_state_future_support_anchor_prior_power
+  当 future_support_gain 路径存在 chunk_state_support_anchor_scores 时，
+  用 support-anchor mass 构造 target_prior 乘子。
+
+ppo_trainer_ttrl.yaml:
+  默认 anchor_prior_weight = 0.0
+  默认 anchor_prior_power = 1.0
+```
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+train_batch_size = 32
+rollout.n = 32
+total_training_steps = 3
+final_val_enable = false
+chunk_state_score_mode = future_support_gain
+future_support_score_type = support_distribution_match
+support_anchor_count = 4
+support_anchor_candidate_start = 4
+future_support_anchor_prior_weight = 4.0
+future_support_prior_smoothing = 8.0
+future_support_keep_mode = soft
+future_support_soft_weight_floor = 0.05
+probe = 4 samples, max_tokens 1536
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+启动问题：
+
+- 第一次启动失败在 Ray socket path，原因是 `TTRL_RUNTIME_DIR=/tmp/ttrl_b200/runtime_${RUN_ID}` 太长。
+- 修复为短路径 `/tmp/cfsp82` 后正常启动。
+- 这不是训练语义问题，属于 Ray UNIX socket 路径长度限制。
+
+diag 汇总：
+
+```text
+diag rows = 40
+steps = 1,2,3
+answer_coverage_mean = 0.525000
+state_oov_mean = 0.475000
+future_support_state_mean_mass = 0.268649
+future_support_state_max_mass = 0.492381
+future_support_state_top_margin = 0.033298
+probe_mean = 0.263889
+source_answer_mass_mean = 0.559468
+source_prompt_top_mass_mean = 0.559468
+prompt_valid_answer_coverage_mean = 0.845313
+prompt_answer_top_margin_mean = 0.487966
+prompt_answer_entropy_mean = 1.683339
+loss_weight_mean = 0.675000
+future_support_keep_mean = 1.000000
+future_support_learnable_keep_mean = 1.000000
+```
+
+逐 step：
+
+```text
+step  rows  real_state  pad_state  skipped_support  coverage  probe_mean  loss_weight
+1     16    11          5          21               0.515625  0.226647    0.6875
+2     16    9           7          23               0.568359  0.332460    0.5625
+3     8     7           1          25               0.457031  0.201231    0.8750
+```
+
+关键训练指标：
+
+```text
+step 1:
+  target_prior_mean = 1.504
+  answer_coverage_mean = 0.516
+  future_support_soft_weight_mean = 0.254
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  grad_norm = 21.467
+  update_actor = 3.643s
+
+step 2:
+  target_prior_mean = 1.929
+  answer_coverage_mean = 0.568
+  future_support_soft_weight_mean = 0.356
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  grad_norm = 15.974
+  update_actor = 2.859s
+
+step 3:
+  target_prior_mean = 1.671
+  answer_coverage_mean = 0.457
+  future_support_soft_weight_mean = 0.218
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  grad_norm = 7.000
+  update_actor = 2.431s
+```
+
+时延：
+
+```text
+step 1:
+  gen = 43.645s
+  chunk_probe = 7.675s
+  chunk_score = 10.365s
+  ref = 5.089s
+  update_actor = 3.643s
+
+step 2:
+  gen = 22.560s
+  chunk_probe = 7.655s
+  chunk_score = 8.373s
+  ref = 1.100s
+  update_actor = 2.859s
+
+step 3:
+  gen = 22.403s
+  chunk_probe = 7.150s
+  chunk_score = 6.752s
+  ref = 0.813s
+  update_actor = 2.431s
+```
+
+结论：
+
+- 这版比 supportq2 / softkeep-anchor smoke 更接近正确语义：full-rollout support 通过 score 和 prior 共同定义目标，anchor 不是 hard teacher，短 probe 不是局部 hit teacher，而是 future answer distribution estimator。
+- `actor_batch_powerflow_weight_nonzero_ratio=1.0` 连续稳定，说明 soft keep 解决了 hard gate 清零问题。
+- `answer_coverage_mean=0.525` 比上一版 softkeep smoke 的整体 `0.481` 好，step 2 达到 `0.568`，说明 full-support anchor prior 有帮助。
+- 不能直接扩 20-step。主要问题是 source selection 太窄：`min_source_answer_mass=0.40` 导致每步只剩 `7-11` 个 real states，大量 prompt 被 `skipped_support_sources` 跳过。这个会让训练分布过窄，并且 pad state 比例过高。
+- 下一轮应保持同样 target 语义，只放宽 source gate：把 `chunk_state_min_source_answer_mass` 降到 `0.20-0.25`，保留 prompt-level support quality gate 和 mid boundary，目标是每步恢复到接近 32 个 real states，同时观察 coverage/OOV 是否仍维持在 `0.50+`。
+- 如果放宽后 coverage 下降明显，再考虑 state-level soft weight 或 prompt support quality 的连续权重，不回到 source hard gate 或 short-horizon local teacher。

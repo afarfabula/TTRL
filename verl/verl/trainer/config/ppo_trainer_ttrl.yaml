@@ -186,6 +186,12 @@ ttrl:
   chunk_state_future_support_gain_slack: 0.125
   chunk_state_future_support_baseline_scale: 1.0
   chunk_state_future_support_source_prior_weight: 2.0
+  # Optional prior multiplier for injected support-anchor candidates when using
+  # future_support_gain. This is not a score floor: the future-support score
+  # still defines the target, while full-rollout support only biases the
+  # PowerFlow distribution toward higher-support proposal chunks.
+  chunk_state_future_support_anchor_prior_weight: 0.0
+  chunk_state_future_support_anchor_prior_power: 1.0
   chunk_state_future_support_prior_smoothing: 0.0
   chunk_state_future_support_min_positive_margin: 0.0
   # Optional state-level learnability gates for future_support_gain. Defaults
