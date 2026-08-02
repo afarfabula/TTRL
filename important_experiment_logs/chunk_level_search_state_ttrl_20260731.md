@@ -12191,3 +12191,55 @@ mean  30.116   7.109  7.017   0.860
 - 主改 candidate/state：从 full rollout group 的 high-support trajectory 在同 boundary 上构造 candidates，或让 chunk candidate 继承 full support answer path 的 state alignment，减少 OOV。
 - 需要把“full rollout group 定义目标”落实到 state/candidate 构造层，而不是只在 score 层做 support match；否则 probe 采样即使更长，也仍主要采到 support 外答案。
 - 下一条 smoke 应该比较两种 candidate source：当前 resample-from-state vs full-group aligned candidate，并用同一 `support_distribution_match + soft keep` 判断 coverage/OOV 是否显著改善。
+
+## 2026-08-02 future-gain support-distribution-match alignedanchors v10 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_alignedanchors_v10_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_supportdist_alignedanchors_v10_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_alignedanchors_v10_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_alignedanchors_v10_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+相对 v9 的变化：
+
+- score 仍是 `support_distribution_match`，keep 仍是 soft keep，不回退到局部命中或 source consistency。
+- candidate 结构改为：`candidate0=source continuation`，`candidate1-7=full rollout support anchors`。
+- `support_anchor_count=7`，`candidate_start=1`，尽量用 full-group high-support continuation 覆盖 candidate space。
+- 打开 `support_anchor_prefix_compat_enable=True`，`prefix_compat_mode=soft`，`prefix_compat_tokens=64`，`prefix_score_power=0.5`，用 prefix match 作为 soft prior 而不是 hard teacher。
+
+三步质量汇总：
+
+```text
+step  anchor_inj  prefix  anchor_mass  coverage  oov    keep   score  label  improved  margin  raw_gain  transport_gain  real_state  actor_samples  zeroed  state_w  w_cov  w_margin  positive_ratio  target_entropy  actor_w_nonzero
+1     0.500       0.006   0.515        0.250     0.750  0.625  0.151  0.297  1.000     0.588   -0.488    -0.518          3           24             0.625   0.174    0.358  0.567     0.151           0.863           1.000
+2     0.482       0.015   0.099        0.324     0.676  0.375  0.213  0.594  1.000     0.526   -0.406    -0.465          4           16             0.750   0.257    0.299  0.593     0.213           1.402           1.000
+3     0.518       0.016   0.036        0.051     0.949  0.000  0.002  0.156  0.750     0.010   -0.693    -0.691          2           64             1.000   0.020    0.000  0.000     0.002           2.066           0.000
+mean  0.500       0.012   0.217        0.208     0.792  0.333  0.122  0.349  0.917     0.375   -0.529    -0.558          3.0         34.7           0.792   0.150    0.219  0.387     0.122           1.444           0.667
+```
+
+耗时：
+
+```text
+step  gen      probe  score   update_actor
+1     43.547   7.257  8.408   1.290
+2     22.510   7.154  6.544   0.695
+3     23.166   7.210  6.625   2.450
+mean  29.741   7.207  7.192   1.478
+```
+
+结论：
+
+- 不扩 20-step，但 v10 给出了比 v9 更有价值的方向证据。
+- step 1/2 明显改善：v9 的 coverage/OOV 是 `0.152/0.848`、`0.086/0.914`；v10 变成 `0.250/0.750`、`0.324/0.676`。这说明把 candidate space 更多交给 full-rollout support anchors 是有效方向。
+- step 3 失败也很清楚：`anchor_mass_mean=0.036`，`support_coverage=0.051`，`state_keep=0.0`，actor weight 全零。也就是说 aligned anchors 只在 prompt/full-group support 本身强的时候有效；低质量 prompt/state 仍会把整步冲掉。
+- prefix compatibility 没有提供真正 state alignment：`prefix_match_mean=0.012`，几乎为零。v10 的提升主要来自 anchor 覆盖率和 high-support continuation，而不是 prefix 连续性。
+- 当前最重要的新结论：candidate 侧改动确实能改善 full-support target，但必须同时收紧 state/prompt selection 或构造同源 boundary anchors，不能把低 anchor-mass 的 prompt/state 送进 actor update。
+- update_actor 仍然很轻，均值 `1.478s`；这个方向的 infra 成本可以接受。
+
+下一步：
+
+- 保留 `support_distribution_match + soft keep + full-group anchor-heavy candidate`。
+- 不能依赖 token prefix match 解决 state alignment；应直接构造同源/同 trajectory 的 state-candidate pairs，或选择 source state 本身来自 high-support answer family，再从同 family 的 sibling rollouts 取 continuation。
+- 对 state selection 加更硬的 full-support质量门：例如 `anchor_mass_mean`、prompt answer entropy、real state count、source answer mass 的组合，避免 v10 step 3 这种 `anchor_mass_mean=0.036` 的 batch 更新。
+- 下一条 v11 应测试 `source_quality_weight_mode` 或更严格 source/prompt gate，而不是继续加 anchor 数；验收看三步都保持 `actor_w_nonzero=1` 且 coverage 不低于 `0.25`。
