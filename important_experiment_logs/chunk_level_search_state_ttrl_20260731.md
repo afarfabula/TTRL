@@ -9531,3 +9531,105 @@ supportq2 prompt-quality:
 - 代价是 state 供给变稀：每 step 8 个 state 里只保留 2-3 个 learnable state，`skipped_support_sources` 均值 26.7。它更像“高置信 target 入口”，不是最终完整训练方案。
 - 不应回退到更强 source gate。source chunk 只保留为 prior / drift guard；继续加 source 侧 hard constraint 已被 sourcegate/supportq 第一版证明会降低 coverage、抬高 OOV。
 - 下一步可以进入 20-step pilot，但目标应明确：验证高质量 prompt support filter 是否能改善 validation；同时设计 candidate/proposal 侧补强，例如混入 high-support rollout suffix/replay proposal，使保留下来的 state 数量增加，而不是降低 target 质量去追求样本量。
+
+## 2026-08-02 supportq2 20-step pilot 结果
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_20step_20260802
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+train_batch_size = 32
+rollout.n = 32
+val.n = 16
+total_training_steps = 20
+dynamic_bsz = false
+chunk_score = future_support_gain / support_distribution_match
+probe = 4 samples, max_tokens 1536
+source hard gate = off
+prompt support quality gate = on
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_20step_20260802.sh
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_20step_20260802.jsonl
+val:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_supportq2_mid_c128_probe1536x4_b32_r32_v64_20step_20260802_val_metrics.json
+raw log:
+  未按预期落盘到 important_experiment_logs，最终 val 可从 val json 和 worker session 输出恢复。
+```
+
+最终 validation：
+
+```text
+mean@16 = 0.466250
+maj@16  = 0.594092
+best@16 = 0.852098
+format_mean@16 = 0.897875
+format_maj@16  = 0.872378
+```
+
+state-level 诊断汇总：
+
+```text
+diag rows = 176
+steps = 20
+answer_coverage_mean = 0.505859
+state_oov_mean = 0.494141
+future_support_keep_mean = 0.136364
+future_support_learnable_keep_mean = 0.136364
+prompt_valid_answer_coverage_mean = 0.905717
+prompt_answer_top_margin_mean = 0.673565
+prompt_answer_entropy_mean = 1.010018
+source_answer_mass_mean = 0.741878
+zero-update steps = 9 / 20
+zero-update step ids = 2, 3, 5, 7, 10, 14, 15, 18, 20
+```
+
+逐 step keep / coverage：
+
+```text
+step  keep   coverage  oov
+1     0.250  0.555     0.445
+2     0.000  0.828     0.172
+3     0.000  0.082     0.918
+4     0.125  0.520     0.480
+5     0.000  0.746     0.254
+6     0.375  0.621     0.379
+7     0.000  0.109     0.891
+8     0.125  0.531     0.469
+9     0.125  0.688     0.312
+10    0.000  0.668     0.332
+11    0.125  0.543     0.457
+12    0.125  0.309     0.691
+13    0.250  0.463     0.537
+14    0.000  0.289     0.711
+15    0.000  0.262     0.738
+16    0.438  0.697     0.303
+17    0.250  0.672     0.328
+18    0.000  0.160     0.840
+19    0.125  0.652     0.348
+20    0.000  0.574     0.426
+```
+
+结论：
+
+- 这次 20-step pilot 失败，validation 明显低于 MV / PowerFlow 参考轨迹，不应继续按该配置扩 80-step。
+- prompt-level full-rollout support quality filter 是有效的：`prompt_valid_answer_coverage_mean=0.906`、`prompt_answer_top_margin_mean=0.674`、`source_answer_mass_mean=0.742`，说明 full group 能筛出高质量 prompt/source。
+- 失败点在 chunk candidate / target：candidate 侧 `answer_coverage_mean=0.506`，`future_support_learnable_keep_mean=0.136`，且 45% 的 step 没有有效 actor update。即便 full prompt support 很强，当前 chunk proposal 仍经常离开 full-rollout answer support。
+- update_actor 不是主矛盾。有效更新步里 update_actor 常在 0.4-1s 量级；20-step 慢和失败主要来自 full rollout + probe/score 成本，以及 target keep 太稀。
+- 日志中出现 repeated boxed 污染样例，说明 malformed / repeated boxed 过滤还需要进入 state/candidate quality gate。
+
+设计纠偏：
+
+- 放弃“局部短视可判定性”这个训练约束。不能再要求 chunk target 主要由 short-horizon probe 的局部命中、source answer consistency 或少量 probe 是否碰巧答对来定义。
+- probe 只能作为 future answer distribution estimator，不能直接当 teacher。它的作用是估计 candidate chunk 把未来 completion 推向 full-rollout group support 的程度。
+- full rollout group 必须先定义 prompt-level support / value / answer mass；chunk 学的是哪个 local transition 会让未来分布更接近这个 support。
+- source chunk 保留为 prior / drift guard，不再作为 hard floor 或主要 teacher。
+- hard keep 需要改成 soft distribution matching / soft weighting。现在大量 step 被 hard keep 清零，直接导致训练信号稀疏；下一版应对低质量 state 降权或跳过，但不能让可学习状态被 `top_margin` 等局部硬阈值过度清零。
+- 下一版优先做 support-conditioned proposal：对同一 state 的 candidate 采样不只从 base policy 采 next chunk，还混入 high-support rollout suffix/replay chunk 或 full-support-conditioned anchor proposal，使 candidate distribution 自身更靠近 full-rollout support，再用 PowerFlow-style q_j ∝ exp(alpha * support_score_j) * prior_j 训练。
