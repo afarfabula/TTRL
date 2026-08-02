@@ -10727,3 +10727,69 @@ mean  29.894   9.713        8.938        7.882
   - 方案 B：support-aware proposal prior。不是直接 copy high-support continuation，而是在当前 state 下用 high-support answer support 引导 resampling / continuation probe，再做 posterior support match。
   - 方案 C：两阶段宽后深，但第一阶段不能用 short-probe local hit 决定 teacher；只能用 full-support posterior 的 coarse transport score 分配更多 probe budget。
 - 下一轮 gate 应同时要求：`top_margin > 0.03`，`coverage >= 0.50`，`OOV <= 0.50`，`label_consistent_ratio >= 0.75`，否则不扩 20-step。
+
+## 2026-08-02 posterior support longprobe2560 a6/s8 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_posterior_support_longprobe2560_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe2560x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_posterior_support_longprobe2560_a6s8_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_posterior_support_longprobe2560_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe2560x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_posterior_support_longprobe2560_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe2560x4_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- quality-gate 版本证明 post-hoc 过滤只能制造 margin，不能解决 support coverage / OOV。
+- 本轮取消 staged probe 和 quality gate，对全部 candidate 使用更长 horizon 的 future distribution estimator，检查更长 probe 能否让 candidate future distribution 自然靠近 full-rollout support。
+- 这轮仍保留 PowerFlow weighted distillation、posterior support match、source/anchor 作为 prior / drift guard，但不让 source hard gate 或 local answer hit 主导 target。
+
+关键配置：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_probe_max_tokens=2560
+ttrl.chunk_state_probe_samples=4
+ttrl.chunk_state_staged_probe_enable=False
+ttrl.chunk_state_future_support_prior_smoothing=8.0
+ttrl.chunk_state_alpha=6.0
+ttrl.chunk_state_eps=0.01
+ttrl.chunk_state_future_support_min_candidate_coverage=0.0
+ttrl.chunk_state_future_support_min_state_coverage=0.0
+ttrl.chunk_state_future_support_max_state_oov=1.0
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.05
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  coverage  oov    top_margin  label_consistent  target_entropy  weight_max
+1     29          232            0.466     0.534  0.020       1.000             1.744           0.826
+2     27          216            0.399     0.601  0.012       1.000             1.903           0.417
+3     23          184            0.384     0.616  0.028       1.000             1.844           0.720
+mean  26.3        210.7          0.416     0.584  0.020       1.000             1.830           0.654
+```
+
+耗时：
+
+```text
+step  gen      chunk_probe  chunk_score  chunk_ref  update_actor
+1     43.475   14.178       10.703       7.141      8.654
+2     22.609   14.117       10.783       3.034      7.800
+3     22.838   14.548       8.418        2.664      6.932
+mean  29.641   14.281       9.968        4.280      7.795
+```
+
+结论：
+
+- 这是负结果，不扩 20-step。
+- 更长 horizon probe 没有改善 full-support alignment：三步均值 coverage 只有 `0.416`，OOV `0.584`，比 sharp a6/s8 的 `0.511/0.489` 明显更差，也没有达到 `coverage >= 0.50` / `OOV <= 0.50` gate。
+- `label_consistent_ratio=1.0` 说明它没有像 quality-gate 那样直接坍缩到硬过滤，但 `state_top_margin` 均值只有 `0.020`，target 仍然不够可分。
+- 耗时也更重：`chunk_state_probe` 从 sharp 版约 `9.36s` 增到 `14.28s`，而 target 质量下降。说明单纯拉长 probe 不是有效解。
+- 退出期出现 `RuntimeError: DataLoader worker ... killed by signal: Killed`，发生在三步指标全部打印、`Final validation skipped` 后，不影响这次 smoke 的三步诊断。
+
+更新后的判断：
+
+- 需要优先放弃“局部短视可判定性”这个约束，而不只是继续拉长 probe 或加 gate。
+- full rollout group 要先定义 prompt-level answer support / value；chunk candidate 的目标应是相对这个 support 的 future distribution improvement。
+- 下一步不再把 short-horizon local hit、source consistency 或 post-hoc hard gate 当 teacher；更合理的方向是先提高 state/candidate proposal 的 support compatibility，再用 posterior support / transport-style target 做软分布蒸馏。
