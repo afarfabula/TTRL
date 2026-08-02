@@ -13543,3 +13543,79 @@ chunk_state_ref                    4.795s   0.756s   0.912s
 - v24 是正向 smoke：它修复了 v23 最核心的负 margin 问题，并且没有引入训练崩溃。
 - 但 v24 还不能直接扩 20-step，因为 actor samples 未达到预设的 >=80 gate。
 - 下一步建议做 v25：保留 `posterior_gain`，把 `future_support_keep` 从 hard keep 改为 soft keep，或轻量放宽 source/prompt gate，目标是在保持 `positive_margin_mean > 0.20` 的同时把 `num_actor_samples` 恢复到 >=80。
+
+## 2026-08-02 support-flow posterior-gain no-split v25 soft-keep 3-step smoke
+
+目的：
+
+- 承接 v24：`posterior_gain` 已经把 target margin 修正为正，但 hard keep 导致 `num_actor_samples=64/56/64`，低于 >=80 的利用率门槛。
+- 本次只改 keep 方式：保持 `posterior_gain`、full-rollout guard、source_mass soft weight、PowerFlow target-only 和 dynamic batch off，把 `future_support_keep` 从 hard 改为 soft。
+- 仍然不使用 short-horizon local teacher：`chunk_state_probe/skipped_for_support_flow=1.0`。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v25_softkeep_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriorgain_nosplit_v25_softkeep_fullguard_balanced_sourceweight_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v25_softkeep_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v25_softkeep_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_support_flow_score_type=posterior_gain
+ttrl.chunk_state_support_flow_baseline_scale=0.5
+ttrl.chunk_state_support_flow_gain_slack=0.05
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.20
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_min_source_answer_mass=0.15
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.50
+ttrl.chunk_state_source_quality_weight_mode=source_mass
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                  1        2        3
+clean_rollout_ratio                0.730    0.784    0.735
+real_states                        13       16       14
+num_actor_samples                  80       88       72
+support_anchor_injected_ratio      0.955    0.955    1.000
+posterior_mass_mean                0.389    0.305    0.324
+posterior_mass_max_mean            0.512    0.497    0.529
+source_mass_mean                   0.566    0.586    0.584
+positive_margin_mean               0.229    0.204    0.237
+score_mean                         0.221    0.160    0.175
+score_max_mean                     0.297    0.270    0.301
+state_keep_ratio                   0.875    0.812    0.875
+label_consistent_ratio             0.656    0.461    0.500
+answer_coverage_mean               0.836    0.836    0.875
+positive_ratio                     0.221    0.157    0.175
+actor_weight_nonzero_ratio         1.000    1.000    1.000
+update_actor                       3.114s   2.943s   2.367s
+gen                                43.477s  23.859s  31.826s
+chunk_state_score                  7.622s   6.073s   8.024s
+chunk_state_ref                    5.049s   1.232s   0.991s
+```
+
+观察：
+
+- v25 工程稳定：退出码 0，无 Traceback、无 RuntimeError、无 DataLoader worker killed；final validation 按 smoke 配置跳过。
+- soft keep 的确改善了 v24 的利用率：step1/2 达到 `num_actor_samples=80/88`，但 step3 仍掉到 72，说明只改 keep mode 还不能稳定保证 >=80。
+- target margin 保持为正：`positive_margin_mean=0.229/0.204/0.237`，没有回到 v23 的负 margin；但 step2 margin 已经贴近 0.20 下限。
+- `actor_weight_nonzero_ratio=1.0` 三步稳定，PowerFlow target-only 的 actor batch 没有空 shard。
+- actor update 仍然快：2.4-3.1s；主要时间在 full rollout generation、math reward/support scoring 和少量 ref logprob。
+- v25 日志确认 `powerflow_chunk_loss_mode=target_only`、`actor.use_dynamic_bsz=False`、vLLM `attention_config.backend=FLASH_ATTN`；diag 共 48 行。
+
+结论：
+
+- v25 是比 v24 更好的工程 smoke：保留正 margin，同时恢复了大部分 actor sample。
+- 但 v25 还不是可直接扩 20-step 的最终门槛版本，因为 `num_actor_samples` 第 3 step 低于 80，且 `posterior_mass_mean` 偏低。
+- 下一步不应回到 short-probe/local teacher，也不应加重 source hard gate。更合理的 v26 是在保持 `posterior_gain + soft keep` 的基础上提高候选利用率，例如轻量增加 candidate 数或降低 `prune_zero_weight_samples` 对 actor sample 的冲击，同时继续用 `positive_margin_mean > 0.20` 和 `num_actor_samples >=80` 做 gate。
