@@ -13007,3 +13007,109 @@ step3 zeroed=1/64   candidate_repeated_boxed_ratio=0.016
 - v18 可以作为下一次 20-step 候选，但准入条件必须包含 final validation pollution audit，不能只看 train-time guard 触发率。
 - 如果 20-step 仍出现重复 `\boxed{}` / prompt echo，下一步应加 validation/rollout-level pollution monitor，并考虑把完整 rollout 中的污染轨迹降权或从 source/support pool 中移除；只在 128-token candidate 上做 hard filter 可能覆盖不够。
 - 仍然不回退到 short-horizon probe teacher，也不引入 source consistency 硬 teacher。
+
+## 2026-08-02 support-flow posterior-mass no-split v18 pollution-guard target-only 20-step final validation
+
+目的：
+
+- 把 v18 从 3-step smoke 扩到 20-step，验证 candidate pollution guard 是否能阻止 v16 看到的重复 `\boxed{}` / prompt echo collapse。
+- 仍坚持 24h goal 的核心语义：full-rollout group posterior/support 定义 chunk target，PowerFlow target-only loss 更新 chunk span；不使用 short-horizon probe hit 或 source consistency 当 teacher。
+- 只做 20-step + final validation，不保存 ckpt，输出路径放在 `/tmp/ttrl_b200/checkpoints/...`，日志和指标放在 `important_experiment_logs/`。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_20step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802.jsonl`
+- final val metrics: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802_val_metrics.json`
+
+关键配置：
+
+```text
+data.train_batch_size=32
+actor_rollout_ref.rollout.n=32
+ttrl.n_votes_per_prompt=64
+ttrl.n_samples_per_prompt=32
+ttrl.chunk_state_score_mode=support_flow
+ttrl.chunk_state_support_flow_score_type=posterior_mass
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_mid_require_nonzero_boundary=True
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_zero_inconsistent_candidates=True
+ttrl.chunk_state_prune_zero_weight_samples=True
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=20
+trainer.test_freq=20
+trainer.final_val_enable=True
+```
+
+20-step final validation：
+
+```text
+val-core/math/acc/mean@16      0.469750
+val-core/math/acc/maj@16/mean  0.587000
+val-core/math/acc/best@16/mean 0.852938
+format_score/mean@16           0.903375
+format_score/maj@16/mean       0.885464
+format_score/worst@16/mean     0.473668
+testing                        298.723s
+```
+
+对比 v16 target-only 20-step：
+
+```text
+metric                         v16        v18
+mean@16                       0.440250   0.469750
+maj@16                        0.560144   0.587000
+best@16                       0.840186   0.852938
+format mean@16                0.890125   0.903375
+format maj@16                 0.855556   0.885464
+format worst@16               0.444788   0.473668
+```
+
+训练段聚合（step 1-19，不含 final validation step 20 的 `testing`）：
+
+```text
+metric                                      mean       min       max      last
+timing_s/gen                              25.474s   21.553s   43.397s  22.229s
+timing_s/generate_sequences               18.532s   17.393s   29.899s  17.393s
+timing_s/chunk_state_score                 6.412s    5.633s    7.788s   6.165s
+timing_s/chunk_state_chunks                0.984s    0.917s    1.116s   0.918s
+timing_s/chunk_state_ref                   0.614s    0.132s    4.372s   0.547s
+timing_s/update_actor                      1.114s    0.413s    1.832s   1.455s
+chunk_state/num_actor_samples             27.789     8.000    48.000   40.000
+chunk_state/real_states                    4.579     2.000     7.000    6.000
+chunk_state/pruned_sample_ratio            0.566     0.250     0.875    0.375
+posterior_answer_duplicate_ratio           0.612     0.146     0.857    0.571
+chunk_state/target_entropy                 1.598     0.863     1.946    1.554
+target_guard_zeroed_candidate_ratio        0.023     0.000     0.109    0.000
+```
+
+guard 汇总：
+
+```text
+zeroed_candidates = 29 / 1280
+zeroed_candidate_ratio ~= 2.27%
+```
+
+观察：
+
+- v18 20-step 跑通并完成 final validation，Ray/runtime/env 没有失败。
+- 当前 B200 快链路正常启用 vLLM CUDA graph，训练启动日志显示 `attention_config.backend=FLASH_ATTN`，actor 侧也有 flash attention monkey patch 和 fused kernel 日志。
+- actor update 已经不是瓶颈：训练段 `update_actor` 均值约 `1.11s`，chunk span actor update 能吃到短序列收益。
+- 主要耗时仍在 full rollout generation 与 group posterior scoring：`gen` 均值约 `25.47s`，`chunk_state_score` 均值约 `6.41s`；端到端进度受 math verifier timeout 和长生成拖动。
+- v18 相对 v16 有小幅改善：mean@16 +2.95pt，maj@16 +2.69pt，best@16 +1.28pt，format worst@16 +2.89pt。
+- 但 validation 日志仍然出现长段重复提示语和重复 `\boxed{}` 风格输出；raw log 中 `Please provide a step-by-step explanation` 重复出现 534 次。说明 v18 的 128-token candidate guard 只挡住了一部分污染，不能解决完整 rollout 尾部的退化。
+- guard 触发率偏低：只 zero 29/1280 candidates。它更像一个轻量污染拦截器，不是足够强的 target-quality 修复。
+
+结论：
+
+- v18 不是最终方向，只能说明“candidate pollution guard 有效但覆盖不足”。最终指标仍远低于 major-vote / paper-style 20-step 目标，也低于我们希望的 85+ mean@16。
+- 下一步不应继续堆 source hard gate，也不应回到 short-horizon local hit teacher。
+- 更合理的 v19 方向：把 pollution/value filter 前移到 full rollout group 和 source/support pool 层面。完整 rollout 一旦出现 prompt echo、重复 boxed、marker 污染、过长复制，应从 group posterior / anchor pool 中剔除或强降权；否则污染轨迹仍会通过 source/support anchor 进入 chunk target。
+- 同时应把 target 从纯 `posterior_mass` 改到更接近 search improvement 的 `posterior_gain` 或 support-value margin：保留 full-group posterior，但要求 candidate chunk 提升未来分布相对 source 的质量，而不是只匹配已有高 mass answer。
