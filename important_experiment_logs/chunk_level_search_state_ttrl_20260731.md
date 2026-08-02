@@ -12139,3 +12139,55 @@ mean  32.993   7.036  9.015   1.217
 - 放松 hard keep 为 soft weighting：低 coverage/high OOV state 可以低权重，但不能让整步 actor weight 归零；需要设置最小有效 state 或 fallback 到 soft target。
 - 提高 candidate/probe 和 full support 的重合，而不是加 source-side 硬约束：优先从 full rollout group 的 mid/late state 构造同 boundary candidate，或增加 probe 分支数/候选质量，再计算 support match。
 - 下一版 smoke 的通过标准：`actor/powerflow_weight/nonzero_ratio` 每步非零，`support_coverage_mean` 至少接近 v6/v7 的 `0.48-0.50`，`state_oov_mean` 明显低于 `0.5`，且不能靠 source answer floor 获得这些数。
+
+## 2026-08-02 future-gain support-distribution-match softkeep v9 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_softkeep_v9_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_supportdist_softkeep_v9_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_softkeep_v9_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_softkeep_v9_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+相对 v8 的变化：
+
+- score 仍是 `ttrl.chunk_state_future_support_score_type=support_distribution_match`，不回退到 short-probe local hit/source consistency。
+- `ttrl.chunk_state_future_support_keep_mode=soft`，`soft_weight_floor=0.02`。
+- support quality gate 从 v8 的 `coverage>=0.25/oov<=0.75/min_margin=0.04` 放宽到 `coverage>=0.125/oov<=0.875/min_margin=0.0`。
+- 目的只是避免 v8 第 3 step 的 actor weight 全零，验证 soft weighting 能否让 full-support target 持续产生更新。
+
+三步质量汇总：
+
+```text
+step  coverage  oov    keep   score  label  improved  margin  raw_gain  transport_gain  real_state  actor_samples  zeroed  state_w  w_cov  w_margin  positive_ratio  target_entropy  actor_w_nonzero
+1     0.152     0.848  0.250  0.082  0.188  0.375     0.234   -0.586    -0.601          3           24             0.625   0.118    0.627  0.593     0.082           1.674           1.000
+2     0.086     0.914  0.125  0.019  0.203  0.875     0.064   -0.772    -0.781          3           8              0.875   0.047    0.312  0.310     0.019           1.909           1.000
+3     0.137     0.863  0.125  0.083  0.234  0.500     0.118   -0.676    -0.693          3           16             0.750   0.110    0.554  0.484     0.083           2.016           1.000
+mean  0.125     0.875  0.167  0.061  0.208  0.583     0.139   -0.678    -0.692          3.0         16.0           0.750   0.092    0.498  0.462     0.061           1.866           1.000
+```
+
+耗时：
+
+```text
+step  gen      probe  score   update_actor
+1     43.477   7.043  8.501   1.348
+2     23.399   7.088  6.286   0.427
+3     23.471   7.197  6.263   0.805
+mean  30.116   7.109  7.017   0.860
+```
+
+结论：
+
+- 不扩 20-step。v9 只修复了 v8 的 hard-gate 零更新问题，没有修复 target 质量问题。
+- soft keep 按预期生效：`future_support_keep_mode_soft=1.0`，三步 `actor/powerflow_weight/nonzero_ratio=1.0`，没有再出现 v8 第 3 step 的 `powerflow_loss=0`。
+- 但 full-support match 的 candidate 分布仍然很差：`support_coverage_mean=0.125`，`state_oov_mean=0.875`，甚至比 v8 均值 `0.235/0.765` 更差。
+- prompt-level full group 仍有足够信息：`prompt_valid_answer_coverage_mean=0.931`。问题不是 full group label 不存在，而是当前 mid-state candidate/probe 很少落回 full group support。
+- update_actor 均值 `0.860s`，说明 chunk actor update 本身很轻；瓶颈和主矛盾继续是 label/candidate 构造，不是 actor update 吞吐。
+- 退出阶段又出现 `DataLoader worker ... killed by signal: Killed`，但 3 个 step、24 行 diag 和 raw log 均完整，进程最终返回 0。扩长实验前需要继续关注 worker 清理/内存峰值。
+
+下一步：
+
+- 不再继续只调 gate/floor；soft keep 可作为默认安全机制，避免整步无效更新。
+- 主改 candidate/state：从 full rollout group 的 high-support trajectory 在同 boundary 上构造 candidates，或让 chunk candidate 继承 full support answer path 的 state alignment，减少 OOV。
+- 需要把“full rollout group 定义目标”落实到 state/candidate 构造层，而不是只在 score 层做 support match；否则 probe 采样即使更长，也仍主要采到 support 外答案。
+- 下一条 smoke 应该比较两种 candidate source：当前 resample-from-state vs full-group aligned candidate，并用同一 `support_distribution_match + soft keep` 判断 coverage/OOV 是否显著改善。
