@@ -9323,3 +9323,76 @@ step 3: support_coverage = 0.297, state_oov = 0.703, state_keep = 0.250, num_act
 - 但它仍未通过扩展条件：coverage 均值 0.391、OOV 均值 0.609，step 2/3 仍然大量 future answers 不在 full-rollout support 内。
 - 不扩 20-step。主问题已经从 loss 公式转为 label estimation / state-probe distribution 质量：需要让 probe 更可靠地估计“未来分布是否靠近 full support”，而不是继续调 PowerFlow 权重或 gate。
 - 下一步优先做 state/probe 侧：减少低支持 prompt，改用 support 清晰且 coverage 高的 state；或者提高 full rollout support 样本数 / probe reuse，使 full support distribution 对 chunk state 的监督更稳定。
+
+## 2026-08-02 support-distribution-match probe3072 3-step smoke
+
+目的：
+
+- 检验上一组 support-distribution-match 的高 OOV / 低 coverage 是否主要来自 probe horizon 太短。
+- 只把 `ttrl.chunk_state_probe_max_tokens` 从 1536 提到 3072，其余 target 语义保持一致。
+- 这个实验不是为了继续强化 short-horizon local hit，而是验证“拉长 probe 是否足够让 future answer distribution 更贴近 full-rollout support”。
+
+配置：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe3072x4_b32_r32_v64_3step_20260802
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe3072x4_b32_r32_v64_3step_20260802.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe3072x4_b32_r32_v64_3step_20260802.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_mid_c128_probe3072x4_b32_r32_v64_3step_20260802.jsonl
+status = completed_failed_smoke
+
+ttrl.chunk_state_future_support_score_type = support_distribution_match
+ttrl.chunk_state_probe_max_tokens = 3072
+ttrl.chunk_state_probe_samples = 4
+ttrl.chunk_state_future_support_min_positive_margin = 0.04
+ttrl.chunk_state_future_support_min_state_coverage = 0.25
+ttrl.chunk_state_future_support_max_state_oov = 0.75
+```
+
+3-step mean diagnostics：
+
+```text
+chunk_state_future_support_gain/support_coverage_mean = 0.403000
+chunk_state_future_support_gain/state_oov_mean = 0.597000
+chunk_state_future_support_gain/state_keep_ratio = 0.291667
+chunk_state_future_support_gain/learnable_state_keep_ratio = 0.291667
+chunk_state_future_support_gain/smoothed_transport_affinity_mean = 0.635667
+chunk_state_future_support_gain/support_expected_value_mean = 0.193667
+chunk_state_future_support_gain/support_overlap_mean = 0.271333
+chunk_state_future_support_gain/candidate_entropy_mean = 0.669333
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.070667
+chunk_state_future_support_gain/positive_margin_mean = 0.337000
+chunk_state_future_support_gain/label_consistent_ratio = 0.653667
+
+chunk_state/num_actor_samples = 18.666667
+chunk_state/zeroed_state_ratio = 0.833000
+
+timing_s/gen = 29.585667
+timing_s/chunk_state_probe = 14.763667
+timing_s/chunk_state_score = 8.460333
+timing_s/chunk_state_ref = 1.549000
+timing_s/update_actor = 0.949000
+```
+
+逐步诊断：
+
+```text
+step 1: support_coverage = 0.521, state_oov = 0.479, state_keep = 0.312, num_actor_samples = 24
+step 2: support_coverage = 0.461, state_oov = 0.539, state_keep = 0.375, num_actor_samples = 8
+step 3: support_coverage = 0.227, state_oov = 0.773, state_keep = 0.188, num_actor_samples = 24
+```
+
+对 probe1536 的直接对比：
+
+```text
+probe1536 support_coverage = 0.390667, state_oov = 0.609333, state_keep = 0.291667, probe_time = 7.758000s
+probe3072 support_coverage = 0.403000, state_oov = 0.597000, state_keep = 0.291667, probe_time = 14.763667s
+```
+
+结论：
+
+- probe horizon 从 1536 拉到 3072 只把 coverage 从 0.391 小幅提高到 0.403，OOV 从 0.609 小幅降到 0.597，state_keep 完全没有提高。
+- probe 成本从约 7.76s 增加到约 14.76s，几乎翻倍；这不值得扩到 20-step。
+- source 质量不是主问题：diag 里 `source_majority_consistent` 均值 1.0，`source_original_correct` 均值约 0.975，`source_answer_mass` 均值约 0.553。
+- 失败仍然是 candidate/probe future distribution 与 full-rollout support 的重叠不够；继续依赖更长的 local probe 或更强 source gate 不是主线。
+- 下一步应按最新约束改设计：full rollout group 先定义 prompt-level support/value；chunk candidate 只学习是否把 future distribution 推向该 support；source chunk 只做 prior/drift guard；低信息 state 直接跳过或降权。不要再让 short-horizon local hit / source consistency 主导 teacher。
