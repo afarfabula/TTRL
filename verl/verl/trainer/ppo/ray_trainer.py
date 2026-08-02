@@ -4343,6 +4343,62 @@ class RayPPOTrainer:
         ).view(len(state_prompts), 1)
         baseline = source_mass * baseline_scale
 
+        if score_type in {"posterior_mass", "posterior_gain"}:
+            prompt_mass_values = [
+                json.loads(str(value)) if str(value) else {}
+                for value in state_prompts.non_tensor_batch.get(
+                    "chunk_state_prompt_answer_mass",
+                    np.asarray(["{}"] * len(state_prompts), dtype=object),
+                )
+            ]
+            anchor_answers = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_support_anchor_answers",
+                    np.full((len(state_prompts), candidates), "", dtype=object),
+                ),
+                dtype=object,
+            ).reshape(len(state_prompts), candidates)
+            anchor_injected = torch.as_tensor(
+                np.asarray(
+                    state_prompts.non_tensor_batch.get(
+                        "chunk_state_support_anchor_injected",
+                        np.zeros((len(state_prompts), candidates), dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ),
+                dtype=torch.float32,
+            ).reshape(len(state_prompts), candidates)
+            posterior_mass = torch.zeros_like(anchor_mass)
+            posterior_answer_duplicate_ratio = 0.0
+            duplicate_ratios = []
+            for state_idx, mass_map in enumerate(prompt_mass_values):
+                answer_to_indices = defaultdict(list)
+                for candidate_idx in range(candidates):
+                    if float(anchor_injected[state_idx, candidate_idx].item()) <= 0.0:
+                        continue
+                    answer = str(anchor_answers[state_idx, candidate_idx])
+                    if not answer or answer == "None":
+                        continue
+                    answer_to_indices[answer].append(candidate_idx)
+                used = sum(len(indices) for indices in answer_to_indices.values())
+                if used:
+                    duplicate_ratios.append(1.0 - (len(answer_to_indices) / max(float(used), 1.0)))
+                for answer, indices in answer_to_indices.items():
+                    answer_mass = float(mass_map.get(answer, 0.0))
+                    if answer_mass <= 0.0:
+                        continue
+                    split_mass = answer_mass / max(len(indices), 1)
+                    for candidate_idx in indices:
+                        posterior_mass[state_idx, candidate_idx] = split_mass
+            posterior_answer_duplicate_ratio = float(np.mean(duplicate_ratios)) if duplicate_ratios else 0.0
+            if score_type == "posterior_mass":
+                score_matrix = posterior_mass.clamp(min=0.0, max=1.0)
+            else:
+                score_matrix = (posterior_mass - baseline + gain_slack).clamp(min=0.0, max=1.0)
+        else:
+            posterior_answer_duplicate_ratio = 0.0
+            posterior_mass = torch.zeros_like(anchor_mass)
+
         if score_type in {"mass", "soft_mass"}:
             score_matrix = anchor_mass.clamp(min=0.0, max=1.0)
         elif score_type == "gain":
@@ -4360,13 +4416,14 @@ class RayPPOTrainer:
                 min=0.0,
                 max=1.0,
             )
-        else:
+        elif score_type not in {"posterior_mass", "posterior_gain"}:
             raise ValueError(f"Unsupported ttrl.chunk_state_support_flow_score_type={score_type!r}")
 
         label_consistent = (score_matrix > 0.0).float()
-        positive_margin = (anchor_mass - baseline).max(dim=-1).values
-        if score_type in {"soft_mass", "soft_relative_mass", "softplus_gain"}:
-            keep_state = anchor_mass.max(dim=-1).values > 0.0
+        score_basis = posterior_mass if score_type in {"posterior_mass", "posterior_gain"} else anchor_mass
+        positive_margin = (score_basis - baseline).max(dim=-1).values
+        if score_type in {"soft_mass", "soft_relative_mass", "softplus_gain", "posterior_mass"}:
+            keep_state = score_basis.max(dim=-1).values > 0.0
         else:
             keep_state = positive_margin >= min_positive_margin
         score_matrix = score_matrix * keep_state.view(-1, 1).to(dtype=score_matrix.dtype)
@@ -4414,6 +4471,8 @@ class RayPPOTrainer:
             "chunk_state_support_flow/score_type_relative_gain": float(score_type == "relative_gain"),
             "chunk_state_support_flow/score_type_soft_relative_mass": float(score_type == "soft_relative_mass"),
             "chunk_state_support_flow/score_type_softplus_gain": float(score_type == "softplus_gain"),
+            "chunk_state_support_flow/score_type_posterior_mass": float(score_type == "posterior_mass"),
+            "chunk_state_support_flow/score_type_posterior_gain": float(score_type == "posterior_gain"),
             "chunk_state_support_flow/gain_slack": gain_slack,
             "chunk_state_support_flow/baseline_scale": baseline_scale,
             "chunk_state_support_flow/source_prior_weight": source_prior_weight,
@@ -4422,10 +4481,17 @@ class RayPPOTrainer:
             "chunk_state_support_flow/split_mass_by_answer": float(split_mass_by_answer),
             "chunk_state_support_flow/answer_split_power": answer_split_power,
             "chunk_state_support_flow/answer_duplicate_ratio": answer_duplicate_ratio,
+            "chunk_state_support_flow/posterior_answer_duplicate_ratio": posterior_answer_duplicate_ratio,
             "chunk_state_support_flow/raw_anchor_mass_mean": raw_anchor_mass.mean().item()
             if len(raw_anchor_mass)
             else 0.0,
             "chunk_state_support_flow/anchor_mass_mean": anchor_mass.mean().item() if len(anchor_mass) else 0.0,
+            "chunk_state_support_flow/posterior_mass_mean": posterior_mass.mean().item()
+            if len(posterior_mass)
+            else 0.0,
+            "chunk_state_support_flow/posterior_mass_max_mean": posterior_mass.max(dim=-1).values.mean().item()
+            if len(posterior_mass)
+            else 0.0,
             "chunk_state_support_flow/source_mass_mean": source_mass.mean().item() if len(source_mass) else 0.0,
             "chunk_state_support_flow/positive_margin_mean": positive_margin.mean().item()
             if len(positive_margin)

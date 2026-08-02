@@ -11961,3 +11961,61 @@ mean  30.609   1.015   0.000  6.796   3.127   4.725
 - 做 v6 answer-level posterior target：对每个 state 先用 full rollout group 得到 `P_good(answer)`，再把候选 chunk/anchor 映射到 answer support；同一 answer 的多个 chunks 共享该 answer posterior mass，避免 answer-stratified 后把主答案质量稀释成低 trajectory mass。
 - source chunk 只作为 drift prior；如果 source answer 是 top posterior，可给 source chunk 一个 prior multiplier，但不作为 score floor。
 - 保留 no-short-probe 主约束。probe 最多用于补全 candidate answer identity 或 future distribution 的辅助估计，不再直接决定 teacher。
+
+## 2026-08-02 support-flow answer-posterior v6 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_answerposterior_spp2_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_answerposterior_spp2_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_answerposterior_spp2_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_answerposterior_spp2_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码变化：
+
+- 在 `support_flow` score path 增加 `posterior_mass` / `posterior_gain`。
+- `posterior_mass` 从 full rollout group 的 `chunk_state_prompt_answer_mass` 读取 prompt-level answer posterior，再映射到 support anchor candidate 的 answer；同一 answer 的多个 anchor 平分该 answer posterior mass。
+- `posterior_gain` 预留为 `posterior_mass - source_mass * baseline_scale + gain_slack`。
+- `positive_margin` 对 posterior score type 改用 `posterior_mass - source_mass`，不再用 trajectory-level anchor mass。
+
+关键配置：
+
+- `ttrl.chunk_state_score_mode=support_flow`。
+- `ttrl.chunk_state_support_flow_score_type=posterior_mass`。
+- `ttrl.chunk_state_support_flow_split_mass_by_answer=False`。
+- `chunk_state_probe/skipped_for_support_flow=1.0`，确认没有 short-horizon probe teacher。
+- batch / rollout 仍是 `data.train_batch_size=32`、`rollout.n=32`、`n_votes_per_prompt=64`、`states_per_prompt=2`。
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  posterior_mean  posterior_max  label_ratio  coverage  w_cov  pos_margin  w_margin  positive_ratio  target_entropy
+1     16          128            1.000       0.614        0.059           0.359          0.492        0.492     0.487 -0.255      -0.273    0.059           1.075
+2     14          112            1.000       0.678        0.052           0.298          0.500        0.500     0.500 -0.380      -0.315    0.052           1.355
+3     14          112            1.000       0.595        0.081           0.525          0.484        0.500     0.500 -0.070      -0.066    0.081           0.631
+mean  14.7        117.3          1.000       0.629        0.064           0.394          0.492        0.497     0.496 -0.235      -0.218    0.064           1.020
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe  score   ref     update_actor
+1     43.445   0.945   0.000  7.653   5.683   4.948
+2     23.377   0.984   0.000  6.651   1.552   4.233
+3     22.923   0.976   0.000  5.750   1.531   4.643
+mean  29.915   0.968   0.000  6.685   2.922   4.608
+```
+
+结论：
+
+- 不扩 20-step。v6 确认 answer-level posterior target 工程路径可以跑通，且全程没有 short probe teacher：`skipped_for_support_flow=1.0`。
+- 但质量仍不够：`answer_coverage_weighted_mean=0.496`，`positive_margin_weighted_mean=-0.218`，`positive_ratio=0.064`。这说明 full posterior 已经接入，但当前 support anchors 很少提供比 source posterior 更强的局部 transition。
+- v6 比 v5 方向更正确，但在这个 smoke 里没有实质改善，因为 selected anchors 的 answer 基本唯一：`posterior_answer_duplicate_ratio=0.0`，answer-level mass 和 trajectory-level anchor mass 在多数 state 上几乎等价。
+- 这个结果进一步支持最新约束：不能回到“短 probe 局部命中就是 teacher”的做法，也不该继续加 source-side hard gate。主问题是 candidate/anchor 生成和选择还没有形成真正的 search-improved transition distribution。
+
+下一步：
+
+- target 仍保持由 full rollout group posterior/value 主导，short probe 只能作为辅助 future identity/value estimate。
+- 改 candidate 侧而不是加 source gate：让候选 chunk 来自 full group 高 posterior answer 的多条 trajectory，或从同一 state 重新采样后用 longer-horizon support gain 映射到 full posterior。
+- 对 low-information state 做硬跳过或低权重：flat support、低 valid answer coverage、高 OOV、malformed/repeated boxed、posterior max 过低、candidate 无法映射到 group support。
+- 下一版优先验证 `q_j proportional exp(alpha * full_group_value_gain_j) * prior_j`，其中 prior 只做 drift guard，不能重新变成 source answer floor。
