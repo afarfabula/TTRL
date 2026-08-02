@@ -10197,3 +10197,109 @@ step 3:
 - 相比 source-soft，prompt020 的状态覆盖更稳定：`29/25/25` 好于 source-soft 的 `24/16/18`；但 coverage 不稳定，step 3 掉到 `0.360`，说明低信息 state / prompt 仍会混入。
 - 不支持直接扩 20-step。下一版应该继续保留 full-support target + soft keep + source hard gate off，但增加 full-support 质量降权/过滤：例如基于 `prompt_valid_answer_coverage`、`prompt_answer_top_margin`、candidate coverage/OOV、support entropy 做 state weight 或 early skip。
 - 不能回到“source consistency / short-probe local hit 当 teacher”的路线。当前失败点仍是 target 质量，不是 actor update；稳态 `update_actor` 约 `7.3-7.4s`，主要时间在 full rollout、chunk probe 和 `chunk_state_score` 的 answer parsing / support scoring。
+
+## 2026-08-02 chunk-state PowerFlow: prompt020 + full-support coverage gate cov040 smoke
+
+目的：
+
+- 在 prompt top-mass 0.20 + product continuous weight 的基础上，加入真正影响 actor batch 的 full-support coverage gate。
+- 验证 `chunk_state_min_answer_coverage=0.40` 是否能过滤低信息 state，避免 prompt020 第 3 step coverage 掉到 `0.360`。
+- 继续遵守最新约束：不能让 short-horizon probe/local answer hit/source consistency 主导 target；coverage gate 只能看 full-rollout support/value 质量，不回退到 source hard teacher。
+
+配置：
+
+```text
+base = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+chunk_state_min_answer_coverage = 0.40
+chunk_state_confidence_power = 0.5
+chunk_state_min_source_answer_mass = 0.0
+chunk_state_min_prompt_top_mass = 0.20
+chunk_state_source_select_by_mass = True
+chunk_state_source_quality_weight_mode = product
+chunk_state_source_quality_weight_floor = 0.05
+chunk_state_source_quality_weight_power = 0.5
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_cov040_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_cov040_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_cov040_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+运行状态：
+
+- 3-step smoke 完成，无 RuntimeError / Traceback。
+- diag 88 行，不是 96 行：step 3 gate 后只有 24 个真实 state 进入本轮 actor batch/diag。
+- 模型仍为 `/models/Qwen2.5-Math-7B`，数据为 `data/MATH-TTT`，venv 为 `/mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200`。
+
+逐 step 结果：
+
+```text
+step  rows  real_state  pad_state  skipped_support  coverage  oov     source_correct  source_mass  prompt_top  probe_mean  loss_weight  state_mean_mass  state_max_mass  top_margin
+1     32    29          3          3                0.482422  0.5176  0.906250        0.450254     0.454719    0.189564    0.906250    0.194856         0.430132        0.052269
+2     32    27          5          5                0.370117  0.6299  0.812500        0.506799     0.506799    0.136728    0.843750    0.141400         0.318099        0.035094
+3     24    24          0          8                0.510417  0.4896  0.916667        0.476603     0.477948    0.221492    1.000000    0.224135         0.453056        0.018830
+```
+
+训练侧关键指标：
+
+```text
+step 1:
+  confidence_gate_ratio = 0.625
+  confidence_weight_mean = 0.442
+  num_actor_samples = 144
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  gen = 43.529s
+  chunk_probe = 9.079s
+  chunk_score = 12.043s
+  chunk_ref = 5.942s
+  update_actor = 5.846s
+  step wall = 120.12s
+
+step 2:
+  confidence_gate_ratio = 0.500
+  confidence_weight_mean = 0.375
+  num_actor_samples = 128
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  gen = 23.302s
+  chunk_probe = 9.553s
+  chunk_score = 10.574s
+  chunk_ref = 1.884s
+  update_actor = 4.851s
+
+step 3:
+  confidence_gate_ratio = 0.792
+  confidence_weight_mean = 0.467
+  num_actor_samples = 152
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  gen = 22.510s
+  chunk_probe = 8.386s
+  chunk_score = 9.346s
+  chunk_ref = 2.138s
+  update_actor = 5.438s
+```
+
+对 prompt020 的对比：
+
+```text
+prompt020 coverage: 0.482 / 0.503 / 0.360
+cov040   coverage: 0.482 / 0.370 / 0.510
+
+prompt020 num_actor_samples: 232 / 200 / 200
+cov040   num_actor_samples: 144 / 128 / 152
+
+prompt020 update_actor: 8.841s / 7.279s / 7.441s
+cov040   update_actor: 5.846s / 4.851s / 5.438s
+```
+
+结论：
+
+- cov040 没有打空 batch，且能明显压低 actor update：`num_actor_samples` 从约 `200-232` 降到 `128-152`，`update_actor` 从约 `7-9s` 降到 `5s` 左右。
+- 但它没有稳定改善 target 质量。step 2 的 support coverage 直接掉到 `0.370`，OOV 到 `0.630`；step 3 虽回到 `0.510`，但真实 state 只有 24 个，状态数不稳定。
+- 因此 cov040 不是可扩 20-step 的正结果。它证明“full-support gate 能提速”，但没有解决主矛盾：target/proposal 仍没有可靠地把 local transition 指向 full-rollout group support。
+- 下一步不要继续沿 source hard gate、short-probe local hit、source consistency 的方向加码，也不要把 cov040 当成主线。更合理的最小改动是：改 candidate/proposal 生成和 target 定义，让 score 直接来自 longer-horizon / staged future support distribution match；low-information state 做 soft skip/降权，但不能让短视局部命中重新成为 teacher。
