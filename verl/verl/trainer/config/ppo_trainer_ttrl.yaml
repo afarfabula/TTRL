@@ -264,6 +264,11 @@ ttrl:
   # full answer distribution onto chunk anchors rather than counting duplicate
   # chunks from the same answer multiple times.
   chunk_state_support_flow_split_mass_by_answer: false
+  # Exponent on the number of same-answer anchors when split_mass_by_answer is
+  # enabled. 1.0 is an exact split; values in (0, 1) partially preserve the
+  # margin of repeated high-support transitions while still penalizing
+  # duplicate-answer overcounting.
+  chunk_state_support_flow_answer_split_power: 1.0
   chunk_state_support_flow_gain_slack: 0.0
   chunk_state_support_flow_baseline_scale: 1.0
   chunk_state_support_flow_source_prior_weight: 1.0

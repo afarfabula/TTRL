@@ -11174,3 +11174,67 @@ mean  33.036   6.219
 - 这轮说明 target 设计要同时满足两个条件：保留足够 support coverage，并保留足够 improvement margin。单纯 answer split 会过度抹平 gain。
 - 更合理的下一个变量是对 split 后的 answer-level mass 加温度/幂次重新锐化，或只对同答案 duplicates 做部分分摊，例如 `projected_mass = answer_mass / count^gamma`，`gamma < 1`，在不重复计权的前提下保留 high-support transition 的 margin。
 - state selection 也需要更直接地过滤低信息 prompt：把 `prompt_valid_answer_coverage`、`prompt_answer_top_margin`、`prompt_answer_entropy` 纳入轻量 gate/soft weight，避免 support 本身太平或太散的 state 主导更新。
+
+## 2026-08-02 support_flow mass-proposal fractional answer-split gate0.30 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_massprop_answersplit05_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- 新增 opt-in 配置 `ttrl.chunk_state_support_flow_answer_split_power`，默认 `1.0` 保持 full answer split。
+- 当 `split_mass_by_answer=True` 时，同答案 anchors 的质量由 `answer_mass / count^power` 得到：
+  - `power=1.0`: 完全按答案去重分摊。
+  - `power=0.5`: 对重复答案做部分惩罚，保留一部分 high-support transition margin。
+  - `power=0.0`: 不分摊，接近原始 mass-ranked anchor mass。
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_support_anchor_selection_mode=mass_ranked
+ttrl.chunk_state_support_flow_split_mass_by_answer=True
+ttrl.chunk_state_support_flow_answer_split_power=0.5
+ttrl.chunk_state_min_prompt_top_mass=0.30
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_support_anchor_count=7
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_mass  pos_margin  ans_cov  anchor_inject  uniq_ans  dup_ans  target_entropy
+1     24          192            0.092        0.116       0.734    0.857          0.805     0.196    1.993
+2     19          152            0.093        0.137       0.599    0.685          0.882     0.118    1.917
+3     17          136            0.076        0.219       0.776    0.946          0.725     0.292    1.929
+mean  20.0        160.0          0.087        0.157       0.703    0.829          0.804     0.202    1.946
+```
+
+耗时：
+
+```text
+step  gen      chunks  score   ref     update_actor
+1     43.471   0.974   7.354   6.827   7.642
+2     23.182   0.978   5.732   2.280   5.915
+3     21.955   1.092   5.705   1.984   4.965
+mean  29.536   1.015   6.264   3.697   6.174
+```
+
+结论：
+
+- 不扩 20-step。均值 `answer_coverage_mean=0.703`、`positive_margin_mean=0.157`、`real_states=20.0`、`update_actor=6.17s`，没有达到扩展 gate。
+- 但这轮比 full split 更健康：`positive_margin_mean` 从 `0.123` 回到 `0.157`，第 3 step 达到 `answer_coverage=0.776`、`positive_margin=0.219`、`update_actor=4.97s`，说明 `power=0.5` 能部分修复 full split 过度抹平 improvement signal 的问题。
+- 仍然不能把这条线直接扩 20-step，因为均值 coverage 还只有 `0.703`，第 2 step coverage 掉到 `0.599`。当前主要问题不是 actor update 速度，而是 full group support 在部分 state 上信息不足或过散，导致 target 不稳定。
+- 这轮再次支持最新判断：不要再要求 chunk target 由 short-horizon probe/local answer hit/source consistency 在局部短视条件下判清楚。当前版本 `chunk_state_probe/skipped_for_support_flow=1.0`，probe 只作为 future distribution estimator，方向是对的；下一步应该加强 full-rollout group distribution 的 state quality control。
+
+下一步：
+
+- 不继续加 source-side hard gate，不回到 source chunk hard teacher，也不让短 probe 命中率主导 target。
+- 优先实现基于 full rollout group 的 state 质量 gate/soft weight：
+  - `prompt_valid_answer_coverage` 过低的 state 跳过或降权。
+  - `prompt_answer_top_margin` 太低、support 太平的 state 跳过或降权。
+  - `prompt_answer_entropy` 过高的 state 跳过或降权。
+- 目标是保留 `power=0.5` 的 partial answer split，同时提高可训练 state 的 support coverage 稳定性，再跑 3-step smoke；只有 `answer_coverage >= 0.75` 且 `positive_margin > 0.20` 稳定后再扩 20-step。
