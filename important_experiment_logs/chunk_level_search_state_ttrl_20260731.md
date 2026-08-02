@@ -13206,3 +13206,67 @@ chunk_state_score                    7.607s   7.176s   5.663s
 - v19 当前配置不能直接作为 20-step gate：它解决了污染进入 source/support 的问题，但同时把 state utilization 打得太低。
 - 下一步应做 v20：保留 full-rollout clean support pool，但放松 source/state 选择或改成 soft weighting。优先方向是 `chunk_state_full_rollout_guard_enable=True`、`source_only_clean=False`，同时让 dirty rollout 仍不进入 support posterior/anchor；如果 real states 仍低，再降低 `min_prompt_valid_answer_coverage` 或从 hard gate 改为 per-state loss weight。
 - 另一个方向是把 `posterior_mass` 切到 `posterior_gain` / value margin，让 target 更像 search improvement，而不是只追随已有高 mass answer；但这应在 state utilization 先恢复后再做 20-step 对比。
+
+## 2026-08-02 support-flow posterior-mass no-split v20 full-rollout guard soft-source 3-step smoke
+
+目的：
+
+- 验证 v19 的 `source_only_clean=True` 是否是 state utilization 过低的主因。
+- 保留 full-rollout guard 对 support posterior / source mass / support anchor 的污染过滤，但允许 source/state selection 不额外 hard require clean。
+- 如果 real states 和 actor samples 恢复，再考虑扩 20-step；如果 target quality 下降，则说明 source/state 与 clean support pool 之间存在不匹配。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v20_fullguard_softsource_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v20_fullguard_softsource_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v20_fullguard_softsource_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v20_fullguard_softsource_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=False
+```
+
+其余保持 v19/v18 target-only support-flow posterior-mass 配置不变。
+
+3-step smoke 结果：
+
+```text
+step                                    1        2        3
+clean_rollout_ratio                  0.730    0.755    0.707
+source_only_clean                    0        0        0
+real_states                          2        3        5
+pad_states                           6        5        3
+num_actor_samples                    8        8        32
+skipped_support_sources              30       28       27
+support_anchor_injected_ratio        1.000    0.357    1.000
+support_anchor_positive_ratio        0.875    0.312    0.875
+posterior_mass_mean                  0.722    0.187    0.594
+posterior_mass_max_mean              0.825    0.236    0.745
+source_mass_mean                     0.825    0.852    0.745
+positive_margin_mean                 0.000   -0.616    0.000
+label_consistent_ratio               0.875    0.312    0.859
+answer_coverage_mean                 0.875    0.312    0.875
+target_entropy                       1.946    0.486    1.920
+target_guard_zeroed_candidate_ratio  0.000    0.000    0.016
+update_actor                         0.706s   0.462s   1.267s
+gen                                  43.519s  24.462s  22.032s
+chunk_state_score                    7.547s   5.974s   5.573s
+```
+
+观察：
+
+- v20 工程跑通，final validation 按 smoke 配置跳过。
+- 单独关闭 `source_only_clean` 没有稳定恢复样本量：step1 仍是 2 real states / 8 actor samples，step2 只有 3 real states / 8 actor samples，step3 恢复到 5 real states / 32 actor samples。
+- step2 质量明显变差：support anchor injected ratio 只有 0.357，posterior mass mean 降到 0.187，answer coverage mean 只有 0.312，positive margin mean 为 -0.616。这说明允许 source/state selection 放松后，会选到与 clean support pool 不兼容的 state，target 反而更噪。
+- `source_clean_mask_mean` 仍为 1.0，说明原本的 `min_source_answer_mass=0.4` 和 full-rollout guard 置零 source mass 已经隐式排除了 dirty selected source；v19 低 utilization 的主因不是 `source_only_clean` 单独造成的，而是 clean support + high source mass + prompt coverage/margin gate 的组合过硬。
+- 相比 v19，v20 没有成为更好的 20-step 候选。它只是证明“直接 soft source”会引入 source/support mismatch。
+
+结论：
+
+- v20 不扩 20-step。
+- 下一步不应简单放开 source cleanliness。更合理的是把 hard filtering 改成 soft weighting / state weighting：保留 clean support posterior，但允许更多 state 进入 actor batch，同时用 prompt clean ratio、source answer mass、support anchor coverage、posterior margin 给 loss weight，而不是把 state 直接 pad 掉。
+- 如果要保持 hard gate，优先调低 `chunk_state_min_source_answer_mass` 或 `chunk_state_min_prompt_valid_answer_coverage`，但必须同时监控 support anchor injected ratio 和 posterior mass；不能只追求 real states 数量。
+- v21 候选建议：`source_only_clean=True` 保守选 source，但把 `chunk_state_min_source_answer_mass` 从 0.4 降到 0.25 或引入 source_quality_weight，目标是 real_states >= 5/8、num_actor_samples >= 32、posterior_mass_mean 不低于 0.55、support_anchor_injected_ratio 接近 1.0。
