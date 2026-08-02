@@ -109,6 +109,13 @@ ttrl:
   # the prompt-level full-rollout support before cycling. This keeps the
   # selected state path closer to high-support answers without hard-coding GT.
   chunk_state_source_select_by_mass: false
+  # Support-source modes choose chunk states from full-rollout support metadata
+  # while keeping full-group support anchors as the target distribution.
+  # support_low prefers lower-source-mass states that still have valid answers;
+  # support_mixed mixes low/high states by ratio for search-improvement smokes.
+  chunk_state_source_mixed_low_ratio: 0.75
+  chunk_state_source_low_max_answer_mass: 0.35
+  chunk_state_source_min_valid_answer_mass: 0.03125
   # If enabled with majority_completion scoring, build PowerFlow targets from
   # candidates whose completions match the state-level majority label. This
   # keeps the 2504.16084 label-estimation semantics separate from soft

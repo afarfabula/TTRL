@@ -10855,3 +10855,88 @@ mean  29.464   6.467        2.456      3.181
   - full-rollout support anchor 仍定义 target；
   - 对低 source-mass state 做 improvement distillation，对高 source-mass state 只做 drift guard 或降权。
 - 3-step gate 改为：`probe skipped=1`，`answer_coverage>=0.75`，`positive_margin_mean` 接近 0 或为正，`real_state>=20/32`，`actor update <5s`。不过 gate 才扩 20-step。
+
+## 2026-08-02 support_flow mixed-source softplus_gain smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_mixedsource_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_mixedsource_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_mixedsource_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_mixedsource_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- 上一版 `softplus_gain + majority_consistent/high-source` 的 `positive_margin_mean=-0.143`，不是因为 support_flow loss 不可用，而是因为 state source 被强行选成高 answer-mass 轨迹，baseline 天然过强。
+- 本轮新增 `chunk_state_source_mode=support_mixed`，让 state source 来自同 prompt 内 lower-source-mass / mixed source；full-rollout answer support anchors 仍然定义 target，source chunk 只作为 candidate prior / drift guard。
+- 这轮完全跳过 short-horizon probe，验证“full group 定义好 support/value，低 support state 学向高 support future distribution 转移”的快链路是否成立。
+
+代码与配置变更：
+
+```text
+ray_trainer.py:
+  新增 chunk_state_source_mode=support_low / support_mixed
+  新增 lower-source state selection:
+    chunk_state_source_mixed_low_ratio
+    chunk_state_source_low_max_answer_mass
+    chunk_state_source_min_valid_answer_mass
+  新增 chunk_state_diag/support_low_fallbacks
+
+ppo_trainer_ttrl.yaml:
+  新增上述 source selection 默认配置，默认只在显式 opt-in source_mode 下生效。
+```
+
+关键配置：
+
+```text
+ttrl.chunk_state_score_mode=support_flow
+ttrl.chunk_state_source_mode=support_mixed
+ttrl.chunk_state_source_mixed_low_ratio=0.75
+ttrl.chunk_state_source_low_max_answer_mass=0.35
+ttrl.chunk_state_source_min_valid_answer_mass=0.03125
+ttrl.chunk_state_min_prompt_top_mass=0.35
+ttrl.chunk_state_min_source_answer_mass=0.0
+ttrl.chunk_state_support_flow_score_type=softplus_gain
+ttrl.chunk_state_support_flow_softplus_temperature=0.125
+ttrl.chunk_state_support_anchor_count=7
+ttrl.chunk_state_support_anchor_candidate_start=1
+ttrl.chunk_state_source_chunk_enable=True
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_chunk_size=128
+ttrl.chunk_state_prune_zero_weight_samples=True
+ttrl.chunk_state_powerflow_weight_clip=4.0
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_mass  pos_margin  ans_cov  anchor_inject  target_entropy
+1     22          176            0.090        0.206       0.729    0.833          1.975
+2     17          136            0.039        0.191       0.573    0.655          2.026
+3     15          120            0.081        0.201       0.719    0.821          1.995
+mean  18.0        144.0          0.070        0.199       0.674    0.770          1.999
+```
+
+耗时：
+
+```text
+step  gen      chunk_score  chunk_ref  update_actor
+1     43.476   7.368        6.577      6.874
+2     23.012   5.788        2.015      5.041
+3     32.349   5.792        1.799      4.621
+mean  32.946   6.316        3.464      5.512
+```
+
+结论：
+
+- 这是方向上的正结果，但暂不扩 20-step。`source_mass_mean` 从上一版 `0.565` 降到 `0.070`，`positive_margin_mean` 从 `-0.143` 变成 `+0.199`，直接验证了当前主矛盾是 high-source baseline / 局部短视 teacher 约束，而不是 actor update。
+- `chunk_state_probe/skipped_for_support_flow=1.0`，说明这轮没有再用 short-horizon probe/local answer hit 定义 target；teacher 来自 full-rollout support anchors。
+- 工程链路仍可接受：`update_actor` 三步均值 `5.51s`，第 2/3 step 已降到 `5.04s/4.62s`。B200 上这条 no-probe PowerFlow chunk update 是可继续优化的快链路。
+- 仍未过 gate：`real_state` 均值只有 `18/32`，`answer_coverage_mean=0.674`，第 2 step coverage 只有 `0.573`。原因主要是 `min_prompt_top_mass=0.35` 跳过了 10/15/17 个 prompt，且 `candidates=8` 中一个 slot 用 source chunk，support anchors 只有 7 个。
+
+下一步：
+
+- 不回退到 short probe teacher，也不继续加 source-side hard gate。
+- 下一轮做更温和的 mixed-source：降低 prompt top-mass gate 到 `0.30` 或 `0.25` 以提高 real states；同时把 `candidates` 增到 `12`、support anchors 增到 `11`，用 B200 显存换更高 full-support anchor coverage。
+- 目标是保持 `positive_margin_mean > 0`，同时把 `real_state >= 20/32`、`answer_coverage >= 0.75`、`update_actor < 6s` 稳住；过这个 3-step gate 才扩 20-step。

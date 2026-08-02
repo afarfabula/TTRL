@@ -1198,12 +1198,16 @@ class RayPPOTrainer:
         max_prompt_answer_entropy = float(cfg.get("chunk_state_max_prompt_answer_entropy", 0.0))
         min_source_answer_mass = float(cfg.get("chunk_state_min_source_answer_mass", 0.0))
         source_select_by_mass = bool(cfg.get("chunk_state_source_select_by_mass", False))
+        source_mixed_low_ratio = float(cfg.get("chunk_state_source_mixed_low_ratio", 0.75))
+        source_low_max_answer_mass = float(cfg.get("chunk_state_source_low_max_answer_mass", 0.35))
+        source_min_valid_answer_mass = float(cfg.get("chunk_state_source_min_valid_answer_mass", 0.0))
         if (
             min_prompt_top_mass > 0.0
             or min_prompt_valid_answer_coverage > 0.0
             or min_prompt_top_margin > 0.0
             or max_prompt_answer_entropy > 0.0
             or min_source_answer_mass > 0.0
+            or source_mode in {"support_low", "support_mixed"}
         ) and source_answer_metadata is None:
             raise ValueError(
                 "chunk-state support source gates require full-rollout answer metadata; "
@@ -1261,6 +1265,13 @@ class RayPPOTrainer:
             local_list.sort(key=lambda local: (-float(source_answer_mass_arr[prompt_start + local]), local))
             return torch.as_tensor(local_list, dtype=locals_tensor.dtype)
 
+        def _rank_locals_low_mass(locals_tensor: torch.Tensor, prompt_start: int) -> torch.Tensor:
+            if source_answer_mass_arr is None or locals_tensor.numel() <= 1:
+                return locals_tensor
+            local_list = [int(local) for local in locals_tensor.tolist()]
+            local_list.sort(key=lambda local: (float(source_answer_mass_arr[prompt_start + local]), local))
+            return torch.as_tensor(local_list, dtype=locals_tensor.dtype)
+
         state_input_ids = []
         state_attention_masks = []
         source_indices = []
@@ -1272,6 +1283,7 @@ class RayPPOTrainer:
         skipped_short_sources = 0
         skipped_support_sources = 0
         majority_consistent_fallbacks = 0
+        support_low_fallbacks = 0
         for prompt_idx in range(prompt_count):
             for state_idx in range(states_per_prompt):
                 source_offset = self.global_steps + prompt_idx + state_idx
@@ -1319,7 +1331,45 @@ class RayPPOTrainer:
                     ).flatten()
                     if min_required_response_len > 0 and long_locals.numel() > 0:
                         mass_good_locals = _intersect_locals(mass_good_locals, long_locals)
-                if source_mode == "success" and source_correctness is not None:
+                if source_mode in {"support_low", "support_mixed"}:
+                    prompt_source_masses = torch.as_tensor(
+                        source_answer_mass_arr[prompt_start:prompt_stop],
+                        dtype=torch.float32,
+                    )
+                    valid_locals = torch.nonzero(
+                        prompt_source_masses >= source_min_valid_answer_mass,
+                        as_tuple=False,
+                    ).flatten()
+                    if min_required_response_len > 0 and long_locals.numel() > 0:
+                        valid_locals = _intersect_locals(valid_locals, long_locals)
+                    low_locals = valid_locals[
+                        prompt_source_masses[valid_locals] <= source_low_max_answer_mass
+                    ]
+                    if low_locals.numel() == 0 and valid_locals.numel() > 0:
+                        low_locals = _rank_locals_low_mass(valid_locals, prompt_start)[
+                            : max(1, valid_locals.numel() // 2)
+                        ]
+                        support_low_fallbacks += 1
+                    high_locals = _rank_locals_by_mass(valid_locals, prompt_start)
+                    low_locals = _rank_locals_low_mass(low_locals, prompt_start)
+                    use_low = source_mode == "support_low"
+                    if source_mode == "support_mixed":
+                        ratio = min(max(source_mixed_low_ratio, 0.0), 1.0)
+                        cycle = max(1, int(round(1.0 / max(1.0 - ratio, 1e-6))))
+                        use_low = (source_offset % cycle) != 0
+                    source_pool = low_locals if use_low and low_locals.numel() > 0 else high_locals
+                    if source_pool.numel() > 0:
+                        source_local = int(source_pool[source_offset % source_pool.numel()].item())
+                    elif min_required_response_len > 0 and long_locals.numel() > 0:
+                        support_low_fallbacks += 1
+                        source_local = int(long_locals[source_offset % long_locals.numel()].item())
+                    elif min_required_response_len > 0:
+                        skipped_short_sources += 1
+                        continue
+                    else:
+                        support_low_fallbacks += 1
+                        source_local = source_offset % n
+                elif source_mode == "success" and source_correctness is not None:
                     prompt_scores = source_correctness[prompt_start:prompt_stop]
                     good_locals = torch.nonzero(prompt_scores > 0.0, as_tuple=False).flatten()
                     if min_required_response_len > 0 and long_locals.numel() > 0:
@@ -1487,6 +1537,9 @@ class RayPPOTrainer:
         state_non_tensor["chunk_state_majority_consistent_fallbacks"] = np.asarray(
             [majority_consistent_fallbacks] * len(source_indices), dtype=np.int64
         )
+        state_non_tensor["chunk_state_support_low_fallbacks"] = np.asarray(
+            [support_low_fallbacks] * len(source_indices), dtype=np.int64
+        )
         if source_correctness is not None:
             state_non_tensor["chunk_state_source_original_correct"] = (
                 source_correctness[np.asarray(source_indices, dtype=np.int64)].numpy().astype(np.float32)
@@ -1577,6 +1630,10 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_majority_consistent_fallbacks", np.asarray([0])),
             dtype=torch.float32,
         )
+        support_low_fallbacks = torch.as_tensor(
+            state_prompts.non_tensor_batch.get("chunk_state_support_low_fallbacks", np.asarray([0])),
+            dtype=torch.float32,
+        )
         real_state_count = torch.as_tensor(
             state_prompts.non_tensor_batch.get("chunk_state_real_state_count", np.asarray([num_states])),
             dtype=torch.float32,
@@ -1598,6 +1655,7 @@ class RayPPOTrainer:
                 "chunk_state_diag/skipped_short_sources": skipped_short_sources.max().item(),
                 "chunk_state_diag/skipped_support_sources": skipped_support_sources.max().item(),
                 "chunk_state_diag/majority_consistent_fallbacks": majority_consistent_fallbacks.max().item(),
+                "chunk_state_diag/support_low_fallbacks": support_low_fallbacks.max().item(),
                 "chunk_state_diag/real_state_count": real_state_count.max().item(),
                 "chunk_state_diag/pad_state_count": pad_state_count.max().item(),
                 "chunk_state_diag/loss_weight_mean": loss_weights.mean().item(),
