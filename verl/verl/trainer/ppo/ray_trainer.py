@@ -3833,7 +3833,7 @@ class RayPPOTrainer:
         cfg = self.config.ttrl
         if not bool(cfg.get("chunk_state_target_guard_enable", False)):
             return scores, {}
-        if len(probe_output) != len(chunk_output) * probe_samples:
+        if probe_output is not None and len(probe_output) != len(chunk_output) * probe_samples:
             raise ValueError(
                 f"Expected {len(chunk_output) * probe_samples} probe outputs, got {len(probe_output)}"
             )
@@ -3855,7 +3855,7 @@ class RayPPOTrainer:
         ]
 
         chunk_mask = chunk_output.batch["response_mask"].bool()
-        probe_mask = probe_output.batch["response_mask"].bool()
+        probe_mask = probe_output.batch["response_mask"].bool() if probe_output is not None else None
         bad_probe_counts = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
         max_candidate_score = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
         flag_counts = Counter()
@@ -3893,44 +3893,45 @@ class RayPPOTrainer:
         guard_anchor = bool(cfg.get("chunk_state_target_guard_anchor", True))
         bad_probe_ratio_threshold = float(cfg.get("chunk_state_target_guard_bad_probe_ratio", 0.5))
 
-        for probe_idx in range(len(probe_output)):
-            chunk_idx = probe_idx // probe_samples
-            state_idx = chunk_idx // candidates
-            candidate_idx = chunk_idx % candidates
-            chunk_len = int(chunk_mask[chunk_idx].sum().item())
-            probe_len = int(probe_mask[probe_idx].sum().item())
-            response_ids = torch.cat(
-                [
-                    chunk_output.batch["responses"][chunk_idx, :chunk_len],
-                    probe_output.batch["responses"][probe_idx, :probe_len],
-                ],
-                dim=0,
-            )
-            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-            answer = extract_answer(response_str)
-            if answer is not None:
-                answer = simplify_expression_string(answer)
-            flags = self._chunk_state_text_guard_flags(response_str, answer, prompt_mass_values[state_idx])
-            scored_probes += 1
-            for key, value in flags.items():
-                if key == "prompt_mass":
-                    continue
-                if value:
-                    flag_counts[key] += 1
-            invalid = any(value for key, value in flags.items() if key != "prompt_mass")
-            if invalid:
-                bad_probe_counts[state_idx, candidate_idx] += 1.0
-            candidate_prompt_mass[state_idx, candidate_idx] = torch.maximum(
-                candidate_prompt_mass[state_idx, candidate_idx],
-                torch.tensor(float(flags["prompt_mass"]), dtype=candidate_prompt_mass.dtype),
-            )
-            distribution_score = float(flags["prompt_mass"])
-            if use_mass_gain:
-                distribution_score = max(0.0, distribution_score - float(source_answer_mass[state_idx].item()))
-            max_candidate_score[state_idx, candidate_idx] = torch.maximum(
-                max_candidate_score[state_idx, candidate_idx],
-                torch.tensor(distribution_score, dtype=max_candidate_score.dtype),
-            )
+        if probe_output is not None:
+            for probe_idx in range(len(probe_output)):
+                chunk_idx = probe_idx // probe_samples
+                state_idx = chunk_idx // candidates
+                candidate_idx = chunk_idx % candidates
+                chunk_len = int(chunk_mask[chunk_idx].sum().item())
+                probe_len = int(probe_mask[probe_idx].sum().item())
+                response_ids = torch.cat(
+                    [
+                        chunk_output.batch["responses"][chunk_idx, :chunk_len],
+                        probe_output.batch["responses"][probe_idx, :probe_len],
+                    ],
+                    dim=0,
+                )
+                response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                answer = extract_answer(response_str)
+                if answer is not None:
+                    answer = simplify_expression_string(answer)
+                flags = self._chunk_state_text_guard_flags(response_str, answer, prompt_mass_values[state_idx])
+                scored_probes += 1
+                for key, value in flags.items():
+                    if key == "prompt_mass":
+                        continue
+                    if value:
+                        flag_counts[key] += 1
+                invalid = any(value for key, value in flags.items() if key != "prompt_mass")
+                if invalid:
+                    bad_probe_counts[state_idx, candidate_idx] += 1.0
+                candidate_prompt_mass[state_idx, candidate_idx] = torch.maximum(
+                    candidate_prompt_mass[state_idx, candidate_idx],
+                    torch.tensor(float(flags["prompt_mass"]), dtype=candidate_prompt_mass.dtype),
+                )
+                distribution_score = float(flags["prompt_mass"])
+                if use_mass_gain:
+                    distribution_score = max(0.0, distribution_score - float(source_answer_mass[state_idx].item()))
+                max_candidate_score[state_idx, candidate_idx] = torch.maximum(
+                    max_candidate_score[state_idx, candidate_idx],
+                    torch.tensor(distribution_score, dtype=max_candidate_score.dtype),
+                )
 
         bad_probe_ratio = bad_probe_counts / max(probe_samples, 1)
         guard_ok = (bad_probe_ratio < bad_probe_ratio_threshold) & (~candidate_invalid)

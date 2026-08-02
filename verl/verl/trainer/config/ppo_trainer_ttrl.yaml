@@ -177,7 +177,8 @@ ttrl:
   chunk_state_target_guard_use_distribution_score: false
   # Candidate-level guard checks the next chunk itself before probe completion.
   # This catches local degeneration such as repeated boxed markers before it can
-  # be rescued by a later probe answer.
+  # be rescued by a later probe answer. It also works for support-flow paths
+  # that intentionally skip probe generation, where it is the only target guard.
   chunk_state_target_guard_candidate_enable: false
   chunk_state_target_guard_candidate_max_boxed_count: 1
   chunk_state_target_guard_candidate_assistant_marker: true

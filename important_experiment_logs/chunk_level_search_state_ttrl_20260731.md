@@ -12848,3 +12848,85 @@ answer_coverage_mean         0.8733       0.8734
 - 保留 full-rollout posterior/support target，但 actor update 要加 distribution-level guard：例如 KL-to-ref / entropy floor / repetition penalty mask / marker contamination filter / no-repeat boxed 负样本过滤。
 - target 不应只按 posterior mass sharpen，还要显式惩罚 malformed、repeated boxed、prompt echo、长重复片段，把这些作为 low-information 或 negative transition 过滤掉。
 - 20-step smoke 的准入门槛改成两类同时通过：target 质量指标健康，且 validation sample 无明显 repeated `\boxed{}`/prompt echo collapse。
+
+## 2026-08-02 support-flow posterior-mass no-split v17 guarded target-only 3-step smoke
+
+目的：
+
+- v16 已证明 `target_only + powerflow_use_boxed_reward=False` 比 v15 有小幅恢复，但 final validation 仍有严重重复 `\boxed{}` / prompt echo。
+- 本次 v17 只做 3-step smoke，不做 accuracy 判断；3 step 的作用是跨过首步 Ray/vLLM/FSDP/compile warmup，确认 no-probe support-flow 路径下 target/candidate guard 连续 step 可运行，并检查 guard 是否真的过滤候选。
+- 核心原则不变：target 仍由 full-rollout group posterior/support 定义，`chunk_state_probe/skipped_for_support_flow=1.0`，不让 short-horizon local hit / source consistency 重新成为 teacher。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v17_guardcand_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v17_guardcand_targetonly_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v17_guardcand_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v17_guardcand_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- `_apply_chunk_state_target_guard(...)` 支持 `probe_output is None`，这样 support-flow / support-anchor 这种跳过 short probe 的路径也可以执行 candidate-level guard。
+- 配置注释补充：support-flow 无 probe 时，candidate guard 可以作为唯一 target guard；这不是恢复 short-probe teacher。
+
+关键配置：
+
+```text
+ttrl.chunk_state_score_mode=support_flow
+ttrl.chunk_state_support_flow_score_type=posterior_mass
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_target_guard_enable=True
+ttrl.chunk_state_target_guard_candidate_enable=True
+ttrl.chunk_state_target_guard_candidate_max_boxed_count=1
+ttrl.chunk_state_target_guard_candidate_assistant_marker=True
+ttrl.chunk_state_zero_inconsistent_candidates=True
+ttrl.chunk_state_prune_zero_weight_samples=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step 聚合：
+
+```text
+metric                                      mean      last
+gen                                      33.0453s  22.9620s
+chunk_state_chunks                       0.9360s   0.9330s
+chunk_state_score                        6.5283s   5.6110s
+chunk_state_ref                          1.6627s   0.2900s
+update_actor                             1.1930s   0.8410s
+real_states                              4.3333    3.0000
+num_actor_samples                       26.6667   16.0000
+pruned_sample_ratio                      0.5833    0.7500
+posterior_mass_mean                      0.5473    0.5490
+posterior_mass_max_mean                  0.7223    0.7080
+source_mass_mean                         0.7223    0.7080
+label_consistent_ratio                   0.8697    0.8590
+answer_coverage_mean                     0.8697    0.8590
+target_entropy                           1.7140    1.7380
+powerflow_weight_max                     1.9250    3.1870
+actor_powerflow_loss                     1.1827    0.7720
+actor_grad_norm                         28.1563   17.9860
+target_guard_kept_candidate_ratio        1.0000    1.0000
+target_guard_zeroed_candidate_ratio      0.0000    0.0000
+candidate_repeated_boxed_probe_ratio     0.0000    0.0000
+candidate_assistant_marker_probe_ratio   0.0000    0.0000
+candidate_prompt_copy_probe_ratio        0.0000    0.0000
+```
+
+观察：
+
+- v17 smoke 跑通，3 个 step 都确认 `actor/powerflow_chunk_loss_target_only=1.0`，且 `chunk_state_probe/skipped_for_support_flow=1.0`，没有回到 short-probe teacher。
+- target/candidate guard 在 no-probe support-flow 路径能正常打点，不再因为 `probe_output=None` 被跳过。
+- actor update 不是瓶颈：三步均值约 `1.19s`，第 2/3 步约 `1.03s`；chunk span 短时 B200 actor update 已足够快。
+- 主要端到端时间仍在 full rollout generation 与 chunk score：三步 `gen` 均值约 `33.0s`，第 2/3 步约 `27.8s`；`chunk_state_score` 约 `6.5s`。
+- guard 现在基本是 no-op：`zeroed_candidate_ratio=0`，repeated boxed / assistant marker / prompt copy 三类 candidate 指标也全是 0。
+- 这说明 v17 只证明了“guard wiring 正常”，没有证明它能挡住 v16 final validation 中真正出现的重复 `\boxed{}` / prompt echo 退化。
+
+结论：
+
+- 不直接扩 v17 到 20-step。当前 gate 未通过，原因不是链路崩溃，而是 guard 太弱，没有覆盖最终生成阶段暴露的坏模式。
+- 下一版应改检测对象：不能只在 candidate chunk 里看局部 marker；需要在 actor batch 和/或定期 validation sample 中统计连续 `\boxed{}`、空 boxed、题面复制、assistant/user marker、长 n-gram 重复，并把这些信号作为 target transition 的 hard filter 或 weight penalty。
+- 仍然保留 full-rollout posterior/support target 和 PowerFlow target-only loss；不回退到 short-horizon probe answer hit，也不继续加强 source-side hard gate。
