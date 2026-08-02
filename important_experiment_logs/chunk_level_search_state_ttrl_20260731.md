@@ -10102,3 +10102,98 @@ step 3:
 - 但 target 质量明显变脏：coverage 只有 `0.465/0.396/0.444`，source original correct 降到 `0.844/0.688/0.750`，比 source-soft 的 `0.509/0.527/0.454` 和 source correct `1.0/0.938/0.958` 更差。
 - 不建议直接扩 20-step。更合理的下一版是折中：保留 source hard gate off，但 prompt 侧不要完全放开；用 `min_prompt_top_mass=0.20` 或连续 weight 加强低质量 prompt 降权，同时保持 real states 尽量接近 24-32。
 - 如果要扩 20-step，当前优先级仍是 source-soft no-source-gate 版，而不是 no-gates product 版。
+
+## 2026-08-02 chunk-state PowerFlow: prompt top-mass 0.20 + product weight smoke
+
+目的：
+
+- 验证 no-gates product 与 source-soft 之间的折中点。
+- 保持 source hard gate off，避免回到 source-side hard constraint；prompt 侧只保留弱 top-mass gate。
+- 继续遵守新的 target 语义：short probe 只估计 future answer distribution，`q_j` 由 full-rollout support/value、support-distribution match、anchor prior、OOV/coverage 质量共同定义；source chunk 只做 prior/drift guard，不做 teacher 或 hard floor。
+
+配置：
+
+```text
+base = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+chunk_state_min_source_answer_mass = 0.0
+chunk_state_min_prompt_top_mass = 0.20
+chunk_state_source_select_by_mass = True
+chunk_state_source_quality_weight_mode = product
+chunk_state_source_quality_weight_floor = 0.05
+chunk_state_source_quality_weight_power = 0.5
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+运行状态：
+
+- 训练主体完成，raw log 1149 行，diag 96 行，正好是 3 step x 32 states。
+- 无 RuntimeError / Traceback；最后按 smoke 配置打印 `Final validation skipped`。
+- 确认模型为 `/models/Qwen2.5-Math-7B`，数据为 `data/MATH-TTT`，venv 为 `/mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200`。
+- vLLM config 中 `attention_config.backend=FLASH_ATTN`，启动阶段有 flashinfer autotune 和 CUDA graph capture；NCCL 日志显示 NVLS 可用、P2P direct 通过。
+
+逐 step 结果：
+
+```text
+step  rows  real_state  pad_state  skipped_support  coverage  oov     source_correct  source_mass  prompt_top  probe_mean  loss_weight
+1     32    29          3          3                0.482422  0.5176  0.906250        0.450254     0.454719    0.189564    0.906250
+2     32    25          7          7                0.502930  0.4971  0.781250        0.546111     0.546111    0.252860    0.781250
+3     32    25          7          7                0.360352  0.6396  0.718750        0.413163     0.413163    0.150081    0.781250
+```
+
+训练侧关键指标：
+
+```text
+step 1:
+  source_quality_weight_mean = 0.452
+  answer_coverage_mean = 0.482
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  num_actor_samples = 232
+  gen = 43.501s
+  chunk_probe = 9.096s
+  chunk_score = 10.479s
+  chunk_ref = 7.259s
+  update_actor = 8.841s
+  step wall = 122.74s
+
+step 2:
+  source_quality_weight_mean = 0.546
+  answer_coverage_mean = 0.503
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  num_actor_samples = 200
+  gen = 23.064s
+  chunk_probe = 9.151s
+  chunk_score = 8.442s
+  chunk_ref = 2.858s
+  update_actor = 7.279s
+  step wall = 86.91s
+
+step 3:
+  source_quality_weight_mean = 0.413
+  answer_coverage_mean = 0.360
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  num_actor_samples = 200
+  gen = 22.248s
+  chunk_probe = 9.214s
+  chunk_score = 20.005s
+  chunk_ref = 2.886s
+  update_actor = 7.441s
+  step wall ~= 127.74s
+```
+
+结论：
+
+- 这是一个有价值但还不够稳定的折中 smoke。
+- 相比 no-gates product，prompt top-mass 0.20 明显改善了 step 2 target 质量：coverage 从 no-gates step 2 的 `0.396` 提到 `0.503`，并且 real states 仍有 `25/32`。
+- 相比 source-soft，prompt020 的状态覆盖更稳定：`29/25/25` 好于 source-soft 的 `24/16/18`；但 coverage 不稳定，step 3 掉到 `0.360`，说明低信息 state / prompt 仍会混入。
+- 不支持直接扩 20-step。下一版应该继续保留 full-support target + soft keep + source hard gate off，但增加 full-support 质量降权/过滤：例如基于 `prompt_valid_answer_coverage`、`prompt_answer_top_margin`、candidate coverage/OOV、support entropy 做 state weight 或 early skip。
+- 不能回到“source consistency / short-probe local hit 当 teacher”的路线。当前失败点仍是 target 质量，不是 actor update；稳态 `update_actor` 约 `7.3-7.4s`，主要时间在 full rollout、chunk probe 和 `chunk_state_score` 的 answer parsing / support scoring。
