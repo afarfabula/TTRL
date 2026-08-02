@@ -13692,3 +13692,98 @@ chunk_state_ref                    5.349s   0.736s   1.214s
 - v26 是一个负向工程 datapoint：简单加宽 next-chunk candidate 不值得继续扩 20-step。
 - 更重要的算法结论：当前 `next 128-token chunk + support anchor` 容易退化成局部 continuation distillation，不能充分形成同一 state 下的 counterfactual search-improvement。
 - 下一阶段切换为 suffix-level counterfactual TTRL：先从已有完整轨迹里选择中后段 search state，再从该 state 重采多条 suffix 一直 rollout 到 EOS，用完整 completion 的最终 answer/support/pass/majority 改善定义 target。chunk 只作为 actor update 的 span 或 state boundary，不再由 short local probe 或 source continuation 决定 teacher。
+
+## 2026-08-02 suffix-level counterfactual support v27 3-step smoke
+
+目的：
+
+- 按新的研究方向放弃 `next 128-token chunk + short probe/local teacher` 主路径。
+- 对每个 prompt 先用完整 32 条 rollout 估计 prompt-level answer support，然后从 majority-consistent 的中后段 search state 重新采样多条 suffix，一直 rollout 到 EOS。
+- 用 `state prefix + suffix` 的完整 completion 最终答案落在 full-rollout support distribution 上的质量来构造 PowerFlow target。这里 suffix candidate 是同一 state 下的 counterfactual continuation，不再由 source chunk/anchor 当 teacher。
+- 先跑 3-step smoke 检查 target 质量、actor batch 形态、infra 耗时和稳定性；不做 validation。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_suffixsupport_v27_mid_suffix_eos_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_suffixsupport_v27_mid_suffix_eos_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_suffixsupport_v27_mid_suffix_eos_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_suffixsupport_v27_mid_suffix_eos_b32_r32_v64_3step_20260802.jsonl`
+
+关键实现：
+
+- 新增 `ttrl.chunk_state_score_mode=suffix_support`。
+- `chunk_state_chunks` 阶段不再只生成 128-token next chunk，而是从 search state 生成 suffix 到 EOS，`chunk_state_suffix_max_tokens=${data.max_response_length}`。
+- scorer 解码 `source full response[:boundary] + sampled suffix`，抽取完整 completion 的最终 answer，再映射到该 prompt 的 full-rollout answer support mass。
+- v27 smoke 使用 `posterior_gain`：同一 state 内以 suffix support mass 的均值为局部 baseline，构造 sharpened distribution；source answer mass 只作为质量/soft weight 参考，不作为 teacher floor。
+- actor update 训练的是完整 suffix span，PowerFlow `target_only`，`use_boxed_reward=False`，`actor.use_dynamic_bsz=False`。
+
+关键配置：
+
+```text
+DATA_TRAIN_BATCH_SIZE=32
+N_SAMPLES_PER_PROMPT=32
+N_VOTES_PER_PROMPT=64
+ttrl.chunk_state_score_mode=suffix_support
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_suffix_max_tokens=3072
+ttrl.chunk_state_suffix_support_score_type=posterior_gain
+ttrl.chunk_state_suffix_support_baseline_scale=0.5
+ttrl.chunk_state_suffix_support_gain_slack=0.02
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_mid_boundary_min_ratio=0.35
+ttrl.chunk_state_mid_boundary_max_ratio=0.75
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.20
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                  1        2        3
+real_states                        16       17       15
+pad_states                         0        7        1
+num_candidates                     128      192      128
+num_actor_samples                  128      136      120
+support_coverage_mean              0.812    0.812    0.664
+oov_ratio                          0.188    0.188    0.336
+mass_mean                          0.424    0.518    0.378
+max_mass_mean                      0.540    0.658    0.576
+score_mean                         0.084    0.105    0.111
+score_max_mean                     0.136    0.160    0.218
+positive_margin_mean               0.270    0.329    0.288
+state_keep_ratio                   1.000    1.000    1.000
+label_consistent_ratio             0.727    0.755    0.617
+answer_duplicate_ratio             0.617    0.662    0.562
+empty_answer_ratio                 0.000    0.036    0.078
+repeated_boxed_ratio               0.031    0.021    0.039
+suffix_len_mean                    687.1    651.3    875.6
+completion_len_mean                1087.1   992.6    1243.6
+actor_weight_nonzero_ratio         1.000    1.000    1.000
+gen                                43.429s  22.336s  32.088s
+suffix_rollout                     12.742s  13.055s  13.023s
+suffix_score                       9.447s   6.441s   7.403s
+chunk_state_ref                    6.310s   2.515s   2.517s
+update_actor                       6.693s   6.785s   6.558s
+```
+
+观察：
+
+- v27 语义 smoke 通过：3 step 都正常退出，无 Traceback、无 RuntimeError、无 DataLoader worker killed；final validation 按 smoke 配置跳过。
+- target 质量明显好于 v26 的局部 next-chunk 路径：`support_coverage_mean=0.812/0.812/0.664`，`OOV=0.188/0.188/0.336`，不再是 0.48-0.52 覆盖率那种低信息状态。
+- actor batch 不再被剪空：`num_actor_samples=128/136/120`，`actor_batch_powerflow_weight_nonzero_ratio=1.0`，且没有 zero shard。
+- 同一 state 下确实存在可学习差异：`positive_margin_mean=0.270/0.329/0.288`，`label_consistent_ratio=0.727/0.755/0.617`。不过 `answer_duplicate_ratio=0.56-0.66` 偏高，说明 suffix candidates 有大量同答案重复，下一步可以考虑 answer-stratified target 或扩大/调温 candidate。
+- 耗时：首步受 vLLM/JIT/CUDA graph warmup 影响为 121s；第二步实际约 61s。稳态拆分大致是 full rollout 22-32s、suffix rollout 13s、suffix scoring 6-7s、ref 2.5s、actor update 6.6-6.8s。
+- B200 infra 确认：vLLM attention backend 配置为 `FLASH_ATTN`；NCCL 日志显示 `isAllDirectP2p 1`、NVLS multicast support available、24 nvls channels；actor fused kernels enabled；dynamic batch 关闭。
+
+结论：
+
+- v27 是当前 chunk/search-state 方向第一个语义更对齐的 smoke：训练对象变成“同一中后段 state 下的 suffix counterfactual continuation”，target 来自完整 completion 的 full-rollout support，而不是局部短 probe 命中或 source anchor。
+- 当前最值得扩展的是 v27 路线，不是继续加 source hard gate 或 next-chunk candidate width。
+- 下一步建议先做 v28 20-step pilot：保留 suffix-to-EOS 和 posterior-gain target，加入更强的 suffix candidate 去重/answer-stratified reweight，并把 suffix scorer 的答案抽取/化简并行化或缓存化，目标是在不改训练语义的情况下压低 6-9s scoring 开销。

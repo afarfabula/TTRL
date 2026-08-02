@@ -220,6 +220,17 @@ ttrl:
   # search-state improvement target, not a short-probe majority teacher.
   chunk_state_answer_support_score: mass
   chunk_state_answer_support_min_mass: 0.0
+  # suffix_support samples counterfactual suffix continuations from a selected
+  # mid/late search state all the way to EOS, then scores the complete
+  # state+suffix answer against the prompt-level full-rollout support
+  # distribution. This avoids using short-horizon local probe hits as teacher.
+  # Supported scores: mass, gain, relative_gain, posterior_gain.
+  chunk_state_suffix_max_tokens: ${data.max_response_length}
+  chunk_state_suffix_support_score_type: gain
+  chunk_state_suffix_support_min_mass: 0.03125
+  chunk_state_suffix_support_baseline_scale: 1.0
+  chunk_state_suffix_support_gain_slack: 0.0
+  chunk_state_suffix_support_min_positive_margin: 0.0
   # answer_source_consistency scores a candidate by whether its future probe
   # returns to the selected source rollout's final answer. This keeps each
   # chunk state tied to its own full-trajectory answer instead of any answer in
