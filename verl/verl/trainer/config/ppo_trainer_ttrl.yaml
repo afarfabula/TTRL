@@ -247,6 +247,11 @@ ttrl:
   chunk_state_support_anchor_count: 4
   chunk_state_support_anchor_candidate_start: 0
   chunk_state_support_anchor_min_mass: 0.03125
+  # "mass_ranked" keeps the historical per-rollout ranking. "answer_stratified"
+  # first covers distinct prompt-level support answers, then fills remaining
+  # slots by mass. This makes anchor proposals closer to the full answer
+  # support distribution instead of duplicating one high-mass answer.
+  chunk_state_support_anchor_selection_mode: mass_ranked
   # support_flow uses the same full-rollout anchor candidates but scores them
   # with prompt-level full-rollout answer support. "gain" keeps the earlier
   # hard improvement smoke; "soft_mass" forms a conservative support replay
@@ -254,6 +259,11 @@ ttrl:
   # anchor support mass to the source baseline without making local positive
   # gain a hard decidability constraint at the chunk boundary.
   chunk_state_support_flow_score_type: gain
+  # If true, candidates sharing the same full-rollout answer split that
+  # answer's prompt-level support mass before flow scoring. This projects the
+  # full answer distribution onto chunk anchors rather than counting duplicate
+  # chunks from the same answer multiple times.
+  chunk_state_support_flow_split_mass_by_answer: false
   chunk_state_support_flow_gain_slack: 0.0
   chunk_state_support_flow_baseline_scale: 1.0
   chunk_state_support_flow_source_prior_weight: 1.0

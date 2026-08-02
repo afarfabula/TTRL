@@ -11055,3 +11055,64 @@ mean  30.096   6.173
 - full rollout group 先定义 prompt-level support/value；chunk 学的是哪个 local transition 会把未来分布推向这个 support/value。
 - 保留 source chunk 作为 prior / drift guard，但不作为 hard floor 或主要 teacher。
 - 优先改 support anchor selection/score：answer-level 去重、按 prompt answer support 分层采样、把 prompt-level answer support distribution 投影到 anchors，减少同答案/低增益 anchor 占用 slot。
+
+## 2026-08-02 support_flow answer-projection gate0.30 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_answerproj_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_answerproj_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_answerproj_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_answerproj_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- 新增 opt-in 配置 `ttrl.chunk_state_support_anchor_selection_mode=answer_stratified`。
+  - `mass_ranked` 保持原行为。
+  - `answer_stratified` 先覆盖不同 full-rollout support answer，再用 mass-ranked anchors 补满剩余 slot。
+- 新增 opt-in 配置 `ttrl.chunk_state_support_flow_split_mass_by_answer=True`。
+  - 同一个 answer 的多个 anchor 共享该 answer 的 prompt-level support mass。
+  - 目的不是做短 probe teacher，而是把 full-rollout answer support distribution 投影到 chunk anchors，避免重复 chunk 重复计权。
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_support_anchor_selection_mode=answer_stratified
+ttrl.chunk_state_support_flow_split_mass_by_answer=True
+ttrl.chunk_state_min_prompt_top_mass=0.30
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_support_anchor_count=7
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_mass  pos_margin  ans_cov  anchor_inject  uniq_ans  dup_ans  target_entropy
+1     24          192            0.092        0.183       0.729    0.857          0.978     0.023    1.933
+2     17          136            0.065        0.272       0.682    0.798          0.856     0.130    1.893
+3     19          152            0.063        0.303       0.557    0.649          0.975     0.025    1.879
+mean  20.0        160.0          0.073        0.253       0.656    0.768          0.936     0.059    1.902
+```
+
+耗时：
+
+```text
+step  gen      update_actor
+1     43.541   7.344
+2     32.693   5.128
+3     23.048   5.491
+mean  33.094   5.988
+```
+
+结论：
+
+- 不扩 20-step。`answer-projection` 达到了预期的去重效果：`unique_answer_ratio=0.936`，`answer_duplicate_ratio=0.059`，说明 target 不再由同答案重复 anchors 隐式放大。
+- 但质量 gate 没过：`answer_coverage_mean=0.656`，低于 gate0.30 fast smoke 的 `0.700`，更低于扩 20-step 的 `0.75` 门槛。第 3 step coverage 只有 `0.557`。
+- `positive_margin_mean=0.253` 仍为正，说明 lower-source search-improvement 方向还成立；`update_actor=5.99s` 已回到 fast-chain 边界。
+- 这次 smoke 说明“重复答案计权”确实是一个语义问题，但不是当前最大瓶颈。只做 answer-level 去重会让 target 更干净，同时也会暴露 full group support answer 覆盖不足的问题。
+
+下一步：
+
+- 不回到 short-horizon probe/local answer hit teacher，也不把 source chunk 变成 hard teacher。
+- 需要提高 support coverage 的稳定性，而不是继续增加 anchor 数量：优先考虑 state selection 对 `prompt_valid_answer_coverage`、`prompt_answer_entropy`、`prompt_top_margin` 加软权重或轻量 gate，跳过 full group support 本身信息不足的 state。
+- 另一个方向是保留 answer projection，但不要硬去重 anchor proposal：proposal 可 mass-ranked 保持 coverage，score 侧按 answer split mass，验证是不是能同时保留 coverage 和正确的 answer-level target semantics。

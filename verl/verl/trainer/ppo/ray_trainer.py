@@ -4009,6 +4009,7 @@ class RayPPOTrainer:
         anchor_start = int(cfg.get("chunk_state_support_anchor_candidate_start", 0))
         chunk_size = int(cfg.get("chunk_state_chunk_size", 256))
         min_mass = float(cfg.get("chunk_state_support_anchor_min_mass", 0.0))
+        selection_mode = str(cfg.get("chunk_state_support_anchor_selection_mode", "mass_ranked"))
         prefix_compat_enable = bool(cfg.get("chunk_state_support_anchor_prefix_compat_enable", False))
         prefix_compat_mode = str(cfg.get("chunk_state_support_anchor_prefix_compat_mode", "hard"))
         prefix_compat_tokens = int(cfg.get("chunk_state_support_anchor_prefix_compat_tokens", 128))
@@ -4019,6 +4020,11 @@ class RayPPOTrainer:
             raise ValueError(
                 "ttrl.chunk_state_support_anchor_prefix_compat_mode must be 'hard' or 'soft', "
                 f"got {prefix_compat_mode!r}"
+            )
+        if selection_mode not in {"mass_ranked", "answer_stratified"}:
+            raise ValueError(
+                "ttrl.chunk_state_support_anchor_selection_mode must be 'mass_ranked' or "
+                f"'answer_stratified', got {selection_mode!r}"
             )
         if anchor_count <= 0:
             raise ValueError("ttrl.chunk_state_support_anchor_count must be positive")
@@ -4047,12 +4053,14 @@ class RayPPOTrainer:
 
         score_matrix = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
         injected_matrix = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
+        anchor_answer_matrix = np.full((len(state_prompts), candidates), "", dtype=object)
         injected = 0
         skipped_no_anchor = 0
         skipped_by_compat = 0
         skipped_source = 0
         anchor_lengths = []
         anchor_masses = []
+        anchor_unique_answer_ratios = []
         selected_ranks = []
         prefix_match_ratios = []
         for state_idx, (prompt_idx, boundary) in enumerate(zip(prompt_indices, boundaries)):
@@ -4100,7 +4108,17 @@ class RayPPOTrainer:
                 anchor_score = mass * prefix_weight
                 if anchor_score <= 0.0:
                     continue
-                ranked.append((-anchor_score, -mass, -prefix_match, full_idx - prompt_start, full_idx, anchor_len))
+                ranked.append(
+                    (
+                        -anchor_score,
+                        -mass,
+                        -prefix_match,
+                        full_idx - prompt_start,
+                        full_idx,
+                        anchor_len,
+                        str(source_answers[full_idx]),
+                    )
+                )
             if not ranked:
                 skipped_no_anchor += 1
                 continue
@@ -4109,7 +4127,30 @@ class RayPPOTrainer:
             # keeping the teacher distribution anchored in full-rollout support.
             offset = (self.global_steps + state_idx) % len(ranked)
             ordered = ranked[offset:] + ranked[:offset]
-            for anchor_rank, (_, _, _, _, full_idx, anchor_len) in enumerate(ordered[:anchor_count]):
+            if selection_mode == "answer_stratified":
+                seen_answers = set()
+                selected = []
+                for item in ordered:
+                    answer = item[6]
+                    if answer in seen_answers:
+                        continue
+                    selected.append(item)
+                    seen_answers.add(answer)
+                    if len(selected) >= anchor_count:
+                        break
+                if len(selected) < anchor_count:
+                    selected_full_indices = {item[4] for item in selected}
+                    for item in ordered:
+                        if item[4] in selected_full_indices:
+                            continue
+                        selected.append(item)
+                        if len(selected) >= anchor_count:
+                            break
+            else:
+                selected = ordered[:anchor_count]
+            if selected:
+                anchor_unique_answer_ratios.append(len({item[6] for item in selected}) / max(len(selected), 1))
+            for anchor_rank, (_, _, _, _, full_idx, anchor_len, answer) in enumerate(selected[:anchor_count]):
                 candidate_idx = anchor_start + anchor_rank
                 target_idx = state_idx * candidates + candidate_idx
                 chunk_output.batch["responses"][target_idx].fill_(self.tokenizer.pad_token_id)
@@ -4128,6 +4169,7 @@ class RayPPOTrainer:
                 else:
                     score_matrix[state_idx, candidate_idx] = mass
                 injected_matrix[state_idx, candidate_idx] = 1.0
+                anchor_answer_matrix[state_idx, candidate_idx] = answer
                 injected += 1
                 anchor_lengths.append(anchor_len)
                 anchor_masses.append(mass)
@@ -4142,6 +4184,7 @@ class RayPPOTrainer:
         state_keep = (score_matrix.max(dim=-1).values > 0.0).float().numpy().astype(np.float32)
         state_prompts.non_tensor_batch["chunk_state_support_anchor_scores"] = score_matrix.numpy().astype(np.float32)
         state_prompts.non_tensor_batch["chunk_state_support_anchor_injected"] = injected_matrix.numpy().astype(np.float32)
+        state_prompts.non_tensor_batch["chunk_state_support_anchor_answers"] = anchor_answer_matrix
         state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent
         state_prompts.non_tensor_batch["chunk_state_majority_ratio"] = prompt_top_mass
         state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = anchor_coverage
@@ -4152,6 +4195,9 @@ class RayPPOTrainer:
             "chunk_state_support_anchor/count": float(anchor_count),
             "chunk_state_support_anchor/candidate_start": float(anchor_start),
             "chunk_state_support_anchor/min_mass": min_mass,
+            "chunk_state_support_anchor/selection_mode_answer_stratified": float(
+                selection_mode == "answer_stratified"
+            ),
             "chunk_state_support_anchor/prefix_compat_enable": float(prefix_compat_enable),
             "chunk_state_support_anchor/prefix_compat_mode_hard": float(prefix_compat_mode == "hard"),
             "chunk_state_support_anchor/prefix_compat_mode_soft": float(prefix_compat_mode == "soft"),
@@ -4177,6 +4223,9 @@ class RayPPOTrainer:
             "chunk_state_support_anchor/anchor_mass_mean": float(np.mean(anchor_masses)) if anchor_masses else 0.0,
             "chunk_state_support_anchor/anchor_mass_max": float(np.max(anchor_masses)) if anchor_masses else 0.0,
             "chunk_state_support_anchor/anchor_len_mean": float(np.mean(anchor_lengths)) if anchor_lengths else 0.0,
+            "chunk_state_support_anchor/unique_answer_ratio": float(np.mean(anchor_unique_answer_ratios))
+            if anchor_unique_answer_ratios
+            else 0.0,
             "chunk_state_support_anchor/selected_rank_mean": float(np.mean(selected_ranks)) if selected_ranks else 0.0,
         }
 
@@ -4226,11 +4275,45 @@ class RayPPOTrainer:
         source_prior_weight = float(cfg.get("chunk_state_support_flow_source_prior_weight", 1.0))
         min_positive_margin = float(cfg.get("chunk_state_support_flow_min_positive_margin", 0.0))
         softplus_temperature = float(cfg.get("chunk_state_support_flow_softplus_temperature", 0.125))
+        split_mass_by_answer = bool(cfg.get("chunk_state_support_flow_split_mass_by_answer", False))
 
         anchor_mass = torch.as_tensor(
             np.asarray(state_prompts.non_tensor_batch["chunk_state_support_anchor_scores"], dtype=np.float32),
             dtype=torch.float32,
         ).reshape(len(state_prompts), candidates)
+        raw_anchor_mass = anchor_mass.clone()
+        answer_duplicate_ratio = 0.0
+        if split_mass_by_answer:
+            anchor_answers = np.asarray(
+                state_prompts.non_tensor_batch.get(
+                    "chunk_state_support_anchor_answers",
+                    np.full((len(state_prompts), candidates), "", dtype=object),
+                ),
+                dtype=object,
+            ).reshape(len(state_prompts), candidates)
+            projected_anchor_mass = torch.zeros_like(anchor_mass)
+            duplicate_ratios = []
+            for state_idx in range(len(state_prompts)):
+                answer_to_indices = defaultdict(list)
+                for candidate_idx in range(candidates):
+                    if float(anchor_mass[state_idx, candidate_idx].item()) <= 0.0:
+                        continue
+                    answer = str(anchor_answers[state_idx, candidate_idx])
+                    if not answer:
+                        continue
+                    answer_to_indices[answer].append(candidate_idx)
+                used = sum(len(indices) for indices in answer_to_indices.values())
+                if used:
+                    duplicate_ratios.append(
+                        1.0 - (len(answer_to_indices) / max(float(used), 1.0))
+                    )
+                for indices in answer_to_indices.values():
+                    answer_mass = anchor_mass[state_idx, indices].max()
+                    split_mass = answer_mass / max(len(indices), 1)
+                    for candidate_idx in indices:
+                        projected_anchor_mass[state_idx, candidate_idx] = split_mass
+            anchor_mass = projected_anchor_mass
+            answer_duplicate_ratio = float(np.mean(duplicate_ratios)) if duplicate_ratios else 0.0
         source_mass = torch.as_tensor(
             np.asarray(
                 state_prompts.non_tensor_batch.get(
@@ -4316,6 +4399,11 @@ class RayPPOTrainer:
             "chunk_state_support_flow/source_prior_weight": source_prior_weight,
             "chunk_state_support_flow/min_positive_margin": min_positive_margin,
             "chunk_state_support_flow/softplus_temperature": softplus_temperature,
+            "chunk_state_support_flow/split_mass_by_answer": float(split_mass_by_answer),
+            "chunk_state_support_flow/answer_duplicate_ratio": answer_duplicate_ratio,
+            "chunk_state_support_flow/raw_anchor_mass_mean": raw_anchor_mass.mean().item()
+            if len(raw_anchor_mass)
+            else 0.0,
             "chunk_state_support_flow/anchor_mass_mean": anchor_mass.mean().item() if len(anchor_mass) else 0.0,
             "chunk_state_support_flow/source_mass_mean": source_mass.mean().item() if len(source_mass) else 0.0,
             "chunk_state_support_flow/positive_margin_mean": positive_margin.mean().item()
