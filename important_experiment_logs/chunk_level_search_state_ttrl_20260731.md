@@ -13901,3 +13901,146 @@ final validation:
   - 再只把每个高质量 answer 的 mass 分给少量代表性 suffix，避免重复答案无限放大，也避免把正确答案簇完全压平。
   - 对 `state_keep_ratio=0` / all-negative / high-OOV / high-duplicate-low-diversity state 直接跳过或降权，而不是训练近似均匀 target。
 - 实验节奏上，v28 不扩 80-step；下一步应做 v29 answer-level aggregated target 的 3-step smoke，再决定是否 20-step。
+
+### v29 answer-level aggregated representative target 3-step smoke
+
+时间：2026-08-02
+
+目标：
+
+- 修复 v28 的过度 duplicate split。v28 把同答案 suffix 的 mass 直接按重复数削弱，导致 `positive_margin_mean` 变负、`state_keep_ratio` 约 0.09、target 接近均匀。
+- v29 改成先在 final-answer level 聚合 support mass，再只把每个 answer 的 mass 分配给少量代表性 suffix。这样保留“同一 state 下多个 suffix 收敛到高 support answer”这个 search-improvement 信号，同时避免所有重复 suffix 一起支配 target。
+- 仍保持用户确认过的核心语义：先完整 rollout 建 prompt-level support，选 mid/late search state，再从 state 多次 suffix-to-EOS，reward/target 由完整 completion 的最终答案 support/gain 定义；不使用 short-horizon local answer hit 当 teacher。
+
+代码和启动：
+
+```text
+commit 前状态：
+  ray_trainer.py 新增 ttrl.chunk_state_suffix_support_answer_aggregate 分支
+  ppo_trainer_ttrl.yaml 新增默认配置：
+    chunk_state_suffix_support_answer_aggregate: false
+    chunk_state_suffix_support_answer_representatives: 1
+
+launcher:
+  verl/run_records/ttrl_chunk_state_powerflow_suffixsupport_v29_answeragg_mid_suffix_eos_b32_r32_v64_3step_20260802.sh
+  verl/run_records/run_front_suffixsupport_v29_answeragg_mid_suffix_eos_3step_20260802.sh
+
+raw log:
+  important_experiment_logs/ttrl_chunk_state_powerflow_suffixsupport_v29_answeragg_mid_suffix_eos_b32_r32_v64_3step_20260802.log
+
+diag jsonl:
+  important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_suffixsupport_v29_answeragg_mid_suffix_eos_b32_r32_v64_3step_20260802.jsonl
+```
+
+关键配置：
+
+```text
+DATA_TRAIN_BATCH_SIZE=32
+N_SAMPLES_PER_PROMPT=32
+N_VOTES_PER_PROMPT=64
+ttrl.chunk_state_score_mode=suffix_support
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_suffix_max_tokens=3072
+ttrl.chunk_state_suffix_support_score_type=posterior_gain
+ttrl.chunk_state_suffix_support_min_mass=0.03125
+ttrl.chunk_state_suffix_support_baseline_scale=0.5
+ttrl.chunk_state_suffix_support_gain_slack=0.02
+ttrl.chunk_state_suffix_support_min_positive_margin=0.0
+ttrl.chunk_state_suffix_support_answer_aggregate=True
+ttrl.chunk_state_suffix_support_answer_representatives=1
+ttrl.chunk_state_suffix_support_split_duplicates=False
+ttrl.chunk_state_suffix_support_answer_split_power=0.0
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_mid_boundary_min_ratio=0.35
+ttrl.chunk_state_mid_boundary_max_ratio=0.75
+ttrl.chunk_state_mid_require_nonzero_boundary=True
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.20
+actor_rollout_ref.actor.powerflow_enable=True
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.powerflow_use_chunk_weights=True
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+trainer.save_freq=-1
+```
+
+3-step 结果：
+
+```text
+训练主体完成 3 个 step；final validation 按配置跳过。
+退出阶段出现 DataLoader worker killed traceback：
+  RuntimeError: DataLoader worker (...) is killed by signal: Killed.
+该异常发生在弱引用/torch library 清理阶段，step 3 指标已经完整打印。下一次 20-step 前需要留意是否复现。
+
+step 1:
+  support_coverage_mean 0.812
+  oov_ratio             0.188
+  positive_margin_mean  0.270
+  state_keep_ratio      1.000
+  label_consistent      0.188
+  raw_positive_ratio    0.063
+  num_actor_samples     128
+  target_entropy        0.444
+  update_actor          7.601s
+
+step 2:
+  support_coverage_mean 0.719
+  oov_ratio             0.281
+  positive_margin_mean  0.260
+  state_keep_ratio      1.000
+  label_consistent      0.172
+  raw_positive_ratio    0.062
+  num_actor_samples     120
+  target_entropy        0.497
+  update_actor          7.470s
+
+step 3:
+  support_coverage_mean 0.820
+  oov_ratio             0.180
+  positive_margin_mean  0.293
+  state_keep_ratio      1.000
+  label_consistent      0.172
+  raw_positive_ratio    0.070
+  num_actor_samples     112
+  target_entropy        0.508
+  update_actor          5.587s
+
+3-step mean:
+  support_coverage_mean 0.784
+  oov_ratio             0.216
+  positive_margin_mean  0.274
+  state_keep_ratio      1.000
+  label_consistent      0.177
+  raw_positive_ratio    0.065
+  answer_duplicate      0.752
+  unique_answer         0.182
+  answer_aggregate      0.248
+  answer_representative 0.182
+  num_actor_samples     120.0
+  target_entropy        0.483
+  powerflow_weight_mean 0.485
+  response_len_mean     662.2
+  gen                   29.351s
+  suffix-to-EOS rollout 12.852s
+  suffix scoring         6.694s
+  chunk-state ref        3.796s
+  update_actor           6.886s
+```
+
+观察：
+
+- v29 target health 明显恢复。相对 v28 20-step 稳态的 `positive_margin_mean=-0.181`、`state_keep_ratio=0.090`、`label_consistent_ratio=0.037`、`raw_positive_ratio=0.004`，v29 3-step 均值恢复到 `positive_margin_mean=0.274`、`state_keep_ratio=1.0`、`label_consistent_ratio=0.177`、`raw_positive_ratio=0.065`。
+- `support_coverage_mean=0.784` 和 `oov_ratio=0.216` 与 v28 的 coverage/OOV 大体同量级，说明改善主要来自 target 聚合/代表 suffix 分配，而不是 batch 随机变得更容易。
+- `answer_duplicate_ratio=0.752` 仍然很高，`unique_answer_ratio=0.182` 仍低。v29 没有消灭重复答案，而是把重复答案从“稀释 target 的噪声”改成“answer-level 聚合后由少量代表 suffix 承载”的信号。
+- actor update 仍在 5.6-7.6s，和 v28 接近；当前主要新增成本还是 suffix-to-EOS rollout 与 suffix scoring。这个符合本方向的计算结构，不是短 chunk actor update 自身的问题。
+- step 1 有额外 JIT/初始化，`gen=43.5s`；step 2/3 的 full rollout gen 约 22s。
+
+结论：
+
+- v29 是比 v28 更健康的候选，应该进入 20-step pilot 看 final val 和 target health 是否保持。
+- 20-step 前需要处理或至少监控退出阶段 `DataLoader worker killed`，确认不是训练中途稳定性问题。
+- 下一版可优先跑 v29 20-step，不建议回到 duplicate split；后续可在 v29 上调 `answer_representatives=2` 或加入 low-diversity state downweight，但不要再让 short-horizon probe 或 source chunk 直接成为 teacher。

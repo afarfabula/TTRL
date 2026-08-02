@@ -233,6 +233,11 @@ ttrl:
   chunk_state_suffix_support_min_positive_margin: 0.0
   chunk_state_suffix_support_split_duplicates: false
   chunk_state_suffix_support_answer_split_power: 1.0
+  # answer_aggregate first scores final answers at the state level, then
+  # assigns each answer's mass only to a few representative suffixes. This
+  # avoids both sampling-frequency overcounting and v28-style over-flattening.
+  chunk_state_suffix_support_answer_aggregate: false
+  chunk_state_suffix_support_answer_representatives: 1
   # answer_source_consistency scores a candidate by whether its future probe
   # returns to the selected source rollout's final answer. This keeps each
   # chunk state tied to its own full-trajectory answer instead of any answer in
