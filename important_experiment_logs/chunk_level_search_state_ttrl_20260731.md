@@ -10523,3 +10523,83 @@ q_j ∝ exp(alpha * score_j) * prior_j
 score_j = future distribution match / support value gain from full-rollout group
 prior_j = source/support-anchor drift guard, not teacher floor
 ```
+
+## 2026-08-02 posterior support match smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_posterior_support_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_posterior_support_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_posterior_support_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_posterior_support_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- 新增 `ttrl.chunk_state_future_support_score_type=posterior_support_match`。
+- 它不是 short-probe teacher，也不是 source/anchor score floor。做法是先用 full-rollout answer support 对 sparse probe evidence 做 posterior shrinkage，再计算：
+
+```text
+score_j = 0.5 * smoothed_support_expected_value
+        + 0.5 * smoothed_support_overlap
+score_j *= smoothed_transport_affinity
+```
+
+- 目标是减少 4 条 probe 偶然 OOV / local hit 对 target 的支配，让 target 更接近 full-rollout group label estimation。
+
+关键配置：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_future_support_prior_smoothing=16.0
+ttrl.chunk_state_future_support_anchor_prior_weight=2.0
+ttrl.chunk_state_future_support_source_prior_weight=1.0
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.05
+ttrl.chunk_state_powerflow_weight_clip=4.0
+ttrl.chunk_state_powerflow_weight_clip_renorm=True
+```
+
+运行状态：
+
+- 3-step smoke 跑到 step 3 并打印 `Final validation skipped`。
+- raw log 末尾出现一次 Ray/DataLoader worker killed traceback：
+
+```text
+RuntimeError: DataLoader worker (...) is killed by signal: Killed.
+```
+
+- traceback 出现在 step3 指标输出之后，`mlx worker login` 进程返回 0。记录为尾部清理/worker 异常信号，不作为可扩 20-step 的绿灯。
+- 模型、数据、venv 仍为 `/models/Qwen2.5-Math-7B`、`data/MATH-TTT`、`/mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200`。
+- 启动日志确认 vLLM `attention_config.backend=FLASH_ATTN`、flashinfer autotune、CUDA graph capture、NCCL P2P/NVLS；actor 侧 `use_dynamic_bsz=False`、`use_fused_kernels=True`。
+
+三步质量汇总：
+
+```text
+step  real_state  pad_state  skipped_support  boundary_mean  boundary_zero  coverage  oov    score  smooth_E  smooth_overlap  top_margin  target_entropy  weight_max  weight_min  actor_samples
+1     29          3          3                456.000        0.188          0.482     0.518  0.474  0.247     0.856           0.014       2.060           0.241       0.076       232
+2     24          0          8                554.667        0.042          0.461     0.539  0.478  0.268     0.849           0.013       2.065           0.210       0.072       192
+3     25          7          7                488.000        0.031          0.521     0.479  0.468  0.234     0.855           0.011       2.065           0.184       0.069       200
+mean  26.0        3.3        6.0              499.556        0.087          0.488     0.512  0.473  0.250     0.853           0.013       2.063           0.212       0.072       208
+```
+
+耗时：
+
+```text
+step  gen      chunk_probe  chunk_score  chunk_ref  update_actor
+1     43.484   9.052        10.407       7.147      8.605
+2     23.246   8.922        8.268        2.739      6.920
+3     23.855   9.283        9.103        2.837      7.299
+```
+
+结论：
+
+- 这是一个有用但不能扩 20-step 的 smoke。
+- 有用的部分：`posterior_support_match` 确实解决了“局部短 probe 把 target 打空”的问题。三步都是 `label_consistent_ratio=1.0`、`future_support_keep_ratio=1.0`，没有 all-negative state；`smoothed_support_overlap` 稳定在约 `0.85`。
+- 不足的部分：`prior_smoothing=16` 明显过强，target 过平。`target_entropy=2.06` 接近 8 candidates 均匀分布的 `ln(8)=2.079`，`state_top_margin` 只有 `0.011-0.014`，`weight_max` 只有 `0.18-0.24`。这说明模型收到的 chunk preference 太弱，容易退化成“几乎均匀的 conservative distillation”。
+- 因此这版不扩 20-step。它验证了新方向：target 应该由 full-rollout support posterior 主导，而不是局部短视命中；但下一步要恢复区分度。
+
+下一步：
+
+- 保留 `posterior_support_match`，把 `prior_smoothing` 从 `16` 降到 `4-8`。
+- 加一个 sharpen / margin 机制：例如对 posterior score 做 per-state centering 或温度放大，目标是把 `state_top_margin` 拉到 `0.03+`、`weight_max` 拉到 `0.30+`，同时不让 `label_consistent_ratio` 回到 `0.6-0.7`。
+- 不回到 sourcegate / source consistency / short-probe teacher；仍然让 full-rollout support/value 定义 target，probe 只提供 future distribution evidence。
