@@ -2969,6 +2969,11 @@ class RayPPOTrainer:
                 min=0.0,
                 max=1.0,
             )
+        elif score_type == "support_value_affinity":
+            score_matrix = (future_value.clamp(min=0.0, max=1.0) * smoothed_transport_affinity).clamp(
+                min=0.0,
+                max=1.0,
+            )
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_future_support_score_type={score_type!r}")
         pre_filter_score_matrix = score_matrix.clone()
@@ -3017,6 +3022,7 @@ class RayPPOTrainer:
             "smoothed_transport_affinity",
             "smoothed_transport_positive_gain",
             "smoothed_transport_support_gain",
+            "support_value_affinity",
         }:
             filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
             positive_margin = filtered_score_gain.max(dim=-1).values
@@ -3096,6 +3102,9 @@ class RayPPOTrainer:
             ),
             "chunk_state_future_support_gain/score_type_smoothed_transport_support_gain": float(
                 score_type == "smoothed_transport_support_gain"
+            ),
+            "chunk_state_future_support_gain/score_type_support_value_affinity": float(
+                score_type == "support_value_affinity"
             ),
             "chunk_state_future_support_gain/gain_slack": gain_slack,
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,

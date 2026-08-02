@@ -9167,3 +9167,81 @@ step 3: state_keep_ratio = 0.375, num_actor_samples = 24, source_answer_mass_mea
 - 这证明“继续加 source/support/candidate hard gate”不是下一步主方向；它只是在减少样本，并没有把 candidate future distribution 与 full-rollout support 更稳定地对齐。
 - 不扩 20-step。
 - 下一步应进入代码层面的 target 重构：把 per-prompt full-rollout answer support/value 显式作为目标分布，候选 chunk 的 probe 只估计 future distribution，再用 transport/KL/value-improvement 构造 soft target；source chunk 仍只作为 prior/drift guard，不再继续硬收 source 侧约束。
+
+## 2026-08-02 support-value-affinity 3-step smoke
+
+目的：
+
+- 放弃“候选 chunk 必须相对 source 产生正 gain 才能当 teacher”的强约束，转向更软的 full-rollout support/value affinity。
+- `score_type=support_value_affinity` 定义为 `future_value * smoothed_transport_affinity`，让 target 直接偏向“未来分布有价值且更贴近 full-rollout support”的 candidate。
+- source chunk 仍保留为 prior / drift guard，但不作为主要 teacher，也不再继续加 source 侧 hard gate。
+
+配置：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportvalue_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportvalue_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportvalue_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportvalue_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+status = completed_failed_smoke
+
+ttrl.chunk_state_future_support_score_type = support_value_affinity
+ttrl.chunk_state_min_prompt_top_mass = 0.40
+ttrl.chunk_state_min_source_answer_mass = 0.35
+ttrl.chunk_state_support_anchor_min_mass = 0.03125
+ttrl.chunk_state_future_support_min_mass = 0.03125
+ttrl.chunk_state_future_support_min_positive_margin = 0.08
+ttrl.chunk_state_future_support_min_state_coverage = 0.25
+ttrl.chunk_state_future_support_max_state_oov = 0.75
+ttrl.chunk_state_future_support_min_state_mean_mass = 0.04
+ttrl.chunk_state_future_support_min_state_max_mass = 0.12
+ttrl.chunk_state_future_support_min_state_top_margin = 0.005
+ttrl.chunk_state_future_support_min_candidate_coverage = 0.0
+ttrl.chunk_state_future_support_min_candidate_mean_mass = 0.0
+```
+
+代码增量：
+
+```text
+score_matrix = future_value.clamp(0, 1) * smoothed_transport_affinity
+```
+
+3-step mean diagnostics：
+
+```text
+chunk_state_future_support_gain/support_coverage_mean = 0.401000
+chunk_state_future_support_gain/state_oov_mean = 0.599000
+chunk_state_future_support_gain/state_keep_ratio = 0.270667
+chunk_state_future_support_gain/learnable_state_keep_ratio = 0.270667
+chunk_state_future_support_gain/smoothed_transport_affinity_mean = 0.632667
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.076333
+chunk_state_future_support_gain/positive_margin_mean = 0.369333
+chunk_state_future_support_gain/label_consistent_ratio = 0.617333
+
+chunk_state/num_actor_samples = 16.000000
+chunk_state/zeroed_state_ratio = 0.854000
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio = 1.000000
+actor/pg_loss = 1.094000
+
+timing_s/gen = 29.957667
+timing_s/chunk_state_probe = 7.573333
+timing_s/chunk_state_score = 7.938000
+timing_s/chunk_state_ref = 1.538000
+timing_s/update_actor = 0.884333
+```
+
+逐步诊断：
+
+```text
+step 1: support_coverage = 0.541, state_oov = 0.459, state_keep = 0.312, num_actor_samples = 24
+step 2: support_coverage = 0.418, state_oov = 0.582, state_keep = 0.375, num_actor_samples = 8
+step 3: support_coverage = 0.244, state_oov = 0.756, state_keep = 0.125, num_actor_samples = 16
+```
+
+结论：
+
+- support-value-affinity 路径能跑通，且 actor update 很快，均值约 0.88s；训练更新速度不是主矛盾。
+- 相比 support-strict，state_keep_ratio 从 0.167 提到 0.271，step 2 不再全零更新，说明放松 source/support hard gate 是正确方向。
+- 但 target 质量仍不达标：support coverage 均值只有 0.401，OOV 均值 0.599，step 3 甚至变成 coverage 0.244 / OOV 0.756 / keep 0.125。
+- 这进一步支持最新判断：不能让 short-horizon probe 的局部 answer hit / source consistency 主导 target，也不能通过继续加硬门控解决；probe 只能作为 future distribution estimator。
+- 下一步要把 label estimation 前移到 full rollout group：先建立 prompt-level answer support/value，再对 chunk candidate 的后续分布做 transport/KL/value-improvement 匹配；低 support coverage、高 OOV、support 太平或 malformed 的 state 直接跳过或强降权。
