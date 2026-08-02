@@ -10390,3 +10390,57 @@ step 3:
 - 它没有改善 target 质量：base coverage 约 `0.482/0.482/0.486`，merge 后反而变成 `0.458/0.464/0.468`；OOV 仍约 `0.53-0.54`。
 - 它还每步额外增加约 `9s` 的 staged probe 开销，actor update 仍在 `7-9s`，整体没有性价比。
 - 这进一步说明问题不在“对已有 top-k candidate 多 probe 几次”，而在 candidate/proposal 本身没有可靠进入 full-rollout support 分布。下一步应该改 proposal/target：构造 support-conditioned candidate，或者在 score 中直接使用 candidate future distribution 的 transport affinity / support overlap，而不是继续给 top-k 加深 probe。
+
+## 2026-08-02 soft prefix support-anchor smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softprefix_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 目标：验证 full-rollout support anchor 作为 proposal/prior 时，prefix compatibility 不再用 hard filter 打空 anchor set，而是 soft downweight。
+- 关键配置：
+  - `ttrl.chunk_state_score_mode=future_support_gain`
+  - `ttrl.chunk_state_future_support_score_type=support_distribution_match`
+  - `ttrl.chunk_state_support_anchor_enable=True`
+  - `ttrl.chunk_state_support_anchor_prefix_compat_enable=True`
+  - `ttrl.chunk_state_support_anchor_prefix_compat_mode=soft`
+  - `ttrl.chunk_state_support_anchor_prefix_score_power=1.0`
+  - `actor_rollout_ref.actor.powerflow_enable=True`
+  - `actor_rollout_ref.actor.use_dynamic_bsz=False`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softprefix_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+- raw console log: `important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softprefix_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+
+注意：这次 worker 后台 nohup 会在 `mlx worker login` 退出时被清掉，所以改成前台执行。console log 从 Trae exec artifact 归档，部分长输出被截断；完整 state 级质量指标以 diag jsonl 为准，step 级 summary 来自前台会话输出。
+
+三步质量汇总：
+
+```text
+step  support_coverage  OOV     source_mass  prompt_top_mass  raw_positive  label_consistent  num_actor_samples
+1     0.482             0.518   0.450        0.455            0.199         0.699             232
+2     0.558             0.442   0.554        0.554            0.308         0.766             200
+3     0.453             0.547   0.375        0.383            0.143         0.660             208
+mean  0.498             0.502   0.460        0.464            0.217         0.708             213
+```
+
+support-anchor 相关现象：
+
+```text
+step  injected_ratio  state_keep  prefix_match_mean  anchor_mass_mean  positive_anchor_candidate_ratio
+1     0.977           1.000       0.264              0.254             0.488
+2     0.945           1.000       0.139              0.394             0.473
+3     0.992           1.000       0.418              0.196             0.496
+```
+
+耗时：
+
+```text
+step  gen      chunk_probe  chunk_score  chunk_ref  update_actor  progress_step
+1     43.461   9.129        10.269       7.175      8.775         122.4s
+2     22.504   9.399        8.852        2.860      7.488         ~63s incremental
+3     22.769   9.398        9.353        2.945      7.601         ~64s incremental
+```
+
+结论：
+
+- soft prefix compatibility 解决了 hard compatibility 的工程问题：anchor set 没有被打空，`injected_ratio=0.945-0.992`，`state_keep=1.0`。
+- 但它没有解决 target 质量主矛盾：coverage 仍只有 `0.45-0.56`，均值约 `0.50`；OOV 均值约 `0.50`。这和用户纠偏一致，问题不是 source hard gate 太少，而是 target 仍然没有被 full-rollout group distribution 足够强地定义。
+- 这轮不扩 20-step。下一步不再继续加 source/local short-probe 约束，应转向：先用 full rollout group 定义 prompt-level support/value，再选择高 support 中后段 state，并让 candidate score 直接反映 future distribution 是否向 full support 靠拢；source chunk 只保留为 prior/drift guard。

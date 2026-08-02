@@ -141,8 +141,12 @@ ttrl:
   # before the current boundary matches the selected state source prefix. This
   # keeps anchors as state-compatible proposals, not cross-trajectory teachers.
   chunk_state_support_anchor_prefix_compat_enable: false
+  # hard filters low prefix-match anchors. soft keeps them as proposals but
+  # downweights their anchor prior by prefix-match, avoiding empty anchor sets.
+  chunk_state_support_anchor_prefix_compat_mode: hard
   chunk_state_support_anchor_prefix_compat_tokens: 128
   chunk_state_support_anchor_min_prefix_match: 0.75
+  chunk_state_support_anchor_prefix_score_power: 1.0
   chunk_state_support_anchor_skip_source: true
   # Optional post-scoring hard guard for chunk targets. It preserves the TTRL
   # order of estimating a full-rollout answer distribution before calculating

@@ -3909,9 +3909,16 @@ class RayPPOTrainer:
         chunk_size = int(cfg.get("chunk_state_chunk_size", 256))
         min_mass = float(cfg.get("chunk_state_support_anchor_min_mass", 0.0))
         prefix_compat_enable = bool(cfg.get("chunk_state_support_anchor_prefix_compat_enable", False))
+        prefix_compat_mode = str(cfg.get("chunk_state_support_anchor_prefix_compat_mode", "hard"))
         prefix_compat_tokens = int(cfg.get("chunk_state_support_anchor_prefix_compat_tokens", 128))
         min_prefix_match = float(cfg.get("chunk_state_support_anchor_min_prefix_match", 0.75))
+        prefix_score_power = float(cfg.get("chunk_state_support_anchor_prefix_score_power", 1.0))
         skip_source = bool(cfg.get("chunk_state_support_anchor_skip_source", True))
+        if prefix_compat_mode not in {"hard", "soft"}:
+            raise ValueError(
+                "ttrl.chunk_state_support_anchor_prefix_compat_mode must be 'hard' or 'soft', "
+                f"got {prefix_compat_mode!r}"
+            )
         if anchor_count <= 0:
             raise ValueError("ttrl.chunk_state_support_anchor_count must be positive")
         if anchor_start < 0 or anchor_start + anchor_count > candidates:
@@ -3981,11 +3988,18 @@ class RayPPOTrainer:
                         int(boundary) - prefix_window : int(boundary),
                     ]
                     prefix_match = (candidate_prefix == source_prefix).float().mean().item()
-                    if prefix_match < min_prefix_match:
+                    if prefix_compat_mode == "hard" and prefix_match < min_prefix_match:
                         skipped_by_compat += 1
                         continue
                 prefix_match_ratios.append(prefix_match)
-                ranked.append((-mass, -prefix_match, full_idx - prompt_start, full_idx, anchor_len))
+                if prefix_compat_enable and prefix_compat_mode == "soft" and prefix_window > 0:
+                    prefix_weight = max(float(prefix_match), 0.0) ** max(prefix_score_power, 0.0)
+                else:
+                    prefix_weight = 1.0
+                anchor_score = mass * prefix_weight
+                if anchor_score <= 0.0:
+                    continue
+                ranked.append((-anchor_score, -mass, -prefix_match, full_idx - prompt_start, full_idx, anchor_len))
             if not ranked:
                 skipped_no_anchor += 1
                 continue
@@ -3994,7 +4008,7 @@ class RayPPOTrainer:
             # keeping the teacher distribution anchored in full-rollout support.
             offset = (self.global_steps + state_idx) % len(ranked)
             ordered = ranked[offset:] + ranked[:offset]
-            for anchor_rank, (_, _, _, full_idx, anchor_len) in enumerate(ordered[:anchor_count]):
+            for anchor_rank, (_, _, _, _, full_idx, anchor_len) in enumerate(ordered[:anchor_count]):
                 candidate_idx = anchor_start + anchor_rank
                 target_idx = state_idx * candidates + candidate_idx
                 chunk_output.batch["responses"][target_idx].fill_(self.tokenizer.pad_token_id)
@@ -4006,7 +4020,12 @@ class RayPPOTrainer:
                 chunk_output.batch["responses"][target_idx, :anchor_len] = anchor_tokens
                 chunk_output.batch["response_mask"][target_idx, :anchor_len] = 1
                 mass = float(source_answer_mass[full_idx])
-                score_matrix[state_idx, candidate_idx] = mass
+                prefix_score = -float(ordered[anchor_rank][2])
+                if prefix_compat_enable and prefix_compat_mode == "soft" and prefix_window > 0:
+                    prefix_weight = max(prefix_score, 0.0) ** max(prefix_score_power, 0.0)
+                    score_matrix[state_idx, candidate_idx] = mass * prefix_weight
+                else:
+                    score_matrix[state_idx, candidate_idx] = mass
                 injected_matrix[state_idx, candidate_idx] = 1.0
                 injected += 1
                 anchor_lengths.append(anchor_len)
@@ -4033,8 +4052,11 @@ class RayPPOTrainer:
             "chunk_state_support_anchor/candidate_start": float(anchor_start),
             "chunk_state_support_anchor/min_mass": min_mass,
             "chunk_state_support_anchor/prefix_compat_enable": float(prefix_compat_enable),
+            "chunk_state_support_anchor/prefix_compat_mode_hard": float(prefix_compat_mode == "hard"),
+            "chunk_state_support_anchor/prefix_compat_mode_soft": float(prefix_compat_mode == "soft"),
             "chunk_state_support_anchor/prefix_compat_tokens": float(prefix_compat_tokens),
             "chunk_state_support_anchor/min_prefix_match": min_prefix_match,
+            "chunk_state_support_anchor/prefix_score_power": prefix_score_power,
             "chunk_state_support_anchor/skip_source": float(skip_source),
             "chunk_state_support_anchor/injected_ratio": injected / max(len(state_prompts) * anchor_count, 1),
             "chunk_state_support_anchor/state_keep_ratio": float(state_keep.mean()) if len(state_keep) else 0.0,
