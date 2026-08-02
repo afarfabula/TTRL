@@ -13333,3 +13333,74 @@ chunk_state_score                    7.635s   6.378s   5.702s
 - v21 是比 v19/v20 更合理的方向，但仍不是 20-step 候选。
 - 下一步不应继续简单降低 hard gate 到追求样本数，而应把 prompt/source gate 从 hard skip 改成 per-state soft weight：允许更多 clean-source state 进入 actor batch，同时用 clean rollout ratio、source mass、prompt coverage、posterior mass/margin 给 loss weight。
 - 另一个更关键的算法方向是把 target 从 `posterior_mass` 改到更像 search improvement 的 `posterior_gain` / support-value margin，避免只是学习已有高 mass answer 的 anchor distribution。
+
+## 2026-08-02 support-flow posterior-mass no-split v22 full-rollout guard soft-weight 3-step smoke
+
+目的：
+
+- 验证 v21 之后的核心假设：state utilization 低不是 B200 算力问题，而是 prompt/source hard gate 把大量 clean-source state 直接 pad 掉。
+- 保留 full-rollout clean source 和 target guard，避免 v20 的 dirty source/support mismatch；但把 source mass、prompt coverage、prompt margin、prompt entropy 从 hard skip 移到 per-state loss weight。
+- 这版专门验证 “soft-weight 能不能把 B200 大显存/大 batch 用起来”，不直接看 acc。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v22_fullguard_softweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v22_fullguard_softweight_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v22_fullguard_softweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v22_fullguard_softweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_min_source_answer_mass=0.0
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.0
+ttrl.chunk_state_min_prompt_top_margin=0.0
+ttrl.chunk_state_max_prompt_answer_entropy=0.0
+ttrl.chunk_state_source_quality_weight_mode=group_quality
+ttrl.chunk_state_source_quality_weight_floor=0.05
+ttrl.chunk_state_source_quality_max_entropy=1.4
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                    1        2        3
+clean_rollout_ratio                  0.730    0.753    0.743
+real_states                          22       19       21
+pad_states                           2        5        3
+num_actor_samples                    144      128      144
+skipped_support_sources              6        9        10
+support_anchor_injected_ratio        0.958    1.000    1.000
+posterior_mass_mean                  0.376    0.417    0.398
+posterior_mass_max_mean              0.544    0.586    0.535
+source_mass_mean                     0.550    0.637    0.568
+label_consistent_ratio               0.839    0.875    0.875
+answer_coverage_mean                 0.839    0.875    0.875
+prompt_valid_answer_coverage_mean    0.609    0.643    0.685
+source_quality_weight_mean           0.096    0.152    0.095
+loss_weight_mean                     0.103    0.149    0.102
+target_guard_zeroed_candidate_ratio  0.021    0.016    0.005
+update_actor                         5.256s   4.241s   5.030s
+gen                                  43.489s  23.100s  21.949s
+chunk_state_score                    7.678s   6.202s   6.073s
+```
+
+观察：
+
+- v22 工程跑通，没有 Traceback/RuntimeError，final validation 按 smoke 配置跳过。
+- state utilization 大幅提升：v21 是 4/6/4 real states、24/40/24 actor samples；v22 变成 22/19/21 real states、144/128/144 actor samples。说明 hard gate 的确是利用率主因，B200 大显存可以承载更多 chunk actor samples。
+- target 质量显著变弱：posterior mass mean 只有 0.376-0.417，低于 v21 的 0.555-0.732；positive margin 也为负。这说明完全取消 hard source/prompt gate 会纳入大量低置信 state，即使用 `group_quality` soft weight 压低 loss，也可能把 target 变得太平/太噪。
+- soft weight 确实起作用：`source_quality_weight_mean` 只有 0.095-0.152，最终 `loss_weight_mean` 只有 0.102-0.149；它没有让弱 state 满权重训练。
+- actor update 变慢到 4-5s 是预期结果，因为 actor samples 从几十个涨到 128-144 个；这仍然可以接受，主时间仍是 rollout generation。
+
+结论：
+
+- v22 证明 soft-weight 路线是有效的 infra/algorithm bridge：它能把 state 数量和 B200 利用率拉起来，同时不改核心训练语义。
+- 但 v22 过软，不能直接扩 20-step；posterior target 质量低于 gate。下一版应折中：恢复轻量 hard gate，或改 `source_quality_weight_mode` 为 `source_mass` / `product`，目标是 real states >= 12、num_actor_samples >= 80，同时 posterior_mass_mean >= 0.50。
+- 当前最合理的 v23 候选：保留 `source_only_clean=True`，设置 `min_source_answer_mass=0.15`、`min_prompt_valid_answer_coverage=0.50`、`min_prompt_top_margin=0.0`、`source_quality_weight_mode=source_mass` 或 `product`。如果 v23 同时保持 >80 actor samples 和 >0.50 posterior mass，再扩 20-step。
