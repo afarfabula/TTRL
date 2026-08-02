@@ -11301,3 +11301,66 @@ mean  32.823   0.962   6.402   3.591   5.891
   - `group_quality`，加入 entropy penalty。
   - 或轻量 hard gate：`chunk_state_min_prompt_top_margin` / `chunk_state_min_prompt_valid_answer_coverage`，只跳过 full group support 明显太散的 prompt。
   - 不回到 short-horizon probe teacher，不增加 source-side hard teacher。
+
+## 2026-08-02 support_flow fractional answer-split + state-quality gate smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_stateq_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_massprop_answersplit05_stateq_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_stateq_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_stateq_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- `support_flow` scorer 额外写出 `chunk_state_positive_margin`。
+- actor batch builder 新增 `chunk_state_min_state_positive_margin`，默认 `-1.0` 关闭。
+- 新增诊断指标：
+  - `chunk_state/answer_coverage_weighted_mean`
+  - `chunk_state/positive_margin_mean`
+  - `chunk_state/positive_margin_weighted_mean`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_source_quality_weight_mode=off
+ttrl.chunk_state_min_answer_coverage=0.75
+ttrl.chunk_state_min_state_positive_margin=0.10
+ttrl.chunk_state_support_flow_answer_split_power=0.5
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  keep_ratio  raw_cov  w_cov  raw_margin  w_margin  pos_margin_flow  dup_ans
+1     24          64             0.333       0.734    0.875  0.116       0.289     0.116            0.196
+2     17          88             0.667       0.797    0.830  0.274       0.343     0.274            0.248
+3     18          88             0.708       0.797    0.852  0.229       0.360     0.229            0.274
+mean  19.7        80             0.569       0.776    0.852  0.206       0.331     0.206            0.239
+```
+
+耗时：
+
+```text
+step  gen      score   ref     update_actor
+1     43.604   7.396   4.822   2.783
+2     23.134   5.824   1.224   3.220
+3     23.627   5.822   1.306   3.452
+mean  30.122   6.347   2.451   3.152
+```
+
+结论：
+
+- 质量达标，但样本量偏小，暂不直接扩 20-step。
+- 这是目前 target 质量最干净的一版：`answer_coverage_mean=0.776`、`answer_coverage_weighted_mean=0.852`、`positive_margin_mean=0.206`、`positive_margin_weighted_mean=0.331`。
+- 训练速度也明显改善：`update_actor_mean=3.15s`，但这是因为 gate 后 `num_actor_samples_mean=80`，不是单纯 infra 提升。
+- 样本量风险很明显：第 1 step 只剩 64 个 actor samples，`zeroed_state_ratio=0.667`。如果直接扩 20-step，可能更新过窄、方差偏大。
+- 这个实验支持一个更明确的方向：target 质量控制应该基于 full-rollout support-flow 的 state-level coverage/margin，而不是 prompt-level soft metadata，也不是 short-horizon probe/local answer hit。
+
+下一步：
+
+- 先不扩 20-step，做一版放宽 gate 的 tradeoff smoke：
+  - 候选 A: `chunk_state_min_answer_coverage=0.70`，`chunk_state_min_state_positive_margin=0.10`。
+  - 候选 B: `chunk_state_min_answer_coverage=0.75`，`chunk_state_min_state_positive_margin=0.05`。
+- 扩 20-step 的最低门槛建议改为：`num_actor_samples_mean >= 120`，`answer_coverage_weighted_mean >= 0.82`，`positive_margin_weighted_mean >= 0.25`，`update_actor < 5s`。
+- 仍然不使用短 probe 局部命中作为 teacher；probe 只做 future distribution estimator，full rollout group support 定义 target。

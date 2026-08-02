@@ -90,6 +90,7 @@ ttrl:
   # semantics unless launchers opt in.
   chunk_state_min_majority_ratio: 0.0
   chunk_state_min_answer_coverage: 0.0
+  chunk_state_min_state_positive_margin: -1.0
   chunk_state_confidence_power: 0.0
   # Optional source-selection gates for support-driven chunk objectives.
   # Defaults are neutral. When enabled, they skip prompts/source rollouts whose

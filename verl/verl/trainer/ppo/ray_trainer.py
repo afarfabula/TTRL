@@ -4370,6 +4370,9 @@ class RayPPOTrainer:
         state_prompts.non_tensor_batch["chunk_state_answer_coverage"] = (
             (anchor_mass > 0.0).float().mean(dim=-1).numpy().astype(np.float32)
         )
+        state_prompts.non_tensor_batch["chunk_state_positive_margin"] = (
+            positive_margin.numpy().astype(np.float32)
+        )
         state_prompts.non_tensor_batch["chunk_state_future_support_keep"] = (
             keep_state.float().numpy().astype(np.float32)
         )
@@ -4494,6 +4497,13 @@ class RayPPOTrainer:
             state_prompts.non_tensor_batch.get("chunk_state_answer_coverage", np.ones(num_states, dtype=np.float32)),
             dtype=torch.float32,
         )
+        state_positive_margin = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_positive_margin",
+                np.zeros(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        )
         future_support_keep = torch.as_tensor(
             state_prompts.non_tensor_batch.get(
                 "chunk_state_future_support_keep",
@@ -4545,6 +4555,9 @@ class RayPPOTrainer:
         ).clamp(min=0.0)
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
         confidence_gate = (majority_ratios >= min_majority_ratio) & (answer_coverage >= min_answer_coverage)
+        min_state_positive_margin = float(cfg.get("chunk_state_min_state_positive_margin", -1.0))
+        if min_state_positive_margin >= 0.0:
+            confidence_gate &= state_positive_margin >= min_state_positive_margin
         confidence_weight = torch.ones(num_states, dtype=torch.float32)
         if confidence_power > 0.0:
             confidence_weight = torch.pow((majority_ratios * answer_coverage).clamp(min=0.0, max=1.0), confidence_power)
@@ -4613,6 +4626,7 @@ class RayPPOTrainer:
             * future_support_state_weight
             * source_quality_weight
         )
+        effective_state_weight_sum = effective_state_loss_weights.sum().clamp(min=1e-12)
         keep_indices = list(range(len(chunk_output)))
 
         repeated_state_prompts = state_prompts.repeat(repeat_times=candidates, interleave=True)
@@ -4742,6 +4756,7 @@ class RayPPOTrainer:
             "chunk_state/zeroed_state_ratio": (effective_state_loss_weights <= 0.0).float().mean().detach().item(),
             "chunk_state/confidence_gate_ratio": confidence_gate.float().mean().detach().item(),
             "chunk_state/confidence_weight_mean": confidence_weight.mean().detach().item(),
+            "chunk_state/min_state_positive_margin": min_state_positive_margin,
             "chunk_state/future_support_keep_mode_hard": float(future_support_keep_mode == "hard"),
             "chunk_state/future_support_keep_mode_soft": float(future_support_keep_mode == "soft"),
             "chunk_state/future_support_keep_mode_off": float(future_support_keep_mode == "off"),
@@ -4778,6 +4793,13 @@ class RayPPOTrainer:
             "chunk_state/prompt_answer_entropy_mean": prompt_answer_entropy.mean().detach().item(),
             "chunk_state/majority_ratio_mean": majority_ratios.mean().detach().item(),
             "chunk_state/answer_coverage_mean": answer_coverage.mean().detach().item(),
+            "chunk_state/answer_coverage_weighted_mean": (
+                (answer_coverage * effective_state_loss_weights).sum() / effective_state_weight_sum
+            ).detach().item(),
+            "chunk_state/positive_margin_mean": state_positive_margin.mean().detach().item(),
+            "chunk_state/positive_margin_weighted_mean": (
+                (state_positive_margin * effective_state_loss_weights).sum() / effective_state_weight_sum
+            ).detach().item(),
             "chunk_state/positive_ratio": score_matrix.mean().detach().item(),
             "chunk_state/label_consistent_only": float(label_consistent_only),
             "chunk_state/zero_inconsistent_candidates": float(zero_inconsistent_candidates),
