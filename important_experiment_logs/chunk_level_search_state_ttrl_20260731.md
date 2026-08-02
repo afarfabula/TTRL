@@ -11364,3 +11364,57 @@ mean  30.122   6.347   2.451   3.152
   - 候选 B: `chunk_state_min_answer_coverage=0.75`，`chunk_state_min_state_positive_margin=0.05`。
 - 扩 20-step 的最低门槛建议改为：`num_actor_samples_mean >= 120`，`answer_coverage_weighted_mean >= 0.82`，`positive_margin_weighted_mean >= 0.25`，`update_actor < 5s`。
 - 仍然不使用短 probe 局部命中作为 teacher；probe 只做 future distribution estimator，full rollout group support 定义 target。
+
+## 2026-08-02 support_flow fractional answer-split + relaxed state-quality gate smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_stateq70_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_massprop_answersplit05_stateq70_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_stateq70_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit05_stateq70_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_source_quality_weight_mode=off
+ttrl.chunk_state_min_answer_coverage=0.70
+ttrl.chunk_state_min_state_positive_margin=0.10
+ttrl.chunk_state_support_flow_answer_split_power=0.5
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  keep_ratio  raw_cov  w_cov  raw_margin  w_margin  dup_ans  target_entropy
+1     24          64             0.333       0.734    0.875  0.116       0.289     0.196    1.993
+2     17          40             0.500       0.646    0.825  0.335       0.335     0.158    1.903
+3     20          80             0.583       0.760    0.837  0.186       0.311     0.257    1.922
+mean  20.3        61.3           0.472       0.713    0.846  0.212       0.312     0.204    1.939
+```
+
+耗时：
+
+```text
+step  gen      score   ref     update_actor
+1     43.426   7.355   4.854   2.857
+2     24.068   5.838   0.588   1.662
+3     22.527   5.921   1.192   3.144
+mean  30.007   6.371   2.211   2.554
+```
+
+结论：
+
+- 不扩 20-step。虽然 `answer_coverage_weighted_mean=0.846`、`positive_margin_weighted_mean=0.312`、`update_actor_mean=2.55s` 达标，但 `num_actor_samples_mean=61.3` 明显低于最低门槛 `120`。
+- 放宽 coverage gate 从 `0.75` 到 `0.70` 没有增加 actor 样本，反而从上一轮均值 `80` 降到 `61.3`，说明瓶颈不是单个 coverage 阈值，而是当前 target 仍只覆盖少数高置信 state。
+- 这个结果再次说明：训练更新速度不是主矛盾。hard gate + clip4 能把 actor update 压到 1-3s，但如果 target 只剩很窄的状态集合，就不适合拉长训练。
+- 当前主矛盾是 target 语义：不能继续要求 chunk target 由 short-horizon probe/local answer hit/source consistency 这一级短视信号判清楚。short probe 只能作为 future distribution estimator，不能作为 teacher；source chunk 只能作为 prior/drift guard，不能作为主要 teacher/floor。
+- run 已产出 3 个 step 的完整指标；尾部 `DataLoader worker ... is killed by signal: Killed` 出现在 Python weakref/退出清理阶段，随后打印 `'Final validation skipped'`，按退出清理 warning 记录，不按训练中断处理。
+
+下一步：
+
+- 放弃“局部短视可判定性”这个约束，回到 full-rollout group support/value 主导 target。
+- 先用 32/64 条 full rollout 建 prompt-level answer support、top answer mass、coverage、margin 和 trajectory 中间 state value。
+- 从 majority-consistent 或高 support/high pass 的完整轨迹中选中后段 state；低信息 state 直接 skip/downweight，包括 all-negative、高 OOV、support coverage 低、top mass 太平、malformed/repeated boxed/marker 污染。
+- candidate chunk 的 score 改成相对 full-group support 的 future distribution improvement，例如 future support mass gain、top answer mass gain、value margin、transport/KL improvement，而不是短 probe 局部答对。
+- PowerFlow target 仍保持 per-state sharpened distribution：`q_j ∝ exp(alpha * score_j) * prior_j`，其中 prior 可以来自 source chunk anchor/proposal prior，但不再由 source consistency 决定 teacher。
