@@ -10303,3 +10303,90 @@ cov040   update_actor: 5.846s / 4.851s / 5.438s
 - 但它没有稳定改善 target 质量。step 2 的 support coverage 直接掉到 `0.370`，OOV 到 `0.630`；step 3 虽回到 `0.510`，但真实 state 只有 24 个，状态数不稳定。
 - 因此 cov040 不是可扩 20-step 的正结果。它证明“full-support gate 能提速”，但没有解决主矛盾：target/proposal 仍没有可靠地把 local transition 指向 full-rollout group support。
 - 下一步不要继续沿 source hard gate、short-probe local hit、source consistency 的方向加码，也不要把 cov040 当成主线。更合理的最小改动是：改 candidate/proposal 生成和 target 定义，让 score 直接来自 longer-horizon / staged future support distribution match；low-information state 做 soft skip/降权，但不能让短视局部命中重新成为 teacher。
+
+## 2026-08-02 chunk-state PowerFlow: prompt020 + staged top2 extra probe smoke
+
+目的：
+
+- 验证 staged future-support estimator：先对所有 candidate 做 base probe，再对每个 state 的 top-2 candidate 补 4 条更长 probe。
+- 目标不是把短 probe 局部命中当 teacher，而是用更多 future distribution evidence 改善 support-distribution match。
+- 不使用 cov040 actor batch gate，避免把“提速 gate”与“target 质量”混在一起判断。
+
+配置：
+
+```text
+base = ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+chunk_state_staged_probe_enable = True
+chunk_state_staged_probe_topk = 2
+chunk_state_staged_probe_extra_samples = 4
+chunk_state_staged_probe_extra_max_tokens = 2048
+chunk_state_staged_probe_merge_mode = repeat_base
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_stagedtop2x4_2048_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw log:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_stagedtop2x4_2048_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_fullsupport_prior_softkeep_prompt020_stagedtop2x4_2048_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+```
+
+运行状态：
+
+- 3-step smoke 完成，无 RuntimeError / Traceback，最后按 smoke 配置打印 `Final validation skipped`。
+- diag 88 行：`32 + 32 + 24`，与 step 3 真实 state 数一致。
+- 模型、数据、venv 仍为 `/models/Qwen2.5-Math-7B`、`data/MATH-TTT`、`/mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200`。
+- 启动日志再次确认 vLLM `attention_config.backend=FLASH_ATTN`、flashinfer autotune、CUDA graph capture、NCCL NVLS/P2P direct；actor 侧 `use_fused_kernels=True`。
+
+逐 step 结果：
+
+```text
+step  rows  real_state  pad_state  skipped_support  coverage  oov     source_correct  source_mass  prompt_top  probe_mean  loss_weight  state_mean_mass  state_max_mass  top_margin
+1     32    29          3          3                0.458008  0.5420  0.906250        0.450254     0.454719    0.164783    0.906250    0.185299         0.438374        0.052486
+2     32    25          7          7                0.464355  0.5356  0.906250        0.494799     0.494799    0.177234    0.781250    0.198526         0.391767        0.021041
+3     24    24          0          8                0.468099  0.5319  0.916667        0.473780     0.483039    0.183976    1.000000    0.199172         0.452195        0.043440
+```
+
+base probe 与 staged merge 后对比：
+
+```text
+step  base_coverage  merged_coverage  base_score  merged_score  selected_chunks  num_actor_samples
+1     0.482          0.458            0.190       0.165         64               232
+2     0.482          0.464            0.200       0.177         64               200
+3     0.486          0.468            0.206       0.184         48               192
+```
+
+训练侧关键耗时：
+
+```text
+step 1:
+  chunk_probe = 9.088s
+  staged_extra = 9.038s
+  chunk_score = 12.941s
+  update_actor = 8.866s
+  gen = 43.500s
+
+step 2:
+  chunk_probe = 9.343s
+  staged_extra = 9.117s
+  chunk_score = 11.813s
+  update_actor = 7.418s
+  gen = 22.478s
+
+step 3:
+  chunk_probe = 8.458s
+  staged_extra = 8.972s
+  chunk_score = 9.195s
+  update_actor = 7.026s
+  gen = 22.073s
+```
+
+结论：
+
+- staged top2 extra probe 是负结果，不扩 20-step。
+- 它没有改善 target 质量：base coverage 约 `0.482/0.482/0.486`，merge 后反而变成 `0.458/0.464/0.468`；OOV 仍约 `0.53-0.54`。
+- 它还每步额外增加约 `9s` 的 staged probe 开销，actor update 仍在 `7-9s`，整体没有性价比。
+- 这进一步说明问题不在“对已有 top-k candidate 多 probe 几次”，而在 candidate/proposal 本身没有可靠进入 full-rollout support 分布。下一步应该改 proposal/target：构造 support-conditioned candidate，或者在 score 中直接使用 candidate future distribution 的 transport affinity / support overlap，而不是继续给 top-k 加深 probe。
