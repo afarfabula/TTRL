@@ -13404,3 +13404,69 @@ chunk_state_score                    7.678s   6.202s   6.073s
 - v22 证明 soft-weight 路线是有效的 infra/algorithm bridge：它能把 state 数量和 B200 利用率拉起来，同时不改核心训练语义。
 - 但 v22 过软，不能直接扩 20-step；posterior target 质量低于 gate。下一版应折中：恢复轻量 hard gate，或改 `source_quality_weight_mode` 为 `source_mass` / `product`，目标是 real states >= 12、num_actor_samples >= 80，同时 posterior_mass_mean >= 0.50。
 - 当前最合理的 v23 候选：保留 `source_only_clean=True`，设置 `min_source_answer_mass=0.15`、`min_prompt_valid_answer_coverage=0.50`、`min_prompt_top_margin=0.0`、`source_quality_weight_mode=source_mass` 或 `product`。如果 v23 同时保持 >80 actor samples 和 >0.50 posterior mass，再扩 20-step。
+
+## 2026-08-02 support-flow posterior-mass no-split v23 full-rollout guard balanced source-weight 3-step smoke
+
+目的：
+
+- 回答 v22 之后的折中问题：能否在恢复轻量 hard gate 的同时，保留足够的 B200 actor samples。
+- 不再强化 source 侧硬约束到 v21 那种过保守状态；source chunk/anchor 仍只作为 prior/drift guard，target 主要来自 full-rollout group posterior/support mass。
+- 这仍是 3-step smoke，不看 final acc；门禁是 `real_states >= 12`、`num_actor_samples >= 80`、`posterior_mass_mean >= 0.50`、`support_anchor_injected_ratio` 接近 1.0、且无 Traceback/RuntimeError。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v23_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v23_fullguard_balanced_sourceweight_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v23_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v23_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_min_source_answer_mass=0.15
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.50
+ttrl.chunk_state_min_prompt_top_margin=0.0
+ttrl.chunk_state_max_prompt_answer_entropy=0.0
+ttrl.chunk_state_source_quality_weight_mode=source_mass
+ttrl.chunk_state_source_quality_weight_floor=0.20
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                  1        2        3
+clean_rollout_ratio                0.730    0.761    0.711
+real_states                        13       15       15
+num_actor_samples                  80       88       96
+support_anchor_injected_ratio      0.955    0.911    0.982
+posterior_mass_mean                0.389    0.437    0.341
+posterior_mass_max_mean            0.512    0.636    0.534
+source_quality_weight_mean         0.566    0.725    0.602
+answer_coverage_mean               0.836    0.797    0.859
+positive_margin_mean              -0.053   -0.089   -0.069
+loss_weight_mean                   0.605    0.697    0.614
+update_actor                       3.126s   3.308s   3.349s
+gen                                43.566s  23.177s  22.808s
+chunk_state_score                  7.608s   6.140s   6.173s
+chunk_state_ref                    5.016s   1.226s   1.229s
+```
+
+观察：
+
+- v23 达到了 state utilization 门槛：`real_states=13/15/15`，`num_actor_samples=80/88/96`，明显好于 v21，也比 v22 的过软 batch 更可控。
+- actor update 速度可接受：3.1-3.3s，说明 chunk actor update 本身不是当前瓶颈；主耗时仍是 full rollout generation 和 support scoring。
+- target quality 仍未过线：`posterior_mass_mean=0.389/0.437/0.341`，三步都低于 0.50；`positive_margin_mean` 仍为负，说明 posterior-mass no-split 目标仍偏平/偏噪。
+- `support_anchor_injected_ratio=0.911-0.982` 基本正常，source clean guard 和 anchor 注入不是主要问题。
+- 退出时出现 `RuntimeError: DataLoader worker (pid 1167753) is killed by signal: Killed.`，和 v21 类似；训练 step 指标已经落盘，但这次不能视作稳定可扩展 smoke。
+
+结论：
+
+- v23 是一个有用的负例：轻量 hard gate + source_mass soft weight 能恢复 state 数量，但不能把 target posterior 质量提升到 20-step 门槛。
+- 不应把 v23 直接扩到 20-step；继续扩只会花时间验证一个后验质量不过线的目标。
+- 下一步应从目标定义入手，而不是再调 source hard gate：用 full rollout group 的 improved distribution / value gain 定义 chunk target，优先尝试 `posterior_gain` 或 support-value margin，并保留 v23 的 utilization 级别作为工程下限。
