@@ -9092,3 +9092,78 @@ num_actor_samples range = 8 - 64
 - state 采样优先来自 support 清晰且 majority-consistent 的中后段，低信息 state 直接不进 actor batch。
 - candidate score 改为相对 full group support 的 future distribution improvement，例如 support mass gain、transport/KL improvement、value margin；source chunk 只作为 prior/drift guard。
 - 保留 PowerFlow-style distribution matching 和 hardfilter+clip4 的工程骨架，但不让 short probe local hit 或 source answer consistency 决定 teacher。
+
+## 2026-08-02 support-strict 3-step smoke
+
+目的：
+
+- 验证“继续提高 full-rollout support/source/candidate hard gate”是否能解决 20-step gate 暴露的 target 质量问题。
+- 该实验不改变 loss 主体，仍用 future_support_gain + PowerFlow-style chunk update；只把 prompt/source/support/candidate coverage 门槛调严。
+- 如果严格门控能同时提高 coverage 并保持足够 actor samples，再考虑 20-step；如果只提高 source 质量但压低 keep ratio，则说明 hard gate 不是主方向。
+
+配置：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportstrict_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+launcher = /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportstrict_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+raw_log = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_supportstrict_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log
+diag_jsonl = /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportstrict_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+status = completed_failed_smoke
+
+chunk_state_min_prompt_top_mass = 0.50
+chunk_state_min_source_answer_mass = 0.50
+chunk_state_support_anchor_min_mass = 0.0625
+chunk_state_future_support_min_mass = 0.0625
+chunk_state_future_support_min_positive_margin = 0.02
+chunk_state_future_support_min_state_coverage = 0.35
+chunk_state_future_support_max_state_oov = 0.65
+chunk_state_future_support_min_state_mean_mass = 0.08
+chunk_state_future_support_min_state_max_mass = 0.25
+chunk_state_future_support_min_state_top_margin = 0.01
+chunk_state_future_support_min_candidate_coverage = 0.25
+chunk_state_future_support_min_candidate_mean_mass = 0.05
+chunk_state_min_answer_coverage = 0.35
+chunk_state_min_informative_gap = 0.01
+```
+
+3-step mean diagnostics：
+
+```text
+chunk_state_source/selected_original_acc_mean = 1.000000
+chunk_state_diag/source_answer_mass_mean = 0.676667
+chunk_state_support_anchor/anchor_mass_mean = 0.676333
+
+chunk_state_future_support_gain/support_coverage_mean = 0.484333
+chunk_state_future_support_gain/state_oov_mean = 0.515667
+chunk_state_future_support_gain/state_keep_ratio = 0.166667
+chunk_state_future_support_gain/learnable_state_keep_ratio = 0.166667
+chunk_state_future_support_gain/smoothed_transport_gain_mean = 0.011333
+chunk_state_future_support_gain/positive_margin_mean = 0.127667
+chunk_state_future_support_gain/label_consistent_ratio = 0.541667
+
+chunk_state/num_actor_samples = 32.000000
+chunk_state/zeroed_state_ratio = 0.833333
+chunk_state/actor_batch_powerflow_weight_nonzero_ratio = 0.666667
+actor/pg_loss = 0.127667
+
+timing_s/gen = 34.165667
+timing_s/chunk_state_probe = 7.049333
+timing_s/chunk_state_score = 7.305667
+timing_s/update_actor = 1.450333
+```
+
+逐步诊断：
+
+```text
+step 1: state_keep_ratio = 0.125, num_actor_samples = 8, source_answer_mass_mean = 0.645
+step 2: state_keep_ratio = 0.000, actor_batch_powerflow_weight_nonzero_ratio = 0.000, pg_loss = 0
+step 3: state_keep_ratio = 0.375, num_actor_samples = 24, source_answer_mass_mean = 0.704
+```
+
+结论：
+
+- support-strict 提高了 source/support 质量：source answer mass 均值约 0.677，明显高于 20-step failed gate 里的普通状态。
+- 但它没有解决可学习 state 稀疏，反而把 state_keep_ratio 压到 0.167，step 2 直接全零更新。
+- 这证明“继续加 source/support/candidate hard gate”不是下一步主方向；它只是在减少样本，并没有把 candidate future distribution 与 full-rollout support 更稳定地对齐。
+- 不扩 20-step。
+- 下一步应进入代码层面的 target 重构：把 per-prompt full-rollout answer support/value 显式作为目标分布，候选 chunk 的 probe 只估计 future distribution，再用 transport/KL/value-improvement 构造 soft target；source chunk 仍只作为 prior/drift guard，不再继续硬收 source 侧约束。
