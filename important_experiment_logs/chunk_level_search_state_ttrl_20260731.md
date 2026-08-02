@@ -11845,3 +11845,69 @@ update_actor_mean               3.068s                    2.421s
 - 尝试 `states_per_prompt=2` 或降低 prompt/source gate 的跳过率，同时保留 `majority_consistent + source_select_by_mass + posterior_support_match`。
 - 更优先的 v4 方向：`states_per_prompt=2`，保留 v2 的 stricter future gate 或介于 v2/v3 之间的 gate，让每个合格 prompt 贡献两个不同中后段 state，而不是放入低质量 prompt。
 - v4 gate 目标仍是：`num_actor_samples_mean >= 96`、`answer_coverage_weighted_mean >= 0.65`、`positive_margin_weighted_mean >= 0.50`、`state_oov_mean <= 0.55`。
+
+## 2026-08-02 posterior-support-match v4 high-support states-per-prompt=2 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v4_highsupport_spp2_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_v4_highsupport_spp2_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v4_highsupport_spp2_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v4_highsupport_spp2_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置：
+
+- 继承 v2 high-support strict softgate。
+- 只新增 `ttrl.chunk_state_states_per_prompt=2`。
+- 保持 `source_mode=majority_consistent`、`source_select_by_mass=True`、`future_support_score_type=posterior_support_match`。
+- 保持 source chunk / support anchor 只作为 proposal/prior/drift guard，不作为主要 teacher。
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  support_cov  w_cov  raw_margin  w_margin  state_oov  score_mean  keep_ratio  target_entropy
+1     16          128            1.000       0.614        0.387        0.544  0.411       0.498     0.613      0.309       0.125       1.963
+2     12          96             0.875       0.578        0.461        0.641  0.382       0.486     0.539      0.322       0.250       2.026
+3     14          112            1.000       0.555        0.305        0.566  0.350       0.488     0.695      0.264       0.062       2.000
+mean  14.0        112.0          0.958       0.582        0.384        0.584  0.381       0.491     0.616      0.298       0.146       1.996
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe   score   ref     update_actor
+1     43.410   0.946   7.900   9.066   5.791   5.102
+2     23.140   0.938   8.536   6.718   1.452   3.701
+3     22.081   1.087   8.170   7.398   1.655   4.258
+mean  29.544   0.990   8.202   7.727   2.966   4.354
+```
+
+对比 v2/v3：
+
+```text
+metric                          v2_highsupport_softgate   v3_relaxedgate   v4_spp2
+selected_original_acc_mean      0.958                     1.000            0.958
+source_answer_mass_mean         0.631                     0.607            0.582
+answer_coverage_weighted_mean   0.685                     0.587            0.584
+positive_margin_weighted_mean   0.518                     0.495            0.491
+support_coverage_mean           0.483                     0.378            0.384
+state_oov_mean                  0.517                     0.622            0.616
+num_actor_samples_mean          58.7                      58.7             112.0
+future_support_keep_ratio       0.104                     0.542            0.146
+update_actor_mean               3.068s                    2.421s           4.354s
+```
+
+结论：
+
+- 不扩 20-step。v4 证明 `states_per_prompt=2` 可以解决样本量问题：`num_actor_samples_mean=112.0`，超过 smoke gate 的 96。
+- 但 target 质量没有达标：`answer_coverage_weighted_mean=0.584 < 0.65`，`positive_margin_weighted_mean=0.491 < 0.50`，`state_oov_mean=0.616 > 0.55`。第三步 `support_coverage=0.305`、`state_oov=0.695` 尤其差。
+- 这轮支持最新判断：主矛盾不是 actor update 速度，也不是单纯 state 数量，而是 target 仍然被 state-local candidate/probe 的噪声主导。虽然配置名是 posterior support match，但实际 candidate future distribution 的 coverage/OOV 仍决定了很多权重，导致 target 不是稳定的 search-improved full-group posterior。
+- 不应该继续要求 chunk target 在 short-horizon/local answer hit/source consistency 里被判清楚。short probe 只能作为候选未来分布的一个辅助估计，不能作为 teacher/floor。
+
+下一步约束：
+
+- 放弃“局部短视可判定性”作为核心训练约束。
+- full rollout group 先定义 prompt-level answer support / majority posterior / value；chunk 只学习哪个局部 transition 会把未来分布推向这个 group-level good posterior。
+- source chunk / support anchor 保留为 prior 或 drift guard，但不能作为主要 teacher，也不能作为硬 floor。
+- 对 low-information state 直接跳过或低权重：all-negative、low support coverage、high OOV、flat support mass、malformed/repeated boxed/marker contamination。
+- 下一版应该把 target 写成 `q_j proportional exp(alpha * score_j) * prior_j`，其中 `score_j` 主要来自 full-rollout support/value/posterior improvement，而不是 raw short-probe correctness 或 source-answer consistency。
