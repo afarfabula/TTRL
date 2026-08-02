@@ -11777,3 +11777,71 @@ update_actor_mean               4.097s              7.302s               3.068s
 - 做 v3 relaxed-gate：保留 `majority_consistent + source_select_by_mass + posterior_support_match`，但放松到 `min_state_coverage=0.25`、`max_state_oov=0.75`、`min_state_mean_mass=0.03`、`min_state_max_mass=0.06`、`min_state_top_margin=0.0`。
 - 保持 source 侧 high-support gate，不再使用 `support_mixed_low_ratio=0.50`；最多在后续用 0.10-0.15 contrastive prior 做诊断。
 - v3 gate 目标：`num_actor_samples_mean >= 96`、`answer_coverage_weighted_mean >= 0.65`、`positive_margin_weighted_mean >= 0.50`、`state_oov_mean <= 0.55`。达到后再考虑 20-step pilot。
+
+## 2026-08-02 posterior-support-match v3 high-support relaxed-gate smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v3_highsupport_relaxedgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_v3_highsupport_relaxedgate_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v3_highsupport_relaxedgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v3_highsupport_relaxedgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置是在 v2 基础上只放松 future-support state gate：
+
+```text
+ttrl.chunk_state_future_support_min_state_coverage=0.25
+ttrl.chunk_state_future_support_max_state_oov=0.75
+ttrl.chunk_state_future_support_min_state_mean_mass=0.03
+ttrl.chunk_state_future_support_min_state_max_mass=0.06
+ttrl.chunk_state_future_support_min_state_top_margin=0.0
+ttrl.chunk_state_future_support_soft_weight_floor=0.03
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  support_cov  w_cov  raw_margin  w_margin  state_oov  score_mean  keep_ratio  target_entropy
+1     8           64             1.000       0.614        0.418        0.598  0.454       0.539     0.582      0.329       0.625       1.936
+2     7           56             1.000       0.602        0.375        0.539  0.382       0.521     0.625      0.293       0.500       1.987
+3     7           56             1.000       0.606        0.340        0.623  0.344       0.424     0.660      0.284       0.500       2.026
+mean  7.3         58.7           1.000       0.607        0.378        0.587  0.393       0.495     0.622      0.302       0.542       1.983
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe   score   ref     update_actor
+1     43.505   1.049   7.038   8.400   4.745   2.726
+2     23.276   1.046   7.168   8.529   0.901   2.294
+3     32.081   0.935   7.108   8.785   0.846   2.242
+mean  32.954   1.010   7.105   8.571   2.164   2.421
+```
+
+对比 v2：
+
+```text
+metric                          v2_highsupport_softgate   v3_highsupport_relaxedgate
+selected_original_acc_mean      0.958                     1.000
+source_answer_mass_mean         0.631                     0.607
+answer_coverage_weighted_mean   0.685                     0.587
+positive_margin_weighted_mean   0.518                     0.495
+support_coverage_mean           0.483                     0.378
+state_oov_mean                  0.517                     0.622
+num_actor_samples_mean          58.7                      58.7
+future_support_keep_ratio       0.104                     0.542
+update_actor_mean               3.068s                    2.421s
+```
+
+结论：
+
+- 不扩 20-step。v3 验证了只放松 future-support gate 并不能解决主问题：`future_support_keep_ratio` 从 `0.104` 提到 `0.542`，但 `num_actor_samples_mean` 仍是 `58.7`，因为真正限制已经变成 source/prompt high-support gate 下的 `real_states` 数量。
+- target 质量从 v2 退化：`answer_coverage_weighted_mean` 从 `0.685` 降到 `0.587`，`state_oov_mean` 从 `0.517` 升到 `0.622`。说明继续放宽 future gate 会引入更多低信息 state，不能作为下一步。
+- v3 仍然支持 high-support source 的必要性：`selected_original_acc_mean=1.0`、`source_answer_mass_mean=0.607` 很健康，但每步只留下 7-8 个 real states，训练覆盖太窄。
+- 下一步不应该再靠 short-horizon probe/local hit 当 teacher，也不应该继续放松 future gate；应该在 full-group posterior 语义下扩大高质量 state 数量。
+
+下一步：
+
+- 尝试 `states_per_prompt=2` 或降低 prompt/source gate 的跳过率，同时保留 `majority_consistent + source_select_by_mass + posterior_support_match`。
+- 更优先的 v4 方向：`states_per_prompt=2`，保留 v2 的 stricter future gate 或介于 v2/v3 之间的 gate，让每个合格 prompt 贡献两个不同中后段 state，而不是放入低质量 prompt。
+- v4 gate 目标仍是：`num_actor_samples_mean >= 96`、`answer_coverage_weighted_mean >= 0.65`、`positive_margin_weighted_mean >= 0.50`、`state_oov_mean <= 0.55`。
