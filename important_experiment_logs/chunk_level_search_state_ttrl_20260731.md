@@ -10793,3 +10793,65 @@ mean  29.641   14.281       9.968        4.280      7.795
 - 需要优先放弃“局部短视可判定性”这个约束，而不只是继续拉长 probe 或加 gate。
 - full rollout group 要先定义 prompt-level answer support / value；chunk candidate 的目标应是相对这个 support 的 future distribution improvement。
 - 下一步不再把 short-horizon local hit、source consistency 或 post-hoc hard gate 当 teacher；更合理的方向是先提高 state/candidate proposal 的 support compatibility，再用 posterior support / transport-style target 做软分布蒸馏。
+
+## 2026-08-02 support_flow softplus_gain smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_suffix_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_suffix_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_suffix_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_suffix_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- `support_flow soft_mass` 已经证明可以完全绕开 short probe，但 20-step 失败，核心问题是它更像 full-support replay，不是 transition improvement。
+- 本轮新增 `support_flow_score_type=softplus_gain`：用 `sigmoid((anchor_mass - source_mass * baseline_scale + gain_slack) / temperature)` 形成软 improvement target。
+- 目标是保留 full-rollout support 作为 teacher，同时避免 hard gain 过稀疏，也避免 soft_mass 无条件 replay。
+
+代码与配置变更：
+
+```text
+ray_trainer.py:
+  新增 ttrl.chunk_state_support_flow_score_type=softplus_gain
+  新增 ttrl.chunk_state_support_flow_softplus_temperature
+
+ppo_trainer_ttrl.yaml:
+  新增 chunk_state_support_flow_softplus_temperature: 0.125
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  anchor_mass  source_mass  pos_margin  score_mean  score_max  ans_cov  entropy  weight_max  grad_norm
+1     11          88             0.210        0.520        -0.077      0.195       0.415      0.852    1.399    0.935       66.301
+2     6           48             0.385        0.646        -0.135      0.288       0.381      0.828    1.788    0.933       44.807
+3     13          104            0.198        0.528        -0.218      0.179       0.266      0.789    1.848    0.486       87.637
+mean  10.0        80.0           0.264        0.565        -0.143      0.221       0.354      0.823    1.678    0.785       66.248
+```
+
+耗时：
+
+```text
+step  gen      chunk_score  chunk_ref  update_actor
+1     43.561   7.626        5.193      3.591
+2     22.112   6.025        0.695      1.897
+3     22.720   5.749        1.480      4.056
+mean  29.464   6.467        2.456      3.181
+```
+
+结论：
+
+- 工程正结果：`chunk_state_probe/skipped_for_support_flow=1.0`，`score_type_softplus_gain=1.0`，PowerFlow actor path 正常。actor update 三步均值约 `3.18s`，明显快于 posterior-support probe 系列的 `7-8s`。
+- 方法信号仍不够，暂不扩 20-step。`positive_margin_mean` 三步全负，均值约 `-0.143`，说明 anchor mass 平均仍低于 selected source mass；这仍然更像 conservative full-support distillation，而不是 search-state improvement。
+- `answer_coverage_mean=0.823` 比 probe 系列高，说明 full-support anchor proposal 覆盖是健康的；但 `real_state` 均值只有 `10/32` 左右，`num_actor_samples` 均值只有 `80`，训练信号偏窄。这主要来自当前 `source_select_by_mass + min_source_answer_mass=0.40 + majority_consistent` 过强。
+- 不应继续只调 temperature。温度可以改变 target sharpness，但不能把负 margin 变成真正的 improvement。
+
+下一步：
+
+- 保留 `support_flow` / no-probe / PowerFlow chunk update 这条快链路。
+- 下一版不要继续把 source 选成高 mass 成功轨迹再要求 anchor 超过 source；这会天然让 positive margin 为负。应改成 paired state 或 mixed-source state：
+  - 同 prompt 同 boundary 下，同时采 high-support source 和 lower-support/fail source；
+  - full-rollout support anchor 仍定义 target；
+  - 对低 source-mass state 做 improvement distillation，对高 source-mass state 只做 drift guard 或降权。
+- 3-step gate 改为：`probe skipped=1`，`answer_coverage>=0.75`，`positive_margin_mean` 接近 0 或为正，`real_state>=20/32`，`actor update <5s`。不过 gate 才扩 20-step。

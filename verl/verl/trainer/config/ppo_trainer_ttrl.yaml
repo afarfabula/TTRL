@@ -242,11 +242,13 @@ ttrl:
   chunk_state_support_anchor_min_mass: 0.03125
   # support_flow uses the same full-rollout anchor candidates but scores them
   # with prompt-level full-rollout answer support. "gain" keeps the earlier
-  # hard improvement smoke; "soft_mass" is the preferred non-short-probe
-  # target because it forms a soft support distribution instead of requiring
-  # local improvement to be decidable at the chunk boundary.
+  # hard improvement smoke; "soft_mass" forms a conservative support replay
+  # distribution; "softplus_gain" is a soft improvement target that compares
+  # anchor support mass to the source baseline without making local positive
+  # gain a hard decidability constraint at the chunk boundary.
   chunk_state_support_flow_score_type: gain
   chunk_state_support_flow_gain_slack: 0.0
   chunk_state_support_flow_baseline_scale: 1.0
   chunk_state_support_flow_source_prior_weight: 1.0
   chunk_state_support_flow_min_positive_margin: 0.0
+  chunk_state_support_flow_softplus_temperature: 0.125

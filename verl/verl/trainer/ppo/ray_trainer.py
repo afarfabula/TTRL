@@ -4167,6 +4167,7 @@ class RayPPOTrainer:
         baseline_scale = float(cfg.get("chunk_state_support_flow_baseline_scale", 1.0))
         source_prior_weight = float(cfg.get("chunk_state_support_flow_source_prior_weight", 1.0))
         min_positive_margin = float(cfg.get("chunk_state_support_flow_min_positive_margin", 0.0))
+        softplus_temperature = float(cfg.get("chunk_state_support_flow_softplus_temperature", 0.125))
 
         anchor_mass = torch.as_tensor(
             np.asarray(state_prompts.non_tensor_batch["chunk_state_support_anchor_scores"], dtype=np.float32),
@@ -4195,12 +4196,18 @@ class RayPPOTrainer:
             )
         elif score_type == "soft_relative_mass":
             score_matrix = (anchor_mass / source_mass.clamp(min=1e-6)).clamp(min=0.0, max=1.0)
+        elif score_type == "softplus_gain":
+            temperature = max(softplus_temperature, 1e-6)
+            score_matrix = torch.sigmoid((anchor_mass - baseline + gain_slack) / temperature).clamp(
+                min=0.0,
+                max=1.0,
+            )
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_support_flow_score_type={score_type!r}")
 
         label_consistent = (score_matrix > 0.0).float()
         positive_margin = (anchor_mass - baseline).max(dim=-1).values
-        if score_type in {"soft_mass", "soft_relative_mass"}:
+        if score_type in {"soft_mass", "soft_relative_mass", "softplus_gain"}:
             keep_state = anchor_mass.max(dim=-1).values > 0.0
         else:
             keep_state = positive_margin >= min_positive_margin
@@ -4245,10 +4252,12 @@ class RayPPOTrainer:
             "chunk_state_support_flow/score_type_gain": float(score_type == "gain"),
             "chunk_state_support_flow/score_type_relative_gain": float(score_type == "relative_gain"),
             "chunk_state_support_flow/score_type_soft_relative_mass": float(score_type == "soft_relative_mass"),
+            "chunk_state_support_flow/score_type_softplus_gain": float(score_type == "softplus_gain"),
             "chunk_state_support_flow/gain_slack": gain_slack,
             "chunk_state_support_flow/baseline_scale": baseline_scale,
             "chunk_state_support_flow/source_prior_weight": source_prior_weight,
             "chunk_state_support_flow/min_positive_margin": min_positive_margin,
+            "chunk_state_support_flow/softplus_temperature": softplus_temperature,
             "chunk_state_support_flow/anchor_mass_mean": anchor_mass.mean().item() if len(anchor_mass) else 0.0,
             "chunk_state_support_flow/source_mass_mean": source_mass.mean().item() if len(source_mass) else 0.0,
             "chunk_state_support_flow/positive_margin_mean": positive_margin.mean().item()
