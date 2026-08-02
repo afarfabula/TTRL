@@ -11116,3 +11116,61 @@ mean  33.094   5.988
 - 不回到 short-horizon probe/local answer hit teacher，也不把 source chunk 变成 hard teacher。
 - 需要提高 support coverage 的稳定性，而不是继续增加 anchor 数量：优先考虑 state selection 对 `prompt_valid_answer_coverage`、`prompt_answer_entropy`、`prompt_top_margin` 加软权重或轻量 gate，跳过 full group support 本身信息不足的 state。
 - 另一个方向是保留 answer projection，但不要硬去重 anchor proposal：proposal 可 mass-ranked 保持 coverage，score 侧按 answer split mass，验证是不是能同时保留 coverage 和正确的 answer-level target semantics。
+
+## 2026-08-02 support_flow mass-proposal answer-split gate0.30 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_massprop_answersplit_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_massprop_answersplit_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- 上一轮 `answer_stratified + split_mass_by_answer` 让 target 语义更干净，但 `answer_coverage_mean` 降到 `0.656`。
+- 本轮只保留 score 侧 `split_mass_by_answer=True`，anchor proposal 回到 `mass_ranked`，验证是否能同时保持 coverage 和 answer-level target semantics。
+- 仍然不使用 short-horizon probe/local answer hit/source consistency 作为 teacher：`chunk_state_probe/skipped_for_support_flow=1.0`。
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_support_anchor_selection_mode=mass_ranked
+ttrl.chunk_state_support_flow_split_mass_by_answer=True
+ttrl.chunk_state_min_prompt_top_mass=0.30
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_support_anchor_count=7
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_mass  pos_margin  ans_cov  anchor_inject  uniq_ans  dup_ans  target_entropy
+1     24          192            0.092        0.068       0.734    0.857          0.805     0.196    2.019
+2     17          136            0.059        0.176       0.719    0.845          0.741     0.261    1.995
+3     20          160            0.103        0.125       0.667    0.774          0.845     0.156    1.999
+mean  20.3        162.7          0.085        0.123       0.707    0.825          0.797     0.204    2.004
+```
+
+耗时：
+
+```text
+step  gen      update_actor
+1     43.559   7.584
+2     32.810   5.182
+3     22.738   5.890
+mean  33.036   6.219
+```
+
+结论：
+
+- 不扩 20-step。`answer_coverage_mean=0.707`，比 answer-stratified 的 `0.656` 高，也略高于 gate0.30 fast smoke 的 `0.700`；但仍低于扩展门槛 `0.75`。
+- `positive_margin_mean=0.123` 明显弱于 gate0.30 fast smoke 的 `0.262` 和 answer-stratified 的 `0.253`。这说明只在 score 侧按 answer split mass 会把 duplicated high-mass answer 的虚高增益压掉，但也削弱了 search-improvement signal。
+- `unique_answer_ratio=0.797`、`answer_duplicate_ratio=0.204`，介于 gate0.30 原始 proposal 和 answer-stratified 之间。proposal coverage 确实回来了一些，但 target margin 不够。
+- `weight_max_mean=0.395`，比 answer-stratified 的 `0.811` 更平，target entropy 也更高。这更像 conservative answer-distribution replay，不像强 policy improvement。
+
+下一步：
+
+- 这轮说明 target 设计要同时满足两个条件：保留足够 support coverage，并保留足够 improvement margin。单纯 answer split 会过度抹平 gain。
+- 更合理的下一个变量是对 split 后的 answer-level mass 加温度/幂次重新锐化，或只对同答案 duplicates 做部分分摊，例如 `projected_mass = answer_mass / count^gamma`，`gamma < 1`，在不重复计权的前提下保留 high-support transition 的 margin。
+- state selection 也需要更直接地过滤低信息 prompt：把 `prompt_valid_answer_coverage`、`prompt_answer_top_margin`、`prompt_answer_entropy` 纳入轻量 gate/soft weight，避免 support 本身太平或太散的 state 主导更新。
