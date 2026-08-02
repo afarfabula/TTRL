@@ -12930,3 +12930,80 @@ candidate_prompt_copy_probe_ratio        0.0000    0.0000
 - 不直接扩 v17 到 20-step。当前 gate 未通过，原因不是链路崩溃，而是 guard 太弱，没有覆盖最终生成阶段暴露的坏模式。
 - 下一版应改检测对象：不能只在 candidate chunk 里看局部 marker；需要在 actor batch 和/或定期 validation sample 中统计连续 `\boxed{}`、空 boxed、题面复制、assistant/user marker、长 n-gram 重复，并把这些信号作为 target transition 的 hard filter 或 weight penalty。
 - 仍然保留 full-rollout posterior/support target 和 PowerFlow target-only loss；不回退到 short-horizon probe answer hit，也不继续加强 source-side hard gate。
+
+## 2026-08-02 support-flow posterior-mass no-split v18 pollution-guard target-only 3-step smoke
+
+目的：
+
+- 继续 v17 的结论：guard wiring 已经可运行，但过弱、基本 no-op。
+- v18 只加强 candidate pollution guard，检测对象对齐 v16 final validation 暴露的坏模式：空 `\boxed{}`、重复 `\boxed`、Human/Assistant/User/System marker、`\end{document}`、重复 `[asy]`、长 n-gram 重复、从 state prompt 复制题面。
+- 不改变 target 语义：仍是 `support_flow + posterior_mass`，`chunk_state_probe/skipped_for_support_flow=1.0`，不回退到 short-probe answer hit / source consistency teacher。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v18_pollutionguard_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+代码改动：
+
+- `chunk_state_target_guard_candidate_*` 增加污染检测配置：
+  - `candidate_empty_boxed`
+  - `candidate_human_marker`
+  - `candidate_document_marker`
+  - `candidate_asy_repeat`
+  - `candidate_ngram_repeat`
+  - `candidate_prompt_copy` with prompt/chunk n-gram overlap
+- 修正 candidate marker 正则，使 `Assistant:` / `Human:` 这类真实污染能被匹配。
+- `_apply_chunk_state_target_guard(...)` 在 candidate guard 中解码 state prompt 文本，用于 prompt-copy overlap 检测。
+
+3-step 聚合：
+
+```text
+metric                                      mean      last
+gen                                      29.6520s  22.2130s
+chunk_state_chunks                       0.9537s   0.9440s
+chunk_state_score                        6.4907s   5.6960s
+chunk_state_ref                          1.7950s   0.1240s
+update_actor                             1.2690s   0.4630s
+real_states                              5.3333    2.0000
+num_actor_samples                       32.0000    8.0000
+pruned_sample_ratio                      0.6457    0.8750
+posterior_mass_mean                      0.5980    0.6950
+posterior_mass_max_mean                  0.7233    0.7940
+source_mass_mean                         0.7367    0.7940
+label_consistent_ratio                   0.8723    0.8750
+answer_coverage_mean                     0.8750    0.8750
+target_entropy                           1.8400    1.9270
+actor_powerflow_loss                     1.5620    1.2140
+actor_grad_norm                         38.2310   13.2720
+target_guard_zeroed_candidate_ratio      0.0107    0.0160
+candidate_prompt_copy_ratio              0.0053    0.0000
+candidate_repeated_boxed_ratio           0.0053    0.0160
+candidate_empty_boxed_ratio              0.0000    0.0000
+candidate_marker_ratio                   0.0000    0.0000
+candidate_ngram_repeat_ratio             0.0000    0.0000
+```
+
+逐步 guard 触发：
+
+```text
+step1 zeroed=0/64   all candidate pollution metrics 0
+step2 zeroed=2/128  candidate_prompt_copy_ratio=0.016
+step3 zeroed=1/64   candidate_repeated_boxed_ratio=0.016
+```
+
+观察：
+
+- v18 smoke 跑通，三步均保持 `actor/powerflow_chunk_loss_target_only=1.0` 和 `chunk_state_probe/skipped_for_support_flow=1.0`。
+- guard 不再是 no-op：step2/step3 分别过滤 prompt-copy 和 repeated-boxed 候选。
+- 过滤强度很轻，三步总共过滤 3 个候选；actor batch 没有被剪空，`num_actor_samples` 分别为 32 / 56 / 8，非零权重比例仍为 1。
+- 触发率低说明 v18 只是接通了污染检测，并不能单独证明能解决 v16 的 20-step validation collapse；真正坏模式可能主要在训练后完整生成尾部出现，而不是每步 128-token candidate 中高频出现。
+- v18 启动日志显示 vLLM 路径启用 `attention_config.backend=FLASH_ATTN`，并进行 CUDA graph capture；本次不是为了 infra speed，但 smoke 使用的是当前 B200 快链路。
+
+结论：
+
+- v18 可以作为下一次 20-step 候选，但准入条件必须包含 final validation pollution audit，不能只看 train-time guard 触发率。
+- 如果 20-step 仍出现重复 `\boxed{}` / prompt echo，下一步应加 validation/rollout-level pollution monitor，并考虑把完整 rollout 中的污染轨迹降权或从 source/support pool 中移除；只在 128-token candidate 上做 hard filter 可能覆盖不够。
+- 仍然不回退到 short-horizon probe teacher，也不引入 source consistency 硬 teacher。

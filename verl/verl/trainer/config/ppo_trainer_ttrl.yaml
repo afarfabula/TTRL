@@ -181,7 +181,18 @@ ttrl:
   # that intentionally skip probe generation, where it is the only target guard.
   chunk_state_target_guard_candidate_enable: false
   chunk_state_target_guard_candidate_max_boxed_count: 1
+  chunk_state_target_guard_candidate_empty_boxed: true
   chunk_state_target_guard_candidate_assistant_marker: true
+  chunk_state_target_guard_candidate_human_marker: true
+  chunk_state_target_guard_candidate_document_marker: true
+  chunk_state_target_guard_candidate_asy_repeat: true
+  chunk_state_target_guard_candidate_ngram_repeat: true
+  chunk_state_target_guard_candidate_ngram_size: 8
+  chunk_state_target_guard_candidate_ngram_max_count: 4
+  chunk_state_target_guard_candidate_prompt_copy: true
+  chunk_state_target_guard_candidate_prompt_copy_min_chars: 160
+  chunk_state_target_guard_candidate_prompt_copy_ngram_size: 24
+  chunk_state_target_guard_candidate_prompt_copy_min_overlap: 1
   # If enabled, use max(0, candidate_answer_mass - source_answer_mass) as the
   # distribution score. This keeps target construction tied to full-rollout
   # answer support and rewards local transitions that improve answer mass.

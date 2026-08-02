@@ -3805,17 +3805,82 @@ class RayPPOTrainer:
             "prompt_mass": prompt_mass,
         }
 
-    def _chunk_state_candidate_guard_flags(self, chunk_str: str) -> dict:
+    def _chunk_state_has_ngram_repeat(self, text: str, ngram_size: int, max_count: int) -> bool:
+        if ngram_size <= 0 or max_count <= 0:
+            return False
+        tokens = re.findall(r"\S+", text)
+        if len(tokens) < ngram_size * max_count:
+            return False
+        counts = Counter(tuple(tokens[i : i + ngram_size]) for i in range(len(tokens) - ngram_size + 1))
+        return bool(counts and max(counts.values()) > max_count)
+
+    def _chunk_state_prompt_copy_overlap(self, prompt_str: str, chunk_str: str, ngram_size: int) -> int:
+        if ngram_size <= 0:
+            return 0
+        prompt_tokens = re.findall(r"\S+", prompt_str.lower())
+        chunk_tokens = re.findall(r"\S+", chunk_str.lower())
+        if len(prompt_tokens) < ngram_size or len(chunk_tokens) < ngram_size:
+            return 0
+        prompt_ngrams = {
+            tuple(prompt_tokens[i : i + ngram_size])
+            for i in range(len(prompt_tokens) - ngram_size + 1)
+        }
+        if not prompt_ngrams:
+            return 0
+        overlap = 0
+        for i in range(len(chunk_tokens) - ngram_size + 1):
+            if tuple(chunk_tokens[i : i + ngram_size]) in prompt_ngrams:
+                overlap += 1
+        return overlap
+
+    def _chunk_state_candidate_guard_flags(self, chunk_str: str, prompt_str: str = "") -> dict:
         cfg = self.config.ttrl
         max_boxed = int(cfg.get("chunk_state_target_guard_candidate_max_boxed_count", 1))
         repeated_boxed = max_boxed >= 0 and chunk_str.count("\\boxed") > max_boxed
-        assistant_marker = bool(cfg.get("chunk_state_target_guard_candidate_assistant_marker", True)) and bool(
-            re.search(r"\\b(assistant|user|system)\\b\\s*[:：]", chunk_str, re.IGNORECASE)
+        empty_boxed = bool(cfg.get("chunk_state_target_guard_candidate_empty_boxed", True)) and bool(
+            re.search(r"\\boxed\s*\{\s*\}", chunk_str)
         )
-        prompt_copy = bool(re.search(r"(problem|question)\\s*[:：]", chunk_str, re.IGNORECASE))
+        assistant_marker = bool(cfg.get("chunk_state_target_guard_candidate_assistant_marker", True)) and bool(
+            re.search(r"\b(assistant|user|system)\b\s*[:：]", chunk_str, re.IGNORECASE)
+        )
+        human_marker = bool(cfg.get("chunk_state_target_guard_candidate_human_marker", True)) and bool(
+            re.search(r"\b(human|assistant)\b\s*:", chunk_str, re.IGNORECASE)
+        )
+        document_marker = bool(cfg.get("chunk_state_target_guard_candidate_document_marker", True)) and bool(
+            re.search(r"\\(?:begin|end)\s*\{\s*document\s*\}", chunk_str, re.IGNORECASE)
+        )
+        asy_repeat = bool(cfg.get("chunk_state_target_guard_candidate_asy_repeat", True)) and (
+            chunk_str.count("[asy]") > 1 or chunk_str.count("\\text{[asy]}") > 1
+        )
+        ngram_repeat = bool(cfg.get("chunk_state_target_guard_candidate_ngram_repeat", True)) and self._chunk_state_has_ngram_repeat(
+            chunk_str,
+            int(cfg.get("chunk_state_target_guard_candidate_ngram_size", 8)),
+            int(cfg.get("chunk_state_target_guard_candidate_ngram_max_count", 4)),
+        )
+        prompt_copy_enable = bool(cfg.get("chunk_state_target_guard_candidate_prompt_copy", True))
+        lexical_prompt_copy = prompt_copy_enable and bool(
+            re.search(r"(problem|question)\\s*[:：]", chunk_str, re.IGNORECASE)
+        )
+        prompt_overlap = 0
+        if prompt_copy_enable and prompt_str and len(chunk_str) >= int(
+            cfg.get("chunk_state_target_guard_candidate_prompt_copy_min_chars", 160)
+        ):
+            prompt_overlap = self._chunk_state_prompt_copy_overlap(
+                prompt_str,
+                chunk_str,
+                int(cfg.get("chunk_state_target_guard_candidate_prompt_copy_ngram_size", 24)),
+            )
+        prompt_copy = lexical_prompt_copy or prompt_overlap >= int(
+            cfg.get("chunk_state_target_guard_candidate_prompt_copy_min_overlap", 1)
+        )
         return {
             "candidate_repeated_boxed": repeated_boxed,
+            "candidate_empty_boxed": empty_boxed,
             "candidate_assistant_marker": assistant_marker,
+            "candidate_human_marker": human_marker,
+            "candidate_document_marker": document_marker,
+            "candidate_asy_repeat": asy_repeat,
+            "candidate_ngram_repeat": ngram_repeat,
             "candidate_prompt_copy": prompt_copy,
         }
 
@@ -3875,6 +3940,16 @@ class RayPPOTrainer:
         candidate_invalid = torch.zeros((len(state_prompts), candidates), dtype=torch.bool)
         candidate_prompt_mass = torch.zeros((len(state_prompts), candidates), dtype=torch.float32)
         if candidate_guard_enable:
+            state_prompt_texts = []
+            state_attention_mask = state_prompts.batch["attention_mask"].bool()
+            for state_idx in range(len(state_prompts)):
+                state_len = int(state_attention_mask[state_idx].sum().item())
+                state_prompt_texts.append(
+                    self.tokenizer.decode(
+                        state_prompts.batch["input_ids"][state_idx, -state_len:],
+                        skip_special_tokens=True,
+                    )
+                )
             for chunk_idx in range(len(chunk_output)):
                 state_idx = chunk_idx // candidates
                 candidate_idx = chunk_idx % candidates
@@ -3883,7 +3958,7 @@ class RayPPOTrainer:
                     chunk_output.batch["responses"][chunk_idx, :chunk_len],
                     skip_special_tokens=True,
                 )
-                flags = self._chunk_state_candidate_guard_flags(chunk_str)
+                flags = self._chunk_state_candidate_guard_flags(chunk_str, state_prompt_texts[state_idx])
                 for key, value in flags.items():
                     if value:
                         flag_counts[key] += 1
@@ -3970,7 +4045,12 @@ class RayPPOTrainer:
             "multi_problem",
             "distribution_oov",
             "candidate_repeated_boxed",
+            "candidate_empty_boxed",
             "candidate_assistant_marker",
+            "candidate_human_marker",
+            "candidate_document_marker",
+            "candidate_asy_repeat",
+            "candidate_ngram_repeat",
             "candidate_prompt_copy",
         ]:
             denom = max(len(chunk_output), 1) if key.startswith("candidate_") else max(scored_probes, 1)
