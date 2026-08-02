@@ -11701,3 +11701,79 @@ update_actor_mean               4.097s                    3.995s                
 - 回退 `support_mixed_low_ratio=0.50`。如果需要 contrastive state，比例应降到 `0.10-0.15`，并且只参与 prior/diagnostic，不直接稀释 high-support state batch。
 - 主线转向 `posterior_support_match_v2`：高 support / majority-consistent 中后段 state，低信息 state skip/downweight，candidate target 用 full-group posterior expected value / support mass gain / transport or KL improvement。
 - 先做 3-step smoke 验证四个量：`support_coverage_mean`、`state_oov_mean`、`answer_coverage_weighted_mean`、`positive_margin_weighted_mean`。达不到 gate 不跑 20-step。
+
+## 2026-08-02 posterior-support-match v2 high-support softgate smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v2_highsupport_softgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_v2_highsupport_softgate_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v2_highsupport_softgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_v2_highsupport_softgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_source_mode=majority_consistent
+ttrl.chunk_state_source_select_by_mass=True
+ttrl.chunk_state_min_prompt_top_mass=0.45
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.65
+ttrl.chunk_state_min_prompt_top_margin=0.20
+ttrl.chunk_state_min_source_answer_mass=0.40
+ttrl.chunk_state_future_support_min_state_coverage=0.35
+ttrl.chunk_state_future_support_max_state_oov=0.65
+ttrl.chunk_state_future_support_min_state_mean_mass=0.06
+ttrl.chunk_state_future_support_min_state_max_mass=0.12
+ttrl.chunk_state_future_support_min_state_top_margin=0.02
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_prune_zero_weight_samples=True
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  support_cov  w_cov  raw_margin  w_margin  state_oov  score_mean  keep_ratio  target_entropy
+1     8           64             1.000       0.614        0.418        0.604  0.454       0.542     0.582      0.329       0.125       1.936
+2     10          80             0.875       0.609        0.441        0.707  0.391       0.463     0.559      0.340       0.062       2.031
+3     4           32             1.000       0.670        0.590        0.745  0.541       0.550     0.410      0.415       0.125       1.946
+mean  7.3         58.7           0.958       0.631        0.483        0.685  0.462       0.518     0.517      0.361       0.104       1.971
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe   score   ref     update_actor
+1     43.691   1.037   7.050   8.444   4.795   2.744
+2     23.328   0.989   8.169   8.141   1.286   5.181
+3     22.502   0.937   7.066   6.548   0.493   1.279
+mean  29.840   0.988   7.428   7.711   2.191   3.068
+```
+
+对比最近三轮：
+
+```text
+metric                          posterior_support   support_mixed_0.50   v2_highsupport_softgate
+selected_original_acc_mean      n/a                 0.083                0.958
+source_answer_mass_mean         n/a                 0.087                0.631
+answer_coverage_weighted_mean   0.634               0.440                0.685
+positive_margin_weighted_mean   0.529               0.432                0.518
+support_coverage_mean           0.445               0.263                0.483
+state_oov_mean                  0.555               0.737                0.517
+num_actor_samples_mean          106.7               192.0                58.7
+future_support_keep_ratio       1.000               1.000                0.104
+update_actor_mean               4.097s              7.302s               3.068s
+```
+
+结论：
+
+- 不扩 20-step。v2 验证了最新方向是对的：full-group high-support / majority-consistent source 能显著修复 source 质量，`selected_original_acc_mean=0.958`、`source_answer_mass_mean=0.631`，并把 `answer_coverage_weighted_mean` 提到 `0.685`，明显优于 support-mixed 的 `0.440`。
+- 但这版 gate 太严，训练信号被收窄：`future_support_keep_ratio=0.104`、`num_actor_samples_mean=58.7`，第三步只有 32 个 actor samples。这个规模不足以支撑 20-step/80-step 训练。
+- 关键失败点不是 target 方向，而是 state gate 过度硬化：`min_state_top_margin=0.02` 和 `min_state_coverage=0.35/max_oov=0.65` 让多数 state 只作为低权重或被 prune 掉。
+- 这轮支持用户纠偏：不应该回到 short-horizon local hit teacher；应该保留 full-group posterior target，同时放松 state gate，让更多 high-support source 的中后段 state 进入 soft distribution matching。
+
+下一步：
+
+- 做 v3 relaxed-gate：保留 `majority_consistent + source_select_by_mass + posterior_support_match`，但放松到 `min_state_coverage=0.25`、`max_state_oov=0.75`、`min_state_mean_mass=0.03`、`min_state_max_mass=0.06`、`min_state_top_margin=0.0`。
+- 保持 source 侧 high-support gate，不再使用 `support_mixed_low_ratio=0.50`；最多在后续用 0.10-0.15 contrastive prior 做诊断。
+- v3 gate 目标：`num_actor_samples_mean >= 96`、`answer_coverage_weighted_mean >= 0.65`、`positive_margin_weighted_mean >= 0.50`、`state_oov_mean <= 0.55`。达到后再考虑 20-step pilot。
