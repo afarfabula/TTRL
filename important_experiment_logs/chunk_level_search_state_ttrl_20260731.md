@@ -13270,3 +13270,66 @@ chunk_state_score                    7.547s   5.974s   5.573s
 - 下一步不应简单放开 source cleanliness。更合理的是把 hard filtering 改成 soft weighting / state weighting：保留 clean support posterior，但允许更多 state 进入 actor batch，同时用 prompt clean ratio、source answer mass、support anchor coverage、posterior margin 给 loss weight，而不是把 state 直接 pad 掉。
 - 如果要保持 hard gate，优先调低 `chunk_state_min_source_answer_mass` 或 `chunk_state_min_prompt_valid_answer_coverage`，但必须同时监控 support anchor injected ratio 和 posterior mass；不能只追求 real states 数量。
 - v21 候选建议：`source_only_clean=True` 保守选 source，但把 `chunk_state_min_source_answer_mass` 从 0.4 降到 0.25 或引入 source_quality_weight，目标是 real_states >= 5/8、num_actor_samples >= 32、posterior_mass_mean 不低于 0.55、support_anchor_injected_ratio 接近 1.0。
+
+## 2026-08-02 support-flow posterior-mass no-split v21 full-rollout guard relaxed-gate 3-step smoke
+
+目的：
+
+- 验证 v20 证明的 source/support mismatch 之后，是否可以保留 `source_only_clean=True`，但降低 source 和 prompt coverage hard gate 来恢复 state utilization。
+- 继续坚持 full rollout group posterior/support 定义 target，source chunk 只作为 clean prior/drift guard，不把短 probe 命中作为主要 teacher。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v21_fullguard_relaxedgate_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v21_fullguard_relaxedgate_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v21_fullguard_relaxedgate_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v21_fullguard_relaxedgate_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_min_source_answer_mass=0.25
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.65
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                    1        2        3
+clean_rollout_ratio                  0.730    0.777    0.712
+real_states                          4        6        4
+pad_states                           4        2        4
+num_actor_samples                    24       40       24
+skipped_support_sources              27       23       26
+support_anchor_injected_ratio        1.000    1.000    1.000
+posterior_mass_mean                  0.732    0.555    0.632
+posterior_mass_max_mean              0.837    0.705    0.723
+source_mass_mean                     0.837    0.705    0.723
+label_consistent_ratio               0.875    0.875    0.875
+answer_coverage_mean                 0.875    0.875    0.875
+prompt_valid_answer_coverage_mean    0.762    0.750    0.824
+target_guard_zeroed_candidate_ratio  0.000    0.000    0.000
+update_actor                         1.150s   1.476s   0.983s
+gen                                  43.603s  22.721s  22.385s
+chunk_state_score                    7.635s   6.378s   5.702s
+```
+
+观察：
+
+- v21 比 v19/v20 明显恢复了一部分 state utilization：real states 从 v19 的 2/5/1、v20 的 2/3/5 改到 4/6/4，actor samples 从 8/32/8 或 8/8/32 改到 24/40/24。
+- target quality 比 v20 稳定：support anchor injected ratio 全程 1.0，posterior mass mean 维持 0.555-0.732，answer coverage mean 维持 0.875，没有再出现 v20 step2 的 `posterior_mass_mean=0.187` / `positive_margin_mean=-0.616`。
+- 但它仍未达到进入 20-step 的 gate：我们期望 real states 稳定 >=5/8、num_actor_samples >=32；v21 只有 step2 达标，step1/step3 仍是 4 real states / 24 actor samples。
+- step3 后训练进程退出时出现 `RuntimeError: DataLoader worker (pid 1115835) is killed by signal: Killed.`，并打印 `Final validation skipped`。GPU 显存已释放；这次不作为成功可扩实验，只作为 smoke 证据。
+- timing 上 actor update 已经很快，0.98-1.48s；主要耗时仍是 rollout generation 和 chunk_state_score。继续调 actor update 不是当前主矛盾。
+
+结论：
+
+- v21 是比 v19/v20 更合理的方向，但仍不是 20-step 候选。
+- 下一步不应继续简单降低 hard gate 到追求样本数，而应把 prompt/source gate 从 hard skip 改成 per-state soft weight：允许更多 clean-source state 进入 actor batch，同时用 clean rollout ratio、source mass、prompt coverage、posterior mass/margin 给 loss weight。
+- 另一个更关键的算法方向是把 target 从 `posterior_mass` 改到更像 search improvement 的 `posterior_gain` / support-value margin，避免只是学习已有高 mass answer 的 anchor distribution。
