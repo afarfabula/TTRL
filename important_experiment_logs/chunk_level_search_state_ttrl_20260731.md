@@ -10603,3 +10603,60 @@ step  gen      chunk_probe  chunk_score  chunk_ref  update_actor
 - 保留 `posterior_support_match`，把 `prior_smoothing` 从 `16` 降到 `4-8`。
 - 加一个 sharpen / margin 机制：例如对 posterior score 做 per-state centering 或温度放大，目标是把 `state_top_margin` 拉到 `0.03+`、`weight_max` 拉到 `0.30+`，同时不让 `label_consistent_ratio` 回到 `0.6-0.7`。
 - 不回到 sourcegate / source consistency / short-probe teacher；仍然让 full-rollout support/value 定义 target，probe 只提供 future distribution evidence。
+
+## 2026-08-02 posterior support match sharp a6/s8 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_posterior_support_sharp_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_posterior_support_sharp_a6s8_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_posterior_support_sharp_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_posterior_support_sharp_a6s8_prompt020_productweight_nosrcgate_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_future_support_prior_smoothing=8.0
+ttrl.chunk_state_alpha=6.0
+ttrl.chunk_state_eps=0.01
+ttrl.chunk_state_future_support_anchor_prior_weight=2.0
+ttrl.chunk_state_future_support_source_prior_weight=1.0
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.05
+ttrl.chunk_state_powerflow_weight_clip=4.0
+ttrl.chunk_state_powerflow_weight_clip_renorm=True
+```
+
+三步质量汇总：
+
+```text
+step  real_state  pad_state  boundary_zero  coverage  oov    top_margin  label_consistent  target_entropy  weight_max  actor_samples
+1     29          3          0.188          0.482     0.518  0.022       1.000             1.753           0.881       232
+2     25          7          0.281          0.489     0.511  0.018       1.000             1.743           0.886       200
+3     26          6          0.031          0.561     0.439  0.008       1.000             1.873           0.509       208
+mean  26.7        5.3        0.167          0.511     0.489  0.016       1.000             1.790           0.759       213.3
+```
+
+耗时：
+
+```text
+step  gen      chunk_probe  chunk_score  update_actor
+1     43.453   9.223        10.495       8.746
+2     23.231   9.360        8.167        7.416
+3     22.144   9.497        8.265        7.816
+mean  29.609   9.360        8.976        7.993
+```
+
+结论：
+
+- 这是正向 smoke，但还不是 20-step 扩展绿灯。
+- 正向部分：相对 `prior_smoothing=16`，sharp a6/s8 明显恢复了 per-state target 区分度。`target_entropy` 从约 `2.063` 降到 `1.790`，`weight_max` 从约 `0.212` 提到 `0.759`，同时 `label_consistent_ratio` 仍为 `1.0`，没有退回短 probe/local hit 噪声主导。
+- 仍然不过关的部分：`state_top_margin` 均值只有 `0.016`，低于 `0.03+` gate；coverage/OOV 仍在约 `0.51/0.49`，说明 candidate future distribution 对 full-rollout support 的贴合度没有本质改善。sharp 只是把已有 posterior signal 放大了，没有产生更可靠的 support-aligned candidate。
+- actor update 约 `8.0s`，训练更新本身不是当前主矛盾；主要耗时仍来自 full rollout、probe、score 和 ref/logprob 链路。更重要的是 target 质量仍未达到可长跑标准。
+
+下一步：
+
+- 不再继续沿 source hard gate、source consistency 或 short-probe teacher 加约束。
+- 保留 `posterior_support_match + PowerFlow weighted distillation` 作为骨架，但要改 candidate/state 侧：优先做更可靠的 full-support future estimator，例如 state-compatible staged longer-horizon proposal、按 full-rollout support 高 coverage / top margin 选择 state、以及对低 support/OOV candidate 做 soft downweight 或跳过。
+- 20-step 前的最小 gate 仍然是：`state_top_margin > 0.03`，`coverage` 明显高于 `0.55` 或 `OOV` 明显低于 `0.45`，同时 `label_consistent_ratio` 不坍缩。
