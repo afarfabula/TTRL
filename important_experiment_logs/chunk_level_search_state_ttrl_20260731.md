@@ -13470,3 +13470,76 @@ chunk_state_ref                    5.016s   1.226s   1.229s
 - v23 是一个有用的负例：轻量 hard gate + source_mass soft weight 能恢复 state 数量，但不能把 target posterior 质量提升到 20-step 门槛。
 - 不应把 v23 直接扩到 20-step；继续扩只会花时间验证一个后验质量不过线的目标。
 - 下一步应从目标定义入手，而不是再调 source hard gate：用 full rollout group 的 improved distribution / value gain 定义 chunk target，优先尝试 `posterior_gain` 或 support-value margin，并保留 v23 的 utilization 级别作为工程下限。
+
+## 2026-08-02 support-flow posterior-gain no-split v24 full-rollout guard balanced source-weight 3-step smoke
+
+目的：
+
+- 承接 v23 的结论：v23 的 state utilization 过线，但 `posterior_mass` 绝对质量目标三步 margin 都为负。
+- 本次只改 target 语义：从 `posterior_mass` 改为 `posterior_gain`，即用 full-rollout posterior mass 相对 source mass baseline 的提升定义 score。
+- 仍然跳过 short-horizon probe teacher：`chunk_state_probe/skipped_for_support_flow=1.0`；source chunk/anchor 仍只作为 prior/drift guard。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v24_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriorgain_nosplit_v24_fullguard_balanced_sourceweight_targetonly_3step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v24_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriorgain_nosplit_v24_fullguard_balanced_sourceweight_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_support_flow_score_type=posterior_gain
+ttrl.chunk_state_support_flow_baseline_scale=0.5
+ttrl.chunk_state_support_flow_gain_slack=0.05
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_min_source_answer_mass=0.15
+ttrl.chunk_state_min_prompt_valid_answer_coverage=0.50
+ttrl.chunk_state_source_quality_weight_mode=source_mass
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=3
+trainer.final_val_enable=False
+```
+
+3-step smoke 结果：
+
+```text
+step                                  1        2        3
+clean_rollout_ratio                0.730    0.773    0.707
+real_states                        13       9        14
+num_actor_samples                  64       56       64
+support_anchor_injected_ratio      0.955    1.000    1.000
+posterior_mass_mean                0.389    0.422    0.350
+posterior_mass_max_mean            0.512    0.640    0.562
+source_mass_mean                   0.566    0.640    0.553
+positive_margin_mean               0.229    0.320    0.286
+score_mean                         0.221    0.233    0.197
+score_max_mean                     0.297    0.370    0.348
+state_keep_ratio                   0.875    1.000    0.938
+label_consistent_ratio             0.656    0.633    0.562
+answer_coverage_mean               0.836    0.875    0.875
+positive_ratio                     0.221    0.233    0.197
+actor_weight_nonzero_ratio         1.000    1.000    1.000
+update_actor                       2.533s   1.888s   2.702s
+gen                                43.450s  32.743s  31.853s
+chunk_state_score                  7.646s   6.570s   6.164s
+chunk_state_ref                    4.795s   0.756s   0.912s
+```
+
+观察：
+
+- v24 工程稳定：无 Traceback、无 RuntimeError、无 DataLoader worker killed，final validation 按 smoke 配置跳过。
+- target 方向明显比 v23 好：v23 的 `positive_margin_mean=-0.053/-0.089/-0.069`，v24 改为 `0.229/0.320/0.286`。说明 `posterior_gain` 确实把 full-rollout posterior 从“绝对 mass teacher”变成了更像 search-improvement 的相对信号。
+- 但 state utilization 回落：`num_actor_samples=64/56/64`，低于 v23 的 `80/88/96`；主要因为 `posterior_gain` + hard keep 会丢掉一部分 state/candidate。
+- actor update 速度很好：1.9-2.7s；当前瓶颈仍然是 full rollout generation 和 support scoring，不是 chunk actor update。
+- v24 不回退到 short-probe local answer hit/source consistency，仍满足当前算法约束。
+
+结论：
+
+- v24 是正向 smoke：它修复了 v23 最核心的负 margin 问题，并且没有引入训练崩溃。
+- 但 v24 还不能直接扩 20-step，因为 actor samples 未达到预设的 >=80 gate。
+- 下一步建议做 v25：保留 `posterior_gain`，把 `future_support_keep` 从 hard keep 改为 soft keep，或轻量放宽 source/prompt gate，目标是在保持 `positive_margin_mean > 0.20` 的同时把 `num_actor_samples` 恢复到 >=80。
