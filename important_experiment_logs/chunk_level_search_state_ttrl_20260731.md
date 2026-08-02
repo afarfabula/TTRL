@@ -11558,3 +11558,74 @@ update_actor_mean               4.761s                       4.097s
 - 设计下一版 `posterior_support_match_v2`：先由 full rollout group 建 prompt-level support/value，再从高 support/high pass 或 majority-consistent 完整轨迹选中后段 state；低信息 state 直接 skip/downweight。
 - candidate score 改为“相对 full-group posterior 的 future distribution improvement”，例如 posterior expected value gain、top answer mass gain、support value margin、transport/KL improvement，而不是 local boxed hit。
 - probe 可以分阶段：较短 probe 只用于初筛或估计粗分布，top candidates 再拉长 probe；所有 probe 信号必须回到 full-rollout support/value posterior 上计算 target。
+
+## 2026-08-02 posterior-value-improvement staged smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_postvalue_staged_softkeep_fullsupport_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_postvalue_staged_softkeep_fullsupport_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_postvalue_staged_softkeep_fullsupport_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_postvalue_staged_softkeep_fullsupport_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+关键实现/配置差异：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_value_improvement
+ttrl.chunk_state_staged_probe_enable=True
+ttrl.chunk_state_staged_probe_topk=2
+ttrl.chunk_state_staged_probe_extra_samples=4
+ttrl.chunk_state_staged_probe_extra_max_tokens=2048
+ttrl.chunk_state_staged_probe_merge_mode=repeat_base
+```
+
+`posterior_value_improvement` 的 score 定义为：先用 `0.7 * smoothed_support_expected_value + 0.3 * smoothed_support_overlap` 乘以 `smoothed_transport_affinity` 得到 posterior value，再减去同一 state 内 candidate posterior value 的均值，只保留正向 advantage。这版的目的不是让 source answer 当 teacher，而是测试“相对 full-group posterior/value 的 state-local improvement”能不能比直接 posterior matching 更尖锐。
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  support_cov  w_cov  raw_margin  w_margin  state_oov  score_mean  label_cons  staged_extra  nonzero_w  target_entropy
+1     11          128            0.521        0.580  0.115       0.133     0.479      0.034       0.531       8.757         0.688      1.696
+2     4           64             0.691        0.612  0.077       0.108     0.309      0.025       0.578       8.566         0.500      1.790
+3     11          128            0.265        0.537  0.123       0.152     0.735      0.026       0.336       9.055         0.688      1.545
+mean  8.7         106.7          0.492        0.576  0.105       0.131     0.508      0.028       0.482       8.793         0.625      1.677
+```
+
+耗时：
+
+```text
+step  gen      probe   staged_extra  score   ref     update_actor
+1     43.478   7.687   8.757         11.280  5.627   4.887
+2     22.995   6.982   8.566         6.074   0.947   2.389
+3     22.482   8.284   9.055         9.121   1.876   4.710
+mean  29.652   7.651   8.793         8.825   2.817   3.995
+```
+
+对比上一轮 `posterior_support_match`：
+
+```text
+metric                          posterior_support_match   posterior_value_improvement_staged
+answer_coverage_mean            0.445                     0.492
+answer_coverage_weighted_mean   0.634                     0.576
+positive_margin_mean            0.406                     0.105
+positive_margin_weighted_mean   0.529                     0.131
+state_oov_mean                  0.555                     0.508
+score_mean                      0.314                     0.028
+label_consistent_ratio          1.000                     0.482
+num_actor_samples_mean          106.7                     106.7
+update_actor_mean               4.097s                    3.995s
+extra_probe_cost_mean           0.000s                    8.793s
+```
+
+结论：
+
+- 不扩 20-step。虽然 raw support coverage 从 `0.445` 到 `0.492` 稍有改善，OOV 从 `0.555` 到 `0.508` 稍降，但加权 target 质量变差：`answer_coverage_weighted_mean=0.576`，`positive_margin_weighted_mean=0.131`，明显低于上一轮 `0.634/0.529`。
+- 主要失败原因不是 probe 不够长，而是 state-local mean baseline 把 PowerFlow target 变得过稀。`score_mean=0.028`、`label_consistent_ratio=0.482` 表明大部分 candidate 被压成接近 0，最后训练信号弱且 target entropy 降低。
+- staged probe 的额外成本约 `8.8s/step`，但没有换来更好的加权 target；因此不应把“更长 probe + advantage 截断”作为当前主线。
+- 这版再次支持最新原则：不要要求 chunk 在局部短视视角里被硬判定为好/坏。PowerFlow 更适合吃一个 soft posterior target，而不是稀疏 binary/advantage target。
+
+下一步：
+
+- 回到 `posterior_support_match` 作为当前较优 scorer，不使用 state-local mean clipping 作为主 target。
+- 优先优化 full rollout group posterior/value 的状态选择和 state 权重，而不是把 candidate score 做得更稀疏：例如 support-mixed/high-quality source、更多中后段 state、低信息 state soft skip。
+- 如果继续 staged probe，只让它改善 posterior estimator 的置信度/方差，不直接把 top-k advantage 当 teacher。更合适的做法是 top-k 加深后重新估计 soft posterior distribution，再做 distribution matching。

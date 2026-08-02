@@ -200,13 +200,18 @@ ttrl:
   # Supported: slack_gain, positive_gain, relative_positive_gain,
   # tv_positive_gain, relative_tv_positive_gain, transport_affinity,
   # transport_positive_gain, transport_support_gain, plus smoothed_transport_*
-  # variants, support_distribution_match, and posterior_support_match. The
+  # variants, support_distribution_match, posterior_support_match, and
+  # posterior_value_improvement. The
   # transport variants compare candidate future answer distributions to the
   # full-rollout support distribution with OOV answers counted as off-support
   # mass, so they are not local correctness teachers. posterior_support_match
   # first shrinks sparse probe evidence toward the full-rollout support
   # posterior, then scores support expected value / overlap / affinity, which
   # avoids letting short-horizon probe hits define the target alone.
+  # posterior_value_improvement keeps that posterior/value signal but only
+  # rewards candidates that improve over the state-local posterior-value mean,
+  # so the actor learns a sharpened local transition rather than a flat support
+  # match.
   chunk_state_future_support_score_type: slack_gain
   chunk_state_future_support_gain_slack: 0.125
   chunk_state_future_support_baseline_scale: 1.0

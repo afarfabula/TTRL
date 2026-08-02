@@ -3219,6 +3219,13 @@ class RayPPOTrainer:
                 min=0.0,
                 max=1.0,
             )
+        elif score_type == "posterior_value_improvement":
+            posterior_value = (
+                (0.7 * smoothed_support_expected_value + 0.3 * smoothed_support_overlap)
+                * smoothed_transport_affinity
+            ).clamp(min=0.0, max=1.0)
+            state_baseline = posterior_value.mean(dim=-1, keepdim=True)
+            score_matrix = (posterior_value - state_baseline).clamp(min=0.0, max=1.0)
         else:
             raise ValueError(f"Unsupported ttrl.chunk_state_future_support_score_type={score_type!r}")
         pre_filter_score_matrix = score_matrix.clone()
@@ -3290,6 +3297,7 @@ class RayPPOTrainer:
             "support_value_affinity",
             "support_distribution_match",
             "posterior_support_match",
+            "posterior_value_improvement",
         }:
             filtered_score_gain = score_matrix.masked_fill(~candidate_quality_ok, float("-inf"))
             positive_margin = filtered_score_gain.max(dim=-1).values
@@ -3388,6 +3396,9 @@ class RayPPOTrainer:
             ),
             "chunk_state_future_support_gain/score_type_posterior_support_match": float(
                 score_type == "posterior_support_match"
+            ),
+            "chunk_state_future_support_gain/score_type_posterior_value_improvement": float(
+                score_type == "posterior_value_improvement"
             ),
             "chunk_state_future_support_gain/gain_slack": gain_slack,
             "chunk_state_future_support_gain/baseline_scale": baseline_scale,
