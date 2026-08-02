@@ -11479,3 +11479,82 @@ mean  29.879   7.992   8.670   3.146   4.761
 - 候选 B：score 从 `support_distribution_match` 改成 `posterior_support_match` 或 `support_value_affinity`，利用 smoothing 后的 posterior support overlap，避免 raw probe OOV 把目标压得过稀。
 - 候选 C：probe 改成 staged：先用 1024-token probe 过滤/排序 candidate，再只对 top candidates 加长 probe，目标是减少 1536-token 全量 probe 成本，同时提高有效 support hit 率。
 - 仍保持原则：full rollout group support/value 主导 target；probe 是未来分布估计器；source/anchor 只做 prior/drift guard。
+
+## 2026-08-02 future_support_gain posterior-support softkeep smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_softkeep_fullsupport_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_softkeep_fullsupport_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_softkeep_fullsupport_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_softkeep_fullsupport_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_score_mode=future_support_gain
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.05
+ttrl.chunk_state_future_support_min_state_coverage=0.0
+ttrl.chunk_state_future_support_max_state_oov=1.0
+ttrl.chunk_state_min_answer_coverage=0.0
+ttrl.chunk_state_min_informative_gap=0.0
+ttrl.chunk_state_prune_zero_weight_samples=False
+ttrl.chunk_state_source_quality_weight_mode=group_quality
+```
+
+这轮只改 score type，从 `support_distribution_match` 切到 `posterior_support_match`。目的不是让短 probe 判定 teacher，而是看 smoothing/posterior overlap 能不能降低 raw probe OOV 对 full-rollout support target 的破坏。
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  support_cov  w_cov  raw_margin  w_margin  state_oov  score_mean  label_cons  soft_w  nonzero_w  target_entropy
+1     11          128            0.541        0.580  0.430       0.508     0.459      0.326       1.000       0.266   0.688      1.953
+2     6           64             0.406        0.652  0.409       0.561     0.594      0.322       1.000       0.223   0.750      2.006
+3     10          128            0.389        0.671  0.378       0.518     0.611      0.294       1.000       0.201   0.625      1.991
+mean  9           106.7          0.445        0.634  0.406       0.529     0.555      0.314       1.000       0.230   0.688      1.983
+```
+
+耗时：
+
+```text
+step  gen      probe   score   ref     update_actor
+1     43.498   7.645   9.948   5.735   4.960
+2     22.859   6.988   6.274   0.980   2.678
+3     23.022   8.219   9.913   1.874   4.654
+mean  29.793   7.617   8.712   2.863   4.097
+```
+
+对比上一轮 `support_distribution_match` softkeep：
+
+```text
+metric                          support_distribution_match   posterior_support_match
+answer_coverage_mean            0.332                        0.445
+answer_coverage_weighted_mean   0.512                        0.634
+positive_margin_mean            0.000*                       0.406
+positive_margin_weighted_mean   0.000*                       0.529
+support_coverage_mean           0.332                        0.445
+state_oov_mean                  0.668                        0.555
+score_mean                      0.132                        0.314
+label_consistent_ratio          0.474                        1.000
+num_actor_samples_mean          128.0                        106.7
+update_actor_mean               4.761s                       4.097s
+```
+
+`*` 上一轮通用 positive_margin 指标为 0 是日志映射缺陷；`future_support_gain/positive_margin_mean` 当时是 0.247。本轮已在 `ray_trainer.py` 中把 `chunk_state_future_support_positive_margin` 同步写入通用 `chunk_state_positive_margin`，后续 `chunk_state/positive_margin_*` 可以直接看。
+
+结论：
+
+- 不扩 20-step。posterior match 明显改善了 full-support target 的加权质量：`answer_coverage_weighted_mean=0.634`、`positive_margin_weighted_mean=0.529`、`label_consistent_ratio=1.0`，但仍低于 20-step gate 的 `answer_coverage_weighted_mean >= 0.82`，并且 `num_actor_samples_mean=106.7` 低于 120。
+- 这轮证明方向比 `support_distribution_match` 健康：posterior/smoothing 能把 raw probe OOV 从 `0.668` 降到 `0.555`，score/margin 都上升，actor update 仍约 4s，没有成为主瓶颈。
+- 但它也再次证明主矛盾不是 update_actor，而是 target 质量。raw support coverage 只有 `0.445`，OOV 仍超过一半，说明当前 4 条 1536-token probe 仍然不能独立承担 teacher/label 的角色。
+- 因此最该放弃的约束不是 PowerFlow、softkeep、full rollout group label estimation，而是“局部短视可判定性”：不能要求 chunk 的好坏在 short-horizon local answer hit/source consistency 这一级被判清楚。
+- 后续 target 必须由 full rollout group 的 answer support/value/posterior 定义；source chunk 只保留为 prior/drift guard；probe 只作为 future distribution estimator，并且要拉长、分阶段或改成更贴近 group posterior 的估计。
+
+下一步：
+
+- 不继续做 sourcegate/source consistency hard constraint；已有证据显示这类约束会把 support coverage 和 actor sample volume 打坏。
+- 设计下一版 `posterior_support_match_v2`：先由 full rollout group 建 prompt-level support/value，再从高 support/high pass 或 majority-consistent 完整轨迹选中后段 state；低信息 state 直接 skip/downweight。
+- candidate score 改为“相对 full-group posterior 的 future distribution improvement”，例如 posterior expected value gain、top answer mass gain、support value margin、transport/KL improvement，而不是 local boxed hit。
+- probe 可以分阶段：较短 probe 只用于初筛或估计粗分布，top candidates 再拉长 probe；所有 probe 信号必须回到 full-rollout support/value posterior 上计算 target。

@@ -3323,6 +3323,9 @@ class RayPPOTrainer:
         state_prompts.non_tensor_batch["chunk_state_future_support_positive_margin"] = (
             positive_margin.detach().cpu().numpy().astype(np.float32)
         )
+        state_prompts.non_tensor_batch["chunk_state_positive_margin"] = (
+            positive_margin.detach().cpu().numpy().astype(np.float32)
+        )
         state_prompts.non_tensor_batch["chunk_state_future_support_state_mean_mass"] = (
             state_mean_mass_tensor.detach().cpu().numpy().astype(np.float32)
         )
