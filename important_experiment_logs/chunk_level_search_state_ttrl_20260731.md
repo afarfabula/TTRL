@@ -12297,3 +12297,69 @@ mean  30.236   7.078  7.898   1.575  1.024
 - source chunk/anchor 只作为 prior 或 drift guard，不能作为主要 teacher/floor；继续加 source-side 硬约束已经被 v10/v11 反例否定。
 - state selection 必须优先解决低信息样本：跳过或强降权 all-negative、support coverage 低、OOV 高、top mass 过平、malformed/repeated boxed/marker 污染的 states。
 - 下一轮应实现/测试 `posterior_support_match` 或 `posterior_value_improvement` 作为主 target，而不是继续调 anchor mass；smoke 先看 `support_coverage`、`OOV`、`label_consistent_ratio`、`actor_w_nonzero`，再决定是否跑 20-step。
+
+## 2026-08-02 posterior-support-match highmassanchors v12 smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_highmassanchors_v12_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_highmassanchors_v12_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_highmassanchors_v12_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_highmassanchors_v12_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+相对 v11 的变化：
+
+- 保持 v11 的 high-mass anchor / state gate / soft keep / clip4 配置不变。
+- 唯一核心变化：`ttrl.chunk_state_future_support_score_type=posterior_support_match`。
+- 目标是让 full-rollout support posterior 对 sparse probe evidence 做 smoothing，再由 posterior expected value / overlap / affinity 定义 PowerFlow target。
+- 这版更符合最新策略纠偏：probe 只是 future distribution 的采样估计，不再由 short-horizon local hit 单独定义 teacher。
+
+三步质量汇总：
+
+```text
+step  anchor_inj  anchor_mass  anchor_pos  coverage  oov    keep   score  label  improved  margin  real_state  actor_samples  zeroed  w_cov  w_margin  positive_ratio  target_entropy  actor_w_nonzero
+1     0.625       0.704        0.547       0.328     0.672  0.500  0.338  1.000  1.000     0.611   3           24             0.625   0.402  0.595     0.338           1.706           1.000
+2     0.750       0.837        0.656       0.578     0.422  0.000  0.543  1.000  1.000     0.635   3           8              0.875   0.781  0.779     0.543           2.027           1.000
+3     0.875       0.534        0.766       0.633     0.367  0.625  0.412  1.000  1.000     0.577   3           24             0.625   0.621  0.593     0.412           1.921           1.000
+mean  0.750       0.692        0.656       0.513     0.487  0.375  0.431  1.000  1.000     0.608   3.0         18.7           0.708   0.601  0.656     0.431           1.885           1.000
+```
+
+耗时：
+
+```text
+step  gen      probe  score   ref    update_actor
+1     43.659   7.019  9.797   4.249  1.314
+2     22.867   6.988  6.341   0.118  0.438
+3     32.537   7.133  8.266   0.417  1.170
+mean  33.021   7.047  8.135   1.595  0.974
+```
+
+与 v11 对比：
+
+```text
+metric                  v11 supportdist  v12 posterior
+support_coverage_mean   0.359            0.513
+state_oov_mean          0.641            0.487
+score_mean              0.184            0.431
+label_consistent_ratio  0.542            1.000
+positive_ratio          0.184            0.431
+weighted_coverage       0.386            0.601
+weighted_margin         0.402            0.656
+update_actor            1.024s           0.974s
+```
+
+结论：
+
+- v12 是目前最符合目标语义的 smoke，建议进入下一阶段 20-step pilot。
+- posterior smoothing 明显修复 v11 的主失败点：v11 step 2 `coverage=0.090/OOV=0.910`，v12 step 2 在相近 high-mass anchor 配置下达到 `coverage=0.578/OOV=0.422`。
+- `label_consistent_ratio=1.0` 三步全满，说明 target 不再被短 probe 的局部稀疏命中打散；full-group posterior 开始主导 chunk target。
+- `actor/powerflow_weight/nonzero_ratio=1.0` 每步保持非零，`update_actor` 仍约 `1s`，PowerFlow chunk actor update 的 infra 成本可接受。
+- 仍有一个需要修的信号：step 2 `state_keep_ratio=0.0` 但 soft keep 仍产出 actor samples。说明 hard keep 指标对 posterior 模式过严，后续应把 learnable gate 改成 posterior-aware，不要让 `state_top_margin` 这类 old-score gate 误判。
+- 第 2 步 `boundary_zero_ratio=0.75`，说明 state selection 仍可能抽到过早状态；下一轮 20-step 前应强制中后段 boundary 或统计单独分层。
+
+下一步：
+
+- 以 v12 为主线，不再继续调 `support_distribution_match` anchor/source gate。
+- 先跑 20-step pilot：`posterior_support_match + highmassanchors + soft keep`，每 20 step 做一次 val 或先 final val，观察 mean@16/maj@16 是否开始超过 MV baseline。
+- 同时准备 v13 小改：posterior-aware learnable gate，去掉对 `state_top_margin` 的硬依赖，强制 nonzero mid/late boundary，保留 low-information skip/downweight。
+- 若 20-step target 指标稳定，再扩到 80-step pilot；若 20-step 仍差，优先改 state selection，不回退到 short-probe local teacher。
