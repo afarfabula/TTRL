@@ -9633,3 +9633,117 @@ step  keep   coverage  oov
 - source chunk 保留为 prior / drift guard，不再作为 hard floor 或主要 teacher。
 - hard keep 需要改成 soft distribution matching / soft weighting。现在大量 step 被 hard keep 清零，直接导致训练信号稀疏；下一版应对低质量 state 降权或跳过，但不能让可学习状态被 `top_margin` 等局部硬阈值过度清零。
 - 下一版优先做 support-conditioned proposal：对同一 state 的 candidate 采样不只从 base policy 采 next chunk，还混入 high-support rollout suffix/replay chunk 或 full-support-conditioned anchor proposal，使 candidate distribution 自身更靠近 full-rollout support，再用 PowerFlow-style q_j ∝ exp(alpha * support_score_j) * prior_j 训练。
+
+## 2026-08-02 soft keep + support-anchor proposal 3-step smoke
+
+目的：
+
+- 验证上一节的核心诊断：`future_support_keep` hard gate 是 20-step 中大量零更新的直接工程原因。
+- 不改变 full-rollout support/value 主导 target 的原则，只把 state-level keep 从 hard gate 改成 soft weight。
+- 同时打开 support-anchor proposal，把同 prompt 的 high-support rollout suffix/replay chunk 注入 candidate 集合，验证 support-conditioned proposal 能否保持非零 actor update。
+
+代码改动：
+
+```text
+ray_trainer.py:
+  新增 chunk_state_future_support_soft_weight = state_coverage * state_max_mass
+  新增 ttrl.chunk_state_future_support_keep_mode = hard | soft | off
+  hard: 保持旧行为，future_support_keep=false 时整 state 清零
+  soft: 不用 future_support_keep 清零整 state，而是用 soft_weight 乘到 state loss weight
+  off: 完全不使用 future_support_keep
+
+ppo_trainer_ttrl.yaml:
+  默认 chunk_state_future_support_keep_mode: hard
+  默认 chunk_state_future_support_soft_weight_floor: 0.0
+```
+
+运行：
+
+```text
+run_id = ttrl_chunk_state_powerflow_futuregain_supportdist_softkeep_anchorprop_mid_c128_probe1536x4_b32_r32_v64_3step_20260802
+model = /models/Qwen2.5-Math-7B
+data = /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+train_batch_size = 32
+rollout.n = 32
+total_training_steps = 3
+final_val_enable = false
+score = future_support_gain / support_distribution_match
+probe = 4 samples, max_tokens 1536
+support_anchor_enable = true
+support_anchor_count = 3
+support_anchor_candidate_start = 5
+future_support_keep_mode = soft
+future_support_soft_weight_floor = 0.05
+```
+
+产物：
+
+```text
+launcher:
+  /mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_chunk_state_powerflow_futuregain_supportdist_softkeep_anchorprop_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh
+diag:
+  /mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_supportdist_softkeep_anchorprop_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl
+raw worker output:
+  /home/tiger/.trae/cli/sessions/2026/07/12/rollout-2026-07-12T04-54-36-019f54ad-60d1-7981-938e-2c5f116e8fe3.artifacts/tool-results/exec_command-call_IydwJfsZXxInavqZl5yd9iVD-2.txt
+```
+
+diag 汇总：
+
+```text
+diag rows = 32
+steps = 1,2,3
+answer_coverage_mean = 0.481445
+state_oov_mean = 0.518555
+future_support_keep_mean = 0.062500
+future_support_learnable_keep_mean = 0.062500
+future_support_state_mean_mass = 0.354567
+future_support_state_max_mass = 0.601146
+future_support_state_top_margin = 0.036441
+probe_mean = 0.323084
+prompt_valid_answer_coverage_mean = 0.891602
+prompt_answer_top_margin_mean = 0.687526
+prompt_answer_entropy_mean = 1.093173
+loss_weight_mean = 0.562500
+source_answer_mass_mean = 0.734520
+```
+
+逐 step：
+
+```text
+step  coverage  hard_keep  learnable_keep  diag_loss_weight
+1     0.554688  0.250      0.250           0.625
+2     0.583984  0.000      0.000           0.5625
+3     0.203125  0.000      0.000           0.500
+```
+
+关键 step 证据：
+
+```text
+step 2:
+  future_support_keep_ratio = 0.000
+  future_support_keep_mode_soft = 1.000
+  future_support_soft_weight_mean = 0.455
+  future_support_state_weight_mean = 0.465
+  kept_state_ratio = 1.000
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  grad_norm = 23.428
+  update_actor = 2.723s
+
+step 3:
+  future_support_keep_ratio = 0.000
+  future_support_keep_mode_soft = 1.000
+  future_support_soft_weight_mean = 0.139
+  future_support_state_weight_mean = 0.154
+  kept_state_ratio = 1.000
+  actor_batch_powerflow_weight_nonzero_ratio = 1.000
+  grad_norm = 5.390
+  update_actor = 1.255s
+```
+
+结论：
+
+- soft keep smoke 跑通，证明 20-step 失败中的“零更新”不是不可避免的算法现象，而是 actor batch 里的 hard keep 直接造成的工程/目标构造问题。
+- 在 step 2 和 step 3，旧 hard keep 会因为 `future_support_keep_ratio=0` 把整步清零；soft keep 下 `kept_state_ratio=1.0`、`actor_batch_powerflow_weight_nonzero_ratio=1.0`，actor 有真实梯度。
+- support-anchor proposal 没有破坏 full-support target 语义：它只是把 high-support rollout suffix 注入 candidate 集合，最终 score 仍由 `support_distribution_match` 和 full-rollout support distribution 定义。
+- 这版不应该直接扩 80-step。虽然零更新问题被解决，但 step 3 的 `answer_coverage=0.203`，candidate support 仍明显不稳。下一步应继续改 proposal：增加 replay/suffix anchor 覆盖、降低无效 base-policy chunk 比例，或切到 `support_flow soft_mass` 先验证纯 full-support proposal 的训练曲线。
+- 后续 20-step 应使用 soft keep，但必须同时提高 candidate support coverage，否则只是“有梯度地学噪声”。

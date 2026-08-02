@@ -196,6 +196,12 @@ ttrl:
   chunk_state_future_support_min_state_mean_mass: 0.0
   chunk_state_future_support_min_state_max_mass: 0.0
   chunk_state_future_support_min_state_top_margin: 0.0
+  # How actor batch uses future_support_keep. "hard" preserves older runs and
+  # zeros a state when future_support_keep is false. "soft" keeps the state but
+  # weights it by full-support coverage * max support mass, which avoids making
+  # short-horizon local decidability the training bottleneck.
+  chunk_state_future_support_keep_mode: hard
+  chunk_state_future_support_soft_weight_floor: 0.0
   # Optional candidate-level quality gate for future_support_gain. It keeps the
   # target tied to prompt-level full-rollout answer support by dropping chunks
   # whose probes rarely land inside that support.

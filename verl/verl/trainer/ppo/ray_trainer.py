@@ -3229,6 +3229,13 @@ class RayPPOTrainer:
         state_prompts.non_tensor_batch["chunk_state_future_support_state_top_margin"] = (
             state_top_margin.detach().cpu().numpy().astype(np.float32)
         )
+        # Continuous state quality for soft keep mode. This keeps low-information
+        # states down-weighted without turning full-support target construction
+        # back into a brittle local hard gate.
+        future_support_soft_weight = (state_coverage_tensor * state_max_mass_tensor).clamp(min=0.0, max=1.0)
+        state_prompts.non_tensor_batch["chunk_state_future_support_soft_weight"] = (
+            future_support_soft_weight.detach().cpu().numpy().astype(np.float32)
+        )
         state_prompts.non_tensor_batch["chunk_state_future_support_learnable_keep"] = (
             learnable_state_keep.float().detach().cpu().numpy().astype(np.float32)
         )
@@ -3378,6 +3385,9 @@ class RayPPOTrainer:
             else 0.0,
             "chunk_state_future_support_gain/state_top_margin_mean": state_top_margin.mean().item()
             if len(state_top_margin)
+            else 0.0,
+            "chunk_state_future_support_gain/soft_weight_mean": future_support_soft_weight.mean().item()
+            if len(future_support_soft_weight)
             else 0.0,
             "chunk_state_future_support_gain/learnable_state_keep_ratio": learnable_state_keep.float().mean().item()
             if len(learnable_state_keep)
@@ -4248,20 +4258,43 @@ class RayPPOTrainer:
             ),
             dtype=torch.float32,
         )
+        future_support_soft_weight = torch.as_tensor(
+            state_prompts.non_tensor_batch.get(
+                "chunk_state_future_support_soft_weight",
+                np.ones(num_states, dtype=np.float32),
+            ),
+            dtype=torch.float32,
+        ).clamp(min=0.0, max=1.0)
         informative = ((score_max - score_min) > float(cfg.get("chunk_state_min_informative_gap", 0.0))).float()
         confidence_gate = (majority_ratios >= min_majority_ratio) & (answer_coverage >= min_answer_coverage)
         confidence_weight = torch.ones(num_states, dtype=torch.float32)
         if confidence_power > 0.0:
             confidence_weight = torch.pow((majority_ratios * answer_coverage).clamp(min=0.0, max=1.0), confidence_power)
+        future_support_keep_mode = str(cfg.get("chunk_state_future_support_keep_mode", "hard"))
+        soft_weight_floor = float(cfg.get("chunk_state_future_support_soft_weight_floor", 0.0))
         keep_state = torch.ones(num_states, dtype=torch.bool)
         if skip_uniform:
             keep_state &= informative.bool()
         if skip_all_negative:
             keep_state &= score_max > 0.0
         keep_state &= confidence_gate
-        keep_state &= future_support_keep > 0.0
+        if future_support_keep_mode == "hard":
+            keep_state &= future_support_keep > 0.0
+            future_support_state_weight = torch.ones(num_states, dtype=torch.float32)
+        elif future_support_keep_mode == "soft":
+            future_support_state_weight = future_support_soft_weight.clamp(min=soft_weight_floor)
+        elif future_support_keep_mode == "off":
+            future_support_state_weight = torch.ones(num_states, dtype=torch.float32)
+        else:
+            raise ValueError(
+                "Unsupported ttrl.chunk_state_future_support_keep_mode="
+                f"{future_support_keep_mode!r}; expected hard, soft, or off"
+            )
         effective_state_loss_weights = (
-            state_loss_weights * keep_state.to(dtype=state_loss_weights.dtype) * confidence_weight
+            state_loss_weights
+            * keep_state.to(dtype=state_loss_weights.dtype)
+            * confidence_weight
+            * future_support_state_weight
         )
         keep_indices = list(range(len(chunk_output)))
 
@@ -4392,6 +4425,12 @@ class RayPPOTrainer:
             "chunk_state/zeroed_state_ratio": (effective_state_loss_weights <= 0.0).float().mean().detach().item(),
             "chunk_state/confidence_gate_ratio": confidence_gate.float().mean().detach().item(),
             "chunk_state/confidence_weight_mean": confidence_weight.mean().detach().item(),
+            "chunk_state/future_support_keep_mode_hard": float(future_support_keep_mode == "hard"),
+            "chunk_state/future_support_keep_mode_soft": float(future_support_keep_mode == "soft"),
+            "chunk_state/future_support_keep_mode_off": float(future_support_keep_mode == "off"),
+            "chunk_state/future_support_soft_weight_mean": future_support_soft_weight.mean().detach().item(),
+            "chunk_state/future_support_state_weight_mean": future_support_state_weight.mean().detach().item(),
+            "chunk_state/future_support_soft_weight_floor": soft_weight_floor,
             "chunk_state/future_support_keep_ratio": (future_support_keep > 0.0).float().mean().detach().item(),
             "chunk_state/majority_ratio_mean": majority_ratios.mean().detach().item(),
             "chunk_state/answer_coverage_mean": answer_coverage.mean().detach().item(),
