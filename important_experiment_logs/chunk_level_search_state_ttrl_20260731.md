@@ -11629,3 +11629,75 @@ extra_probe_cost_mean           0.000s                    8.793s
 - 回到 `posterior_support_match` 作为当前较优 scorer，不使用 state-local mean clipping 作为主 target。
 - 优先优化 full rollout group posterior/value 的状态选择和 state 权重，而不是把 candidate score 做得更稀疏：例如 support-mixed/high-quality source、更多中后段 state、低信息 state soft skip。
 - 如果继续 staged probe，只让它改善 posterior estimator 的置信度/方差，不直接把 top-k advantage 当 teacher。更合适的做法是 top-k 加深后重新估计 soft posterior distribution，再做 distribution matching。
+
+## 2026-08-02 posterior-support-match support-mixed smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_futuregain_posteriormatch_supportmixed_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_futuregain_posteriormatch_supportmixed_softkeep_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_futuregain_posteriormatch_supportmixed_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_futuregain_posteriormatch_supportmixed_softkeep_mid_c128_probe1536x4_b32_r32_v64_3step_20260802.jsonl`
+
+关键配置：
+
+```text
+ttrl.chunk_state_future_support_score_type=posterior_support_match
+ttrl.chunk_state_source_mode=support_mixed
+ttrl.chunk_state_source_mixed_low_ratio=0.50
+ttrl.chunk_state_source_low_max_answer_mass=0.35
+ttrl.chunk_state_source_min_valid_answer_mass=0.03125
+ttrl.chunk_state_min_source_answer_mass=0.0
+ttrl.chunk_state_source_quality_weight_mode=group_quality
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.05
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_acc  source_mass  support_cov  w_cov  raw_margin  w_margin  state_oov  score_mean  nonzero_w  target_entropy
+1     24          192            0.125       0.117        0.293        0.451  0.297       0.406     0.707      0.220       1.000      2.000
+2     20          192            0.083       0.070        0.199        0.341  0.287       0.387     0.801      0.209       0.833      2.011
+3     19          192            0.042       0.075        0.297        0.528  0.323       0.503     0.703      0.244       0.792      2.006
+mean  21          192            0.083       0.087        0.263        0.440  0.302       0.432     0.737      0.224       0.875      2.006
+```
+
+耗时：
+
+```text
+step  gen      chunks  probe   score   ref     update_actor
+1     43.580   0.968   9.008   11.083  6.658   7.455
+2     23.082   0.979   9.220   9.648   2.872   7.187
+3     22.799   1.275   9.607   8.347   2.847   7.263
+mean  29.820   1.074   9.278   9.693   4.126   7.302
+```
+
+对比前两轮 smoke：
+
+```text
+metric                          posterior_support_match   posterior_value_staged   support_mixed_0.50
+answer_coverage_weighted_mean   0.634                     0.576                    0.440
+positive_margin_weighted_mean   0.529                     0.131                    0.432
+support_coverage_mean           0.445                     0.492                    0.263
+state_oov_mean                  0.555                     0.508                    0.737
+source_original_acc_mean        n/a                       n/a                      0.083
+source_answer_mass_mean         n/a                       n/a                      0.087
+num_actor_samples_mean          106.7                     106.7                    192.0
+update_actor_mean               4.097s                    3.995s                   7.302s
+```
+
+结论：
+
+- 不扩 20-step。`support_mixed_low_ratio=0.50` 虽然把 actor samples 提到 192，但 source 质量明显过低：`selected_original_acc_mean=0.083`、`source_answer_mass_mean=0.087`，导致 `support_coverage_mean=0.263`、`state_oov_mean=0.737`。
+- 这不是 PowerFlow actor update 的问题，而是 state/source/target 估计质量问题。更多低质量 state 只会让 batch 变大、`update_actor` 变慢到 `7.3s`，但不会改善 target。
+- 这轮直接反证“继续加 source 侧 hard/low contrastive 约束”的方向。低质量 source 可以做诊断或少量 contrastive prior，但不能主导训练 batch。
+- 当前最重要的方法约束更新：放弃“局部短视可判定性”。不要再要求 chunk target 主要由 short-horizon probe 的局部 answer hit、source answer consistency 或 source floor 来定义。
+- 替代原则是：先由 full rollout group 建 prompt-level support/value/posterior；chunk candidate 只学习哪个局部 transition 会把未来分布推向这个 full-group posterior 认为好的区域；source chunk 只作为 prior/drift guard，不作为 teacher/floor。
+- probe 后续只能作为 future distribution estimator。短 probe 可以做粗估、筛选或方差控制，但 target 必须回到 full-rollout support/value/posterior 上计算，不能单独由局部 boxed hit 决定。
+
+下一步：
+
+- 回退 `support_mixed_low_ratio=0.50`。如果需要 contrastive state，比例应降到 `0.10-0.15`，并且只参与 prior/diagnostic，不直接稀释 high-support state batch。
+- 主线转向 `posterior_support_match_v2`：高 support / majority-consistent 中后段 state，低信息 state skip/downweight，candidate target 用 full-group posterior expected value / support mass gain / transport or KL improvement。
+- 先做 3-step smoke 验证四个量：`support_coverage_mean`、`state_oov_mean`、`answer_coverage_weighted_mean`、`positive_margin_weighted_mean`。达不到 gate 不跑 20-step。
