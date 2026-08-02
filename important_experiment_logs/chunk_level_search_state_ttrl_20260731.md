@@ -12706,3 +12706,145 @@ source answer consistency、或短 probe answer distribution 来定义。
 - probe 如继续使用，只能用于估计 future distribution 或 longer-horizon value，不再单独决定 teacher。
 
 因此 v16 不应简单扩展 v15，也不应回退到 short-probe local hit。优先方向是把当前 `boxed_reward` 注入式 PowerFlow 更新替换为更稳定的 full-posterior distribution matching / target-only KL / guarded PowerFlow variant，并把 validation format collapse 作为 smoke 准入指标。
+
+## 2026-08-02 support-flow posterior-mass no-split v16 target-only smoke
+
+目的：
+
+- 保留 v15 的 `support_flow + posterior_mass`、`posterior_split_duplicates=False`、nonzero mid boundary、skip-empty。
+- 只切 actor loss：`actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only`，并设置 `actor_rollout_ref.actor.powerflow_use_boxed_reward=False`。
+- 目标是验证 full-posterior chunk target 可以进入 PowerFlow 权重，但不再通过 `boxed_reward` 注入 residual，避免 v15 20-step 后出现的重复 `\boxed{}` 污染。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v16_targetonly_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+配置确认：
+
+```text
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+ttrl.chunk_state_score_mode=support_flow
+ttrl.chunk_state_support_flow_score_type=posterior_mass
+ttrl.chunk_state_support_flow_posterior_split_duplicates=False
+ttrl.chunk_state_mid_require_nonzero_boundary=True
+ttrl.chunk_state_skip_empty_state_batch=True
+actor_rollout_ref.actor.use_dynamic_bsz=False
+```
+
+3-step 聚合：
+
+```text
+steps                                      3
+posterior_mass_mean                       0.6050
+posterior_mass_max_mean                   0.7230
+source_mass_mean                          0.7230
+label_consistent_ratio                    0.8750
+answer_coverage_mean                      0.8750
+positive_ratio                            0.6050
+num_actor_samples                         45.3333
+actor_powerflow_chunk_loss_target_only    1.0000
+actor_powerflow_loss                      0.5200
+actor_grad_norm                          26.6520
+gen                                      31.1797s
+chunk_state_chunks                        0.9267s
+chunk_state_score                         6.5837s
+chunk_state_ref                           1.9170s
+update_actor                              1.7457s
+```
+
+观察：
+
+- `actor/powerflow_chunk_loss_target_only=1.0` 三步全生效，说明 actor 端确实走 target-only 路径。
+- `chunk_state_probe/skipped_for_support_flow=1.0`，仍没有回到 short-probe teacher。
+- 日志中的 `boxed_reward_mean` 仍非零，是 trainer 为兼容现有 actor batch/metrics 继续写入 support-flow score；在 `target_only` 模式下它不进入 PowerFlow residual。
+- target 质量指标健康：`posterior_mass_mean=0.605`、`label_consistent_ratio=0.875`、`answer_coverage=0.875`。
+- 3-step 没有 final validation，不能判断 v15 的格式崩坏是否解决。
+
+下一步：
+
+- 跑同配置 20-step + final val，准入指标不只看 target 质量，还要看 `mean@16/maj@16/best@16` 与 validation sample 是否仍出现重复 `\boxed{}` 污染。
+
+## 2026-08-02 support-flow posterior-mass no-split v16 target-only 20-step
+
+目的：
+
+- 在 v16 smoke 通过后，跑同配置 20-step + final validation。
+- 核心约束保持不变：chunk target 由 full-rollout group posterior/support 主导，`chunk_state_probe/skipped_for_support_flow=1.0`，不回退到 short-horizon probe answer hit / source consistency teacher。
+- 只验证 `target_only + powerflow_use_boxed_reward=False` 是否能缓解 v15 的重复 `\boxed{}` 污染。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_supportflow_posteriormass_nosplit_v16_targetonly_20step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802.jsonl`
+- final val metrics: `important_experiment_logs/ttrl_chunk_state_powerflow_supportflow_posteriormass_nosplit_v16_targetonly_nonzeromid_c128_b32_r32_v64_20step_20260802_val_metrics.json`
+
+20-step 聚合：
+
+```text
+train metric                                mean       last
+gen                                      24.9589s   22.6930s
+chunk_state_chunks                       0.9611s    0.9870s
+chunk_state_score                        6.3705s    6.8710s
+chunk_state_ref                          0.6512s    0.5620s
+update_actor                             1.2432s    1.7930s
+posterior_mass_mean                      0.4485     0.4630
+posterior_mass_max_mean                  0.7184     0.7640
+source_mass_mean                         0.7346     0.7640
+positive_ratio                           0.4485     0.4630
+label_consistent_ratio                   0.8717     0.8750
+answer_coverage_mean                     0.8734     0.8750
+num_actor_samples                       32.0000    40.0000
+real_states                              4.0000     5.0000
+target_entropy                           1.5395     1.5140
+actor_powerflow_loss                     0.7099     0.2140
+actor_grad_norm                         21.3349    16.6950
+actor_powerflow_chunk_loss_target_only   1.0000     1.0000
+testing                                300.1980s  300.1980s
+```
+
+final validation:
+
+```text
+val-core/math/acc/mean@16           0.440250
+val-core/math/acc/maj@16/mean       0.560144
+val-core/math/acc/best@16/mean      0.840186
+format mean@16                      0.890125
+format maj@16                       0.855556
+format worst@16                     0.444788
+```
+
+与 v15 对比：
+
+```text
+metric                       v15 boxed    v16 target-only
+mean@16                      0.398375     0.440250
+maj@16                       0.502288     0.560144
+best@16                      0.804986     0.840186
+format mean@16               0.877750     0.890125
+format maj@16                0.837458     0.855556
+update_actor mean            1.2274s      1.2432s
+posterior_mass_mean          0.4724       0.4485
+label_consistent_ratio       0.8692       0.8717
+answer_coverage_mean         0.8733       0.8734
+```
+
+结论：
+
+- v16 相比 v15 有小幅恢复，说明去掉 `boxed_reward` residual、改成 target-only 是正确方向，但效果仍远低于可接受的 MV / PowerFlow 参考轨迹。
+- 训练侧速度不是主矛盾：`update_actor` 平均约 `1.24s`，chunk update 只有 128 token span，B200 上 actor 更新已经足够快。
+- target 语义已经基本符合当前纠偏：`support_flow + posterior_mass`、`posterior_split_duplicates=False`、`chunk_state_probe/skipped_for_support_flow=1.0`，没有让 short probe 局部命中信号做 teacher。
+- 但 final validation 仍出现严重重复 `\boxed{}` 和题面污染，raw log 中连续空 `\boxed{}` 片段约 4 万处；`format worst@16=0.4448` 也说明尾部样本退化很严重。
+- 因此，v16 失败点不再是“target 由 short probe 定义”，而是 PowerFlow-style chunk update 即便 target-only，也会在当前权重/目标形态下造成局部 continuation 分布漂移，模型学到重复 marker / prompt echo 的坏模式。
+
+下一步方向：
+
+- 不回退到 short-horizon probe teacher，也不继续加强 sourcegate/source consistency 硬约束。
+- 保留 full-rollout posterior/support target，但 actor update 要加 distribution-level guard：例如 KL-to-ref / entropy floor / repetition penalty mask / marker contamination filter / no-repeat boxed 负样本过滤。
+- target 不应只按 posterior mass sharpen，还要显式惩罚 malformed、repeated boxed、prompt echo、长重复片段，把这些作为 low-information 或 negative transition 过滤掉。
+- 20-step smoke 的准入门槛改成两类同时通过：target 质量指标健康，且 validation sample 无明显 repeated `\boxed{}`/prompt echo collapse。
