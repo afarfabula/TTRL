@@ -13787,3 +13787,117 @@ update_actor                       6.693s   6.785s   6.558s
 - v27 是当前 chunk/search-state 方向第一个语义更对齐的 smoke：训练对象变成“同一中后段 state 下的 suffix counterfactual continuation”，target 来自完整 completion 的 full-rollout support，而不是局部短 probe 命中或 source anchor。
 - 当前最值得扩展的是 v27 路线，不是继续加 source hard gate 或 next-chunk candidate width。
 - 下一步建议先做 v28 20-step pilot：保留 suffix-to-EOS 和 posterior-gain target，加入更强的 suffix candidate 去重/answer-stratified reweight，并把 suffix scorer 的答案抽取/化简并行化或缓存化，目标是在不改训练语义的情况下压低 6-9s scoring 开销。
+
+## 2026-08-02 suffix-level counterfactual support v28 answer-dedup 20-step pilot
+
+目的：
+
+- 扩展 v27 的 suffix-to-EOS search-state 路线到 20-step，并做 final validation。
+- 验证 answer-level duplicate split 是否能解决 v27 里 `answer_duplicate_ratio=0.56-0.66` 的问题，避免同一答案的多条 suffix 因采样频率过高而支配 PowerFlow target。
+- 保持用户修正后的训练语义：先由完整 rollout group 估计 prompt-level support，再从中后段 state 重采多条 suffix 到 EOS，用完整 completion 的最终 answer support/posterior gain 定义 target。source chunk/anchor 不作为 teacher。
+
+文件：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_suffixsupport_v28_dedup_mid_suffix_eos_b32_r32_v64_20step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_suffixsupport_v28_dedup_mid_suffix_eos_20step_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_suffixsupport_v28_dedup_mid_suffix_eos_b32_r32_v64_20step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_suffixsupport_v28_dedup_mid_suffix_eos_b32_r32_v64_20step_20260802.jsonl`
+- final val metrics: `important_experiment_logs/ttrl_chunk_state_powerflow_suffixsupport_v28_dedup_mid_suffix_eos_b32_r32_v64_20step_20260802_val_metrics.json`
+
+关键实现：
+
+- 新增配置：
+
+```text
+ttrl.chunk_state_suffix_support_split_duplicates
+ttrl.chunk_state_suffix_support_answer_split_power
+```
+
+- 当 `split_duplicates=True` 时，同一 state 内按最终抽取答案分组；每个答案使用该答案组内最大 support mass，再除以 `num_duplicates ** answer_split_power` 分配给重复 suffix。
+- `raw_mass_mean/raw_max_mass_mean` 继续记录未拆分的原始 support mass；`mass_mean/max_mass_mean` 记录拆分后的训练 target mass。
+- 新增 `unique_answer_ratio`，用于和 `answer_duplicate_ratio` 一起判断同一 state 下的 answer 多样性。
+
+关键配置：
+
+```text
+DATA_TRAIN_BATCH_SIZE=32
+N_SAMPLES_PER_PROMPT=32
+N_VOTES_PER_PROMPT=64
+VAL_N=16
+ttrl.chunk_state_score_mode=suffix_support
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_suffix_max_tokens=3072
+ttrl.chunk_state_suffix_support_score_type=posterior_gain
+ttrl.chunk_state_suffix_support_baseline_scale=0.5
+ttrl.chunk_state_suffix_support_gain_slack=0.02
+ttrl.chunk_state_suffix_support_split_duplicates=True
+ttrl.chunk_state_suffix_support_answer_split_power=1.0
+ttrl.chunk_state_boundary_mode=mid
+ttrl.chunk_state_mid_boundary_min_ratio=0.35
+ttrl.chunk_state_mid_boundary_max_ratio=0.75
+ttrl.chunk_state_full_rollout_guard_enable=True
+ttrl.chunk_state_full_rollout_guard_source_only_clean=True
+ttrl.chunk_state_future_support_keep_mode=soft
+ttrl.chunk_state_future_support_soft_weight_floor=0.20
+actor_rollout_ref.actor.powerflow_chunk_loss_mode=target_only
+actor_rollout_ref.actor.powerflow_use_boxed_reward=False
+actor_rollout_ref.actor.use_dynamic_bsz=False
+trainer.total_training_steps=20
+trainer.test_freq=20
+trainer.final_val_enable=True
+trainer.save_freq=-1
+```
+
+20-step 结果：
+
+```text
+训练稳定性：
+  正常完成 20 step + final validation
+  无 Traceback / RuntimeError / DataLoader worker killed
+
+final validation:
+  acc mean@16 = 0.529875
+  acc maj@16  = 0.667382
+  acc best@16 = 0.882996
+  format mean@16 = 0.914375
+  testing = 291.708s
+
+稳态 step 2-19 平均耗时：
+  full rollout gen              23.462s
+  suffix-to-EOS rollout         12.899s
+  suffix support scoring         7.133s
+  chunk-state ref logprob        2.924s
+  update_actor                   8.109s
+
+稳态 step 2-19 target 质量：
+  support_coverage_mean          0.789
+  oov_ratio                      0.211
+  positive_margin_mean          -0.181
+  state_keep_ratio               0.090
+  label_consistent_ratio         0.037
+  raw_positive_ratio             0.004
+  answer_duplicate_ratio         0.776
+  unique_answer_ratio            0.159
+  num_actor_samples avg          139.6
+  target_entropy                 2.007
+```
+
+观察：
+
+- v28 工程稳定，20-step pilot 能完整跑完并落 final val；这证明 suffix-to-EOS search-state 训练链路可以扩展到短程训练，不是只在 3-step smoke 里可用。
+- 指标很差：20-step 后 `mean@16=0.530`、`maj@16=0.667`，明显低于 MV/PowerFlow 相关基线，不是可继续扩 80-step 的候选。
+- answer-level duplicate split 没有解决核心问题，反而过度稀释了 target：`raw_mass_mean` 仍有 0.38-0.57 的有效 support，但拆分后 `mass_mean` 只有约 0.07-0.09，`positive_margin_mean` 全程为负，多个 step 出现 `state_keep_ratio=0`、`label_consistent_ratio=0`、target 接近均匀。
+- `answer_duplicate_ratio` 仍高达约 0.78，`unique_answer_ratio` 只有约 0.16，说明同一 state 下 suffix 到 EOS 的答案多样性不足；简单按重复答案均分 mass 会把少数有用 gain 也一起打散。
+- actor update 不是主要瓶颈：有效样本少时可降到 5-7s，稳态均值 8.1s。主要耗时仍是完整 rollout、suffix-to-EOS rollout、answer/support scoring 和 final validation。
+- v28 也暴露了一个重要算法边界：不能把“答案重复”当成纯坏信号硬拆。对于 math500 这类任务，同一 state 下多个 suffix 收敛到同一高 support answer 本身可能就是 search-improvement signal 的一部分；应该做 answer-level target aggregation，再把答案级 mass 回分给代表性 suffix，而不是把每个重复 suffix 都按 1/n 削弱。
+
+结论：
+
+- v28 是负结果，但对方向有价值：suffix-to-EOS search-state 语义是对的，answer duplicate split 的具体 target 设计不对。
+- 下一版不应继续 `split_duplicates=True, power=1.0` 这条路。更合理的是：
+  - 保留完整 rollout group 定义 prompt-level support。
+  - 保留 mid/late state + 多 suffix 到 EOS 的 counterfactual search。
+  - target 先在 answer level 聚合和 sharpen：`q(answer) ∝ exp(alpha * support_gain(answer)) * prior(answer)`。
+  - 再只把每个高质量 answer 的 mass 分给少量代表性 suffix，避免重复答案无限放大，也避免把正确答案簇完全压平。
+  - 对 `state_keep_ratio=0` / all-negative / high-OOV / high-duplicate-low-diversity state 直接跳过或降权，而不是训练近似均匀 target。
+- 实验节奏上，v28 不扩 80-step；下一步应做 v29 answer-level aggregated target 的 3-step smoke，再决定是否 20-step。

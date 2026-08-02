@@ -3080,6 +3080,10 @@ class RayPPOTrainer:
         baseline_scale = float(cfg.get("chunk_state_suffix_support_baseline_scale", 1.0))
         gain_slack = float(cfg.get("chunk_state_suffix_support_gain_slack", 0.0))
         min_positive_margin = float(cfg.get("chunk_state_suffix_support_min_positive_margin", 0.0))
+        split_duplicates = bool(cfg.get("chunk_state_suffix_support_split_duplicates", False))
+        answer_split_power = float(cfg.get("chunk_state_suffix_support_answer_split_power", 1.0))
+        if answer_split_power < 0.0:
+            raise ValueError("ttrl.chunk_state_suffix_support_answer_split_power must be non-negative")
         if score_type not in {"mass", "gain", "relative_gain", "posterior_gain"}:
             raise ValueError(f"Unsupported ttrl.chunk_state_suffix_support_score_type={score_type!r}")
 
@@ -3158,7 +3162,36 @@ class RayPPOTrainer:
             completion_lengths.append(float(response_ids.numel()))
 
         mass_matrix = torch.tensor(mass_values, dtype=torch.float32).view(len(state_prompts), candidates)
+        raw_mass_matrix = mass_matrix.clone()
         valid_matrix = torch.tensor(valid_values, dtype=torch.float32).view(len(state_prompts), candidates)
+        answer_matrix = np.asarray(answer_values, dtype=object).reshape(len(state_prompts), candidates)
+        duplicate_ratios = []
+        unique_answer_ratios = []
+        if split_duplicates:
+            dedup_mass_matrix = torch.zeros_like(mass_matrix)
+            for state_idx in range(len(state_prompts)):
+                answer_to_indices = defaultdict(list)
+                for candidate_idx in range(candidates):
+                    answer = str(answer_matrix[state_idx, candidate_idx])
+                    if answer == "None" or float(mass_matrix[state_idx, candidate_idx].item()) <= 0.0:
+                        continue
+                    answer_to_indices[answer].append(candidate_idx)
+                used = sum(len(indices) for indices in answer_to_indices.values())
+                if used:
+                    duplicate_ratios.append(1.0 - (len(answer_to_indices) / max(float(used), 1.0)))
+                    unique_answer_ratios.append(len(answer_to_indices) / max(float(candidates), 1.0))
+                for indices in answer_to_indices.values():
+                    answer_mass = mass_matrix[state_idx, indices].max()
+                    split_mass = answer_mass / (max(len(indices), 1) ** answer_split_power)
+                    for candidate_idx in indices:
+                        dedup_mass_matrix[state_idx, candidate_idx] = split_mass
+            mass_matrix = dedup_mass_matrix
+        else:
+            for state_idx in range(len(state_prompts)):
+                valid_answers = [str(answer) for answer in answer_matrix[state_idx] if str(answer) != "None"]
+                if valid_answers:
+                    duplicate_ratios.append(1.0 - (len(set(valid_answers)) / max(len(valid_answers), 1)))
+                    unique_answer_ratios.append(len(set(valid_answers)) / max(float(candidates), 1.0))
         source_mass = source_answer_mass.view(len(state_prompts), 1)
         baseline = (source_mass * baseline_scale).clamp(min=0.0, max=1.0)
         if score_type == "mass":
@@ -3184,13 +3217,6 @@ class RayPPOTrainer:
         sorted_scores = torch.sort(score_matrix, dim=-1, descending=True).values
         state_top_margin = sorted_scores[:, 0] - sorted_scores[:, 1] if candidates > 1 else sorted_scores[:, 0]
         future_support_soft_weight = (support_coverage * state_max_mass).clamp(min=0.0, max=1.0)
-
-        answer_matrix = np.asarray(answer_values, dtype=object).reshape(len(state_prompts), candidates)
-        duplicate_ratios = []
-        for state_idx in range(len(state_prompts)):
-            valid_answers = [str(answer) for answer in answer_matrix[state_idx] if str(answer) != "None"]
-            if valid_answers:
-                duplicate_ratios.append(1.0 - (len(set(valid_answers)) / max(len(valid_answers), 1)))
 
         state_prompts.non_tensor_batch["chunk_state_label_consistent"] = label_consistent.cpu().numpy().astype(
             np.float32
@@ -3230,6 +3256,8 @@ class RayPPOTrainer:
             "chunk_state_suffix_support/baseline_scale": baseline_scale,
             "chunk_state_suffix_support/gain_slack": gain_slack,
             "chunk_state_suffix_support/min_positive_margin": min_positive_margin,
+            "chunk_state_suffix_support/split_duplicates": float(split_duplicates),
+            "chunk_state_suffix_support/answer_split_power": answer_split_power,
             "chunk_state_suffix_support/source_mass_mean": source_answer_mass.mean().item()
             if len(source_answer_mass)
             else 0.0,
@@ -3240,6 +3268,12 @@ class RayPPOTrainer:
             if len(support_coverage)
             else 0.0,
             "chunk_state_suffix_support/oov_ratio": 1.0 - valid_matrix.mean().item() if len(valid_matrix) else 0.0,
+            "chunk_state_suffix_support/raw_mass_mean": raw_mass_matrix.mean().item()
+            if len(raw_mass_matrix)
+            else 0.0,
+            "chunk_state_suffix_support/raw_max_mass_mean": raw_mass_matrix.max(dim=-1).values.mean().item()
+            if len(raw_mass_matrix)
+            else 0.0,
             "chunk_state_suffix_support/mass_mean": mass_matrix.mean().item() if len(mass_matrix) else 0.0,
             "chunk_state_suffix_support/max_mass_mean": state_max_mass.mean().item() if len(state_max_mass) else 0.0,
             "chunk_state_suffix_support/score_mean": score_matrix.mean().item() if len(score_matrix) else 0.0,
@@ -3260,6 +3294,9 @@ class RayPPOTrainer:
             else 0.0,
             "chunk_state_suffix_support/answer_duplicate_ratio": float(np.mean(duplicate_ratios))
             if duplicate_ratios
+            else 0.0,
+            "chunk_state_suffix_support/unique_answer_ratio": float(np.mean(unique_answer_ratios))
+            if unique_answer_ratios
             else 0.0,
             "chunk_state_suffix_support/empty_answer_ratio": float(np.mean(empty_answer_values))
             if empty_answer_values

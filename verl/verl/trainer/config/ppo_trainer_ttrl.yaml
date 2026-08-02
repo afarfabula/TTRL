@@ -231,6 +231,8 @@ ttrl:
   chunk_state_suffix_support_baseline_scale: 1.0
   chunk_state_suffix_support_gain_slack: 0.0
   chunk_state_suffix_support_min_positive_margin: 0.0
+  chunk_state_suffix_support_split_duplicates: false
+  chunk_state_suffix_support_answer_split_power: 1.0
   # answer_source_consistency scores a candidate by whether its future probe
   # returns to the selected source rollout's final answer. This keeps each
   # chunk state tied to its own full-trajectory answer instead of any answer in
