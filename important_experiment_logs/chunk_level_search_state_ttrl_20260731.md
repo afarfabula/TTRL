@@ -10997,3 +10997,61 @@ mean  29.902   6.425        5.062      9.436
 - 保留上一版 `candidates=8 / anchors=7` 快链路，不继续靠更多 anchors 硬堆 coverage。
 - 可以只降低 prompt gate 到 `0.30`，保持 8 candidates，验证能否在不显著拖慢 actor update 的情况下把 real states 提到 20+。
 - 另一条更关键的设计方向是改 support anchor 选择/score，而不是数量：例如对 anchors 做 answer-level 去重、按 top answer support 分布分层采样，或者把 prompt-level support mass 转成 per-answer target distribution 后再投到 chunk anchors，避免 slots 被同答案/同质低增益 anchor 浪费。
+
+## 2026-08-02 support_flow mixed-source gate0.30 fast smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_mixedsource_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_mixedsource_gate030_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_mixedsource_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_mixedsource_gate030_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- dense-anchor 证明靠增加 candidate / anchor 数量会显著拖慢 actor update，且没有提高 full-support answer coverage。
+- 本轮回到 `candidates=8 / support_anchor_count=7` 快链路，只把 `min_prompt_top_mass` 从 `0.35` 降到 `0.30`，验证能否在不引入更多 actor samples 的情况下提高有效 state 数。
+- 仍然坚持 full-rollout support/value 定义 target：`chunk_state_probe/skipped_for_support_flow=1.0`，不使用 short-horizon probe/local answer hit/source consistency 作为 teacher。
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_min_prompt_top_mass=0.30
+ttrl.chunk_state_candidates=8
+ttrl.chunk_state_support_anchor_count=7
+ttrl.chunk_state_support_anchor_candidate_start=1
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_mass  pos_margin  ans_cov  anchor_inject  target_entropy
+1     24          192            0.092        0.216       0.750    0.857          1.962
+2     17          136            0.062        0.215       0.656    0.750          1.976
+3     20          160            0.058        0.355       0.693    0.792          1.949
+mean  20.3        162.7          0.071        0.262       0.700    0.800          1.962
+```
+
+耗时：
+
+```text
+step  gen      update_actor
+1     43.575   7.405
+2     23.176   5.110
+3     23.537   6.003
+mean  30.096   6.173
+```
+
+结论：
+
+- 不扩 20-step。`positive_margin_mean=0.262` 是正的，说明 mixed lower-source + support-flow gain 的方向仍然成立；但 `answer_coverage_mean=0.700`，低于进入 20-step 的 `0.75` 门槛。
+- `real_state` 均值从上一版 `18.0` 提到 `20.3`，说明降低 prompt gate 有帮助；但第 2 step 仍只有 `17/32`，state selection 还不稳定。
+- `update_actor` 均值 `6.17s`，比 dense-anchor 的 `9.44s` 明显好，但仍略高于当前希望的 `<6s` fast-chain 目标。第 2/3 step 已接近可接受区间。
+- 这次结果进一步支持最新判断：主矛盾不是 actor update 本身，而是 target support 质量。继续用 short-horizon probe/local answer hit 去判定 chunk 好坏会回到噪声 teacher；继续加 source hard gate 也会恶化 coverage/OOV。
+
+下一步：
+
+- 不再要求 chunk target 主要由短 probe 的局部命中信号定义；probe 只能作为 future answer distribution estimator。
+- full rollout group 先定义 prompt-level support/value；chunk 学的是哪个 local transition 会把未来分布推向这个 support/value。
+- 保留 source chunk 作为 prior / drift guard，但不作为 hard floor 或主要 teacher。
+- 优先改 support anchor selection/score：answer-level 去重、按 prompt answer support 分层采样、把 prompt-level answer support distribution 投影到 anchors，减少同答案/低增益 anchor 占用 slot。
