@@ -10940,3 +10940,60 @@ mean  32.946   6.316        3.464      5.512
 - 不回退到 short probe teacher，也不继续加 source-side hard gate。
 - 下一轮做更温和的 mixed-source：降低 prompt top-mass gate 到 `0.30` 或 `0.25` 以提高 real states；同时把 `candidates` 增到 `12`、support anchors 增到 `11`，用 B200 显存换更高 full-support anchor coverage。
 - 目标是保持 `positive_margin_mean > 0`，同时把 `real_state >= 20/32`、`answer_coverage >= 0.75`、`update_actor < 6s` 稳住；过这个 3-step gate 才扩 20-step。
+
+## 2026-08-02 support_flow mixed-source dense-anchor smoke
+
+实验：
+
+- launcher: `verl/run_records/ttrl_chunk_state_powerflow_support_flow_mixedsource_denseanchor_softplusgain_mid_c128_b32_r32_v64_3step_20260802.sh`
+- 前台 worker helper: `verl/run_records/run_front_support_flow_mixedsource_denseanchor_softplusgain_smoke_20260802.sh`
+- raw log: `important_experiment_logs/ttrl_chunk_state_powerflow_support_flow_mixedsource_denseanchor_softplusgain_mid_c128_b32_r32_v64_3step_20260802.log`
+- diag: `important_experiment_logs/chunk_state_diag/ttrl_chunk_state_powerflow_support_flow_mixedsource_denseanchor_softplusgain_mid_c128_b32_r32_v64_3step_20260802.jsonl`
+
+设计动机：
+
+- 上一版 mixed-source 已经把 `positive_margin_mean` 拉正，但 `real_state` 和 `answer_coverage` 不稳。
+- 本轮不改变 target 语义，仍然使用 full-rollout support anchors + `softplus_gain`，不使用 short probe teacher。
+- 只做一个密集 anchor ablation：`min_prompt_top_mass` 从 `0.35` 降到 `0.30`，`candidates` 从 `8` 增到 `12`，support anchors 从 `7` 增到 `11`，检查 B200 大显存能否直接换来更高 support coverage。
+
+关键配置差异：
+
+```text
+ttrl.chunk_state_min_prompt_top_mass=0.30
+ttrl.chunk_state_candidates=12
+ttrl.chunk_state_support_anchor_count=11
+ttrl.chunk_state_support_anchor_candidate_start=1
+```
+
+三步质量汇总：
+
+```text
+step  real_state  actor_samples  source_mass  pos_margin  ans_cov  anchor_inject  target_entropy
+1     24          288            0.092        0.216       0.663    0.723          2.349
+2     21          248            0.086        0.304       0.653    0.712          2.335
+3     19          224            0.078        0.315       0.663    0.723          2.320
+mean  21.3        253.3          0.085        0.278       0.660    0.719          2.335
+```
+
+耗时：
+
+```text
+step  gen      chunk_score  chunk_ref  update_actor
+1     43.432   7.455        8.202      11.015
+2     22.806   5.902        3.642      9.035
+3     23.468   5.917        3.341      8.257
+mean  29.902   6.425        5.062      9.436
+```
+
+结论：
+
+- 这是负向 ablation，不扩 20-step。
+- 降低 prompt gate 后 `real_state` 从上一版均值 `18.0` 提到 `21.3`，说明有效 state 数可以通过 prompt gate 调整改善。
+- 但增加 candidate / support anchor 没有提高 support coverage：`answer_coverage_mean` 从上一版 `0.674` 降到 `0.660`，`anchor_injected_ratio` 也从 `0.770` 降到 `0.719`。原因是同 prompt 的 valid support answer 数有限，增加 slots 只会放入更多低 mass anchors 或空位。
+- 代价明显变大：`num_actor_samples` 从 `144` 增到 `253`，`update_actor` 从 `5.51s` 增到 `9.44s`。这违背当前 fast-chain 目标。
+
+下一步：
+
+- 保留上一版 `candidates=8 / anchors=7` 快链路，不继续靠更多 anchors 硬堆 coverage。
+- 可以只降低 prompt gate 到 `0.30`，保持 8 candidates，验证能否在不显著拖慢 actor update 的情况下把 real states 提到 20+。
+- 另一条更关键的设计方向是改 support anchor 选择/score，而不是数量：例如对 anchors 做 answer-level 去重、按 top answer support 分布分层采样，或者把 prompt-level support mass 转成 per-answer target distribution 后再投到 chunk anchors，避免 slots 被同答案/同质低增益 anchor 浪费。
