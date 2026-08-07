@@ -1,0 +1,15 @@
+{
+  "model": "/tmp/Qwen3-30B-A3B-Base",
+  "data": "/mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT/test.parquet",
+  "total": 16,
+  "correct": 5,
+  "acc": 0.3125,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "max_tokens": 512,
+  "max_model_len": 1536,
+  "tp": 2,
+  "batch_size": 8,
+  "elapsed_s": 104.16998219490051,
+  "out_jsonl": "/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/qwen3_30b_a3b_expertsample_math500_smoke16_outputs.jsonl"
+}

@@ -1,0 +1,29 @@
+{
+  "model": "/tmp/Qwen3-30B-A3B-Base",
+  "data": "/mlx_devbox/users/quyanyi/playground/TTRL/verl/data/GPQA-TTT/test.json",
+  "total": 198,
+  "sample_total": 3168,
+  "correct": 177,
+  "sample_correct": 915,
+  "acc": 0.28882575757575757,
+  "mean_acc": 0.28882575757575757,
+  "pass@16": 0.8939393939393939,
+  "pass_at_n": 0.8939393939393939,
+  "n": 16,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "max_tokens": 512,
+  "max_model_len": 4096,
+  "tp": 2,
+  "batch_size": 8,
+  "enforce_eager": false,
+  "expert_sample": {
+    "enabled": true,
+    "keep_head": "5",
+    "pool": "32",
+    "tau": "0.5",
+    "seed": null
+  },
+  "elapsed_s": 1416.639634847641,
+  "out_jsonl": "/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/qwen3_30b_a3b_expertsample_k5_pool32_tau05_stochastic_gpqa_n16_mlen4096_outputs.jsonl"
+}

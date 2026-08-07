@@ -1,0 +1,73 @@
+{
+  "run_id": "ttrl_math500_paper_b32_20260714_101500",
+  "purpose": "Paper-style TTRL Qwen2.5-Math-7B math500 reproduction for reported mean@16=83.4.",
+  "model": "/models/Qwen2.5-Math-7B",
+  "train_data": "/mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT/train.parquet",
+  "val_data": "/mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT/test.parquet",
+  "runtime_log": "/tmp/ttrl_b200/logs/ttrl_math500_paper_b32_20260714_101500.log",
+  "runtime_log_sha256": "e4d0df3dc6bbfd76c9780794b5d017df1bbf36666946734cb72bf5c8ab223b88",
+  "runtime_log_size_bytes": 121092624,
+  "checkpoint": "/tmp/ttrl_b200/checkpoints/ttrl_math500_paper_b32_20260714_101500/global_step_150",
+  "checkpoint_size": "86G",
+  "checkpoint_file_count": 26,
+  "persistent_run_script": "/mlx_devbox/users/quyanyi/playground/TTRL/verl/run_records/ttrl_math500_paper_b32_20260714_101500.sh",
+  "run_script_sha256": "393f706ea2797a5fdfc45d247895d869b036c0b546905db74db821ea785b1a91",
+  "config": {
+    "data.train_batch_size": 32,
+    "trainer.total_epochs": 10,
+    "trainer.total_training_steps": null,
+    "computed_total_training_steps": 150,
+    "ttrl.n_votes_per_prompt": 64,
+    "ttrl.n_samples_per_prompt": 32,
+    "data.max_prompt_length": 1024,
+    "data.max_response_length": 3072,
+    "actor_rollout_ref.rollout.temperature": 1.0,
+    "actor_rollout_ref.rollout.val_kwargs.n": 16,
+    "actor_rollout_ref.rollout.val_kwargs.temperature": 0.6,
+    "actor_rollout_ref.rollout.val_kwargs.top_p": 0.95,
+    "actor_rollout_ref.actor.ppo_mini_batch_size": 1,
+    "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 2,
+    "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu": 2,
+    "actor_rollout_ref.ref.fsdp_config.param_offload": true,
+    "trainer.test_freq": 20,
+    "trainer.save_freq": 2000000,
+    "trainer.val_before_train": false,
+    "trainer.resume_mode": "disable"
+  },
+  "validation": [
+    {"step": 20, "mean_at_16": 0.763, "maj_at_16_mean": 0.825, "best_at_16_mean": 0.912, "testing_s": 277.822, "step_s": 362.003},
+    {"step": 40, "mean_at_16": 0.801, "maj_at_16_mean": 0.849, "best_at_16_mean": 0.911, "testing_s": 284.416, "step_s": 380.657},
+    {"step": 60, "mean_at_16": 0.810, "maj_at_16_mean": 0.846, "best_at_16_mean": 0.899, "testing_s": 289.357, "step_s": 393.418},
+    {"step": 80, "mean_at_16": 0.824, "maj_at_16_mean": 0.852, "best_at_16_mean": 0.889, "testing_s": 289.366, "step_s": 398.215},
+    {"step": 100, "mean_at_16": 0.826, "maj_at_16_mean": 0.853, "best_at_16_mean": 0.881, "testing_s": 287.431, "step_s": 406.777},
+    {"step": 120, "mean_at_16": 0.827, "maj_at_16_mean": 0.853, "best_at_16_mean": 0.884, "testing_s": 292.022, "step_s": 404.558},
+    {"step": 140, "mean_at_16": 0.830, "maj_at_16_mean": 0.853, "best_at_16_mean": 0.887, "testing_s": 293.124, "step_s": 423.055},
+    {"step": 150, "mean_at_16": 0.8275, "maj_at_16_mean": 0.853, "best_at_16_mean": 0.885, "testing_s": 290.875, "step_s": 435.625}
+  ],
+  "summary": {
+    "final_mean_at_16": 0.8275,
+    "final_maj_at_16_mean": 0.853,
+    "final_best_at_16_mean": 0.885,
+    "peak_mean_at_16": 0.830,
+    "peak_mean_step": 140,
+    "reported_target_mean_at_16": 0.834,
+    "peak_gap_to_target": 0.004,
+    "plain_step_count": 142,
+    "plain_step_avg_s": 108.89397887323943,
+    "plain_step_median_s": 108.6275,
+    "progress_wall_time": "5:11:28"
+  },
+  "health": {
+    "training_process_exited": true,
+    "gpu_memory_released": true,
+    "tmp_disk_end": "3.5T total, 377G used, 2.9T available, 12%",
+    "fatal_markers_in_final_log_tail": {
+      "RayTaskError": false,
+      "OutOfMemoryError": false,
+      "CUDA out of memory": false,
+      "No space left": false,
+      "Error executing job": false,
+      "RuntimeError:": false
+    }
+  }
+}

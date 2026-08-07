@@ -1,0 +1,29 @@
+{
+  "model": "/tmp/Qwen3-30B-A3B-Base",
+  "data": "/mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT/test.parquet",
+  "total": 500,
+  "sample_total": 8000,
+  "correct": 356,
+  "sample_correct": 2767,
+  "acc": 0.345875,
+  "mean_acc": 0.345875,
+  "pass@16": 0.712,
+  "pass_at_n": 0.712,
+  "n": 16,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "max_tokens": 512,
+  "max_model_len": 1536,
+  "tp": 2,
+  "batch_size": 8,
+  "enforce_eager": false,
+  "expert_sample": {
+    "enabled": true,
+    "keep_head": "7",
+    "pool": "16",
+    "tau": "0.5",
+    "seed": "2026020243"
+  },
+  "elapsed_s": 4214.06787276268,
+  "out_jsonl": "/mlx_devbox/users/quyanyi/playground/TTRL/important_experiment_logs/qwen3_30b_a3b_expertsample_k7_pool16_tau05_math500_n16_full_outputs.jsonl"
+}
