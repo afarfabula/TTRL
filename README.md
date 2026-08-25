@@ -185,6 +185,40 @@ Test-Time RL / GRPO 数学推理后训练：基于 TTRL/verl 构建无 GT 测试
 扩展到 Qwen3-30B-A3B MoE：完成 Base checkpoint 的 MATH500/GPQA n=16 评测与 vLLM Expert-Sample router patch，验证本地 Base 模型下 Expert-Sample 未复现 headline gain；同时打通 2xB200 Qwen3-30B-A3B TTRL smoke，定位 FSDP1 optimizer offload 不足与 FSDP2 offload 的可行边界。
 ```
 
+## 训练链路吞吐与稳定性优化
+
+这部分可以作为简历里 Claim 1 的 infra 追问展开：目标不是盲目调快，而是在不改变 TTRL/GRPO 训练语义的前提下，把 Qwen2.5-Math-7B + MATH500 的 8xB200 实验变成可重复迭代的高吞吐闭环。
+
+### 关键优化与取舍
+
+| 方向 | 做法 | 结果 / 结论 |
+| --- | --- | --- |
+| B200 单机 8 卡环境固化 | 固定 Python venv、CUDA/Ray/vLLM/verl 路径，使用短 `/tmp` runtime 目录规避 Ray Unix socket 路径过长问题 | 环境可复用，避免每次实验重新排查依赖和运行目录 |
+| vLLM rollout 快路径 | 保留 vLLM `FLASH_ATTN` backend、CUDA graph capture、fused Triton kernels；不用 `import flash_attn` 作为唯一判断标准 | Qwen2.5-Math-7B rollout generation 稳定在可迭代范围内，日志中保留 backend 和 step timing |
+| NCCL / Ray 稳定化 | 单机 B200 使用 `TTRL_FORCE_LOCAL_NCCL=1`、`NCCL_NVLS_ENABLE=1`、`NCCL_P2P_DISABLE=0`、`NCCL_IB_DISABLE=1`、`NCCL_SOCKET_IFNAME=\"=eth0\"`、`RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` | 降低多进程/Ray/vLLM 混合训练中的通信和设备可见性问题 |
+| 80-step 快速迭代预算 | 从 150-step paper-style run 中抽取 80-step gate：step80 已接近最终主趋势 | 80-step 约 `2.5-2.6h`，适合作为新 reward / target 的中期筛选点 |
+| validation 成本拆分 | 单独记录 `timing_s/testing`，避免把 validation step 当成普通训练 step | step80 validation 约 `289s`，普通非 validation step 约 `109-113s`，便于判断真实训练吞吐 |
+| actor dynamic batch 审计 | 代码审计发现 dynamic batch 先算 microbatch scalar loss 再按 sample count 缩放，response length 不同时会改变 token-level loss 权重 | 不把 actor dynamic batch 作为默认吞吐优化；报告实验保持 `actor.use_dynamic_bsz=False` |
+| old-logprob 复用 guardrail | 加 `training/rollout_probs_diff_max/mean/std` 监控，只有 diff 持续为 `0.000` 时才把 rollout logprob 复用视为语义安全 | 在 sharpened MV-anchor run 中 diff monitor 保持 0，减少重复 logprob 路径的不确定性 |
+| fixed microbatch / ref microbatch 探索 | 只允许固定 microbatch 变大这类低风险优化，并要求用 fixed-batch loss/gradient/parameter-delta 等价性验证 | 明确区分“语义安全优化”和“可能改变训练结果的吞吐优化” |
+| chunk-state 短 span actor update | 把 chunk target 写入 `powerflow_flat_weights`，用 hardfilter/clip4/nonzero-mid 控制 actor batch 密度和权重尖峰 | 多轮 chunk-state smoke 中 `update_actor` 可稳定到约 `1.0-3.3s`，说明 actor update 不是主要瓶颈 |
+| bottleneck attribution | 对 `gen/reward/ref/update_actor/testing/throughput` 做结构化记录 | 能判断瓶颈主要在 full rollout generation、math verifier / support scoring、validation，而不是单纯 actor update |
+
+### 可写进简历的 infra 表述
+
+```text
+训练链路吞吐与稳定性优化：在 8xB200 上搭建 Qwen2.5-Math-7B TTRL/MATH500 高吞吐实验环境，固化 Python/CUDA/Ray/vLLM/verl 运行栈和短路径 Ray runtime，配置 vLLM FLASH_ATTN、CUDA graph、Triton fused kernels、NCCL NVLS/P2P 与本地通信参数；将训练日志拆分为 rollout generation、reward/verifier、reference logprob、actor update、validation 和 throughput 指标，建立 80-step gate 作为约 2.5-2.6 小时的算法迭代预算。针对 actor dynamic batch、fixed microbatch、old-logprob reuse、ref/rollout logprob microbatch 等吞吐优化做语义审计，发现 dynamic batch 会因 sample-count 缩放改变 token-level GRPO loss 权重，因此默认禁用；通过 rollout_probs_diff monitor 验证 old-logprob 复用语义安全。chunk-state 方向通过 hardfilter/clip4/nonzero-mid 等机制将短 span actor update 控制到约 1-3s，最终定位系统瓶颈主要在 full rollout generation、verifier/scoring 和 validation，而非 actor update 本身。
+```
+
+### 证据文档
+
+- 环境与运行手册：`important_experiment_logs/B200_ENV_USAGE.md`
+- MV baseline 与 dynamic batch 语义审计：`important_experiment_logs/mv_b32_r32_v64_infra_semantics_20260731.md`
+- chunk-state 24h 吞吐/稳定性审计：`important_experiment_logs/chunk_level_search_state_ttrl_24h_audit_20260801.md`
+- chunk/suffix 长进展记录：`important_experiment_logs/chunk_level_search_state_ttrl_20260731.md`
+- sharpened MV-anchor timing 与 old-logprob diff：`important_experiment_logs/sharpened_mvanchor_soft002_seedfix_20260731.md`
+- full-rollout step timing 与 target health：`important_experiment_logs/full_rollout_ttrl_12h_progress_20260802.md`
+
 更短的英文 bullet：
 
 ```text
