@@ -7,13 +7,23 @@ PYTHON_BIN="${PYTHON_BIN:-$WORKSPACE_DIR/.venvs/ttrl_b200/bin/python}"
 TTRL_RUNTIME_DIR="${TTRL_RUNTIME_DIR:-/tmp/ttrl_b200/runtime}"
 MODEL_DIR="${BACKBONE_PATH:-/models/Qwen2.5-Math-7B}"
 
-export LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:$WORKSPACE_DIR/.venvs/ttrl_b200/lib/python3.11/site-packages/nvidia/cu13/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-export CUDA_HOME="$WORKSPACE_DIR/.venvs/ttrl_b200/lib/python3.11/site-packages/nvidia/cu13"
+DEFAULT_CUDA_HOME="$WORKSPACE_DIR/.venvs/ttrl_b200/lib/python3.11/site-packages/nvidia/cu13"
+CUDA_HOME="${CUDA_HOME:-$DEFAULT_CUDA_HOME}"
+DEFAULT_VENV_LIB="$WORKSPACE_DIR/.venvs/ttrl_b200/lib/python3.11/site-packages/nvidia/cu13/lib"
+VENV_CUDA_LIB_PATH="${VENV_CUDA_LIB_PATH:-$DEFAULT_VENV_LIB}"
+export LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:$VENV_CUDA_LIB_PATH:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export CUDA_HOME
 export PATH="$CUDA_HOME/bin:$PATH"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+VLLM_ATTENTION_BACKEND_CFG="${VLLM_ATTENTION_BACKEND_CFG-FLASH_ATTN}"
 unset VLLM_USE_V1
 
 "$PYTHON_BIN" "$ROOT_DIR/scripts/check_hf_model_ready.py" "$MODEL_DIR"
+
+EXTRA_ROLLOUT_ARGS=()
+if [[ -n "$VLLM_ATTENTION_BACKEND_CFG" ]]; then
+  EXTRA_ROLLOUT_ARGS+=(actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config.backend="$VLLM_ATTENTION_BACKEND_CFG")
+fi
 
 BACKBONE="${BACKBONE:-Qwen2.5-Math-7B}" \
 BACKBONE_PATH="$MODEL_DIR" \
@@ -32,7 +42,9 @@ TP_SIZE="${TP_SIZE:-1}" \
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}" \
 REF_PARAM_OFFLOAD="${REF_PARAM_OFFLOAD:-False}" \
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-32768}" \
-ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-True}" \
+# Keep actor dynamic batching opt-in: the current implementation changes microbatch loss weighting.
+ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-False}" \
+ACTOR_USE_KL_LOSS="${ACTOR_USE_KL_LOSS:-True}" \
 ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-8192}" \
 SAVE_FREQ="${SAVE_FREQ:--1}" \
 TEST_FREQ="${TEST_FREQ:--1}" \
@@ -55,7 +67,7 @@ TTRL_RUNTIME_DIR="$TTRL_RUNTIME_DIR" \
 bash "$ROOT_DIR/examples/ttrl/Qwen2.5-Math/math500_local.sh" \
   actor_rollout_ref.model.use_fused_kernels=True \
   actor_rollout_ref.model.fused_kernel_options.impl_backend=triton \
-  actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config.backend=FLASH_ATTN \
+  "${EXTRA_ROLLOUT_ARGS[@]}" \
   reward_model.reward_manager=prime \
   reward_model.num_processes=128 \
   ttrl.majority_vote_num_processes=64 \

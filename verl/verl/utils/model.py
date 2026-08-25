@@ -472,14 +472,25 @@ def load_megatron_gptmodel_weights(
     config, model_config, parallel_model, params_dtype, is_value_model=False, local_cache_path="~/.cache/verl/rlhf"
 ):
     """Load weights for mcore GPT model."""
-    _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model, local_cache_path)
+    from megatron.core import parallel_state as mpu
+
+    from verl.models.mcore.saver import _megatron_calc_global_rank
+
+    src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=mpu.get_context_parallel_rank())
+    if torch.distributed.get_rank() == src_rank:
+        _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model, local_cache_path)
+        hf_config = model.config
+    else:
+        model = None
+        state_dict = {}
+        hf_config = model_config
 
     from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
 
     load_state_dict_to_megatron_gptmodel(
         state_dict=state_dict,
         wrapped_models=parallel_model,
-        config=model.config,
+        config=hf_config,
         params_dtype=params_dtype,
         is_value_model=is_value_model,
     )

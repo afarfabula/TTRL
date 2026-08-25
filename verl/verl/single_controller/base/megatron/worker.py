@@ -16,8 +16,8 @@ from verl.single_controller.base.worker import DistGlobalInfo, DistRankInfo, Wor
 
 
 class MegatronWorker(Worker):
-    def __init__(self, cuda_visible_devices=None) -> None:
-        super().__init__(cuda_visible_devices)
+    def __init__(self, cuda_visible_devices=None, _verl_runtime_env_vars=None) -> None:
+        super().__init__(cuda_visible_devices, _verl_runtime_env_vars=_verl_runtime_env_vars)
 
     def get_megatron_global_info(self):
         from megatron.core import parallel_state as mpu

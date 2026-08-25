@@ -19,6 +19,7 @@ from typing import List, Tuple
 import torch
 from torch import distributed as dist
 
+from verl import DataProto
 from verl.utils.device import get_device_name
 
 
@@ -253,6 +254,7 @@ def rearrange_micro_batches(
     num_batches_divided_by=None,
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
+    use_dynamic_bsz_balance=True,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -264,6 +266,7 @@ def rearrange_micro_batches(
         num_batches_divided_by (optional): virtual pipeline parallel size, for megatron.
         same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
+        use_dynamic_bsz_balance (bool): accepted for compatibility with older verl APIs.
 
     Returns:
         List[TensorDict]: the micro-batches.
@@ -322,3 +325,30 @@ def get_reverse_idx(idx_map):
         reverse_idx_map[idx] = i
 
     return reverse_idx_map
+
+
+def prepare_dynamic_batch(
+    data: DataProto,
+    max_token_len: int,
+    dp_group=None,
+    num_batches_divided_by=None,
+    same_micro_num_in_dp=True,
+    min_num_micro_batch=None,
+    use_dynamic_bsz_balance=True,
+) -> tuple[list[DataProto], list[list[int]]]:
+    batch, batch_idx_list = rearrange_micro_batches(
+        data.batch,
+        max_token_len=max_token_len,
+        dp_group=dp_group,
+        num_batches_divided_by=num_batches_divided_by,
+        same_micro_num_in_dp=same_micro_num_in_dp,
+        min_num_micro_batch=min_num_micro_batch,
+        use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+    )
+    micro_batches = []
+    for i, batch_idx in enumerate(batch_idx_list):
+        tensors = dict(batch[i])
+        non_tensors = {key: value[batch_idx] for key, value in data.non_tensor_batch.items()}
+        meta_info = copy.deepcopy(data.meta_info)
+        micro_batches.append(DataProto.from_dict(tensors, non_tensors, meta_info=meta_info))
+    return micro_batches, batch_idx_list

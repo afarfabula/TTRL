@@ -1,0 +1,10 @@
+MODEL_READY: /models/Qwen2.5-Math-7B
+Using python: /mlx_devbox/users/quyanyi/playground/.venvs/ttrl_b200/bin/python
+Using model: /models/Qwen2.5-Math-7B
+Using data: /mlx_devbox/users/quyanyi/playground/TTRL/verl/data/MATH-TTT
+Output directory: /tmp/ttrl_b200/checkpoints/ttrl_chunk_state_powerflow_support_anchor_diagoff_novallog_mid_c128_b32_r32_v64_20step_20260801
+Actor offload: param=False optimizer=False activation=False
+Rollout: free_cache_engine=False enforce_eager=False gpu_memory_utilization=0.82
+Critic offload: param=False optimizer=False activation=False
+/mlx_devbox/users/quyanyi/playground/TTRL/verl/verl/__init__.py:18: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources

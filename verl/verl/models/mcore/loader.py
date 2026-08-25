@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 
 import torch
@@ -65,6 +66,10 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
 
     start_time = time.time()
 
+    def _stage_log(message):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        print(f"[mcore-loader-stage rank={rank}] {message}", flush=True)
+
     def _get_gpt_model(model):
         return model
 
@@ -80,10 +85,36 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
     src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=cp_rank)
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
-    mp_group = mpu.get_model_parallel_group()
+    if torch.distributed.get_rank() == src_rank:
+        state_dict_keys = set(state_dict.keys())
+    else:
+        state_dict_keys = None
+    obj_list = [state_dict_keys]
+    dist.broadcast_object_list(obj_list, src=src_rank)
+    state_dict_keys = obj_list[0]
+
+    is_moe_state_dict = "model.layers.0.mlp.experts.0.gate_proj.weight" in state_dict_keys
+    if is_moe_state_dict:
+        # The HF checkpoint is loaded on a single global source rank. With EP enabled,
+        # attention weights are replicated across EP ranks and expert weights are
+        # sharded by TP x EP, so every rank must participate in the same ordered
+        # collectives. Use the world group here; local Megatron groups do not all
+        # contain global src_rank and can deadlock or abort when only part of the
+        # worker set enters the loader.
+        mp_group = None
+    else:
+        mp_group = mpu.get_model_parallel_group()
+    if is_moe_state_dict:
+        _stage_log(
+            "detected_moe_state_dict "
+            f"tp={mpu.get_tensor_model_parallel_world_size()} "
+            f"ep={mpu.get_expert_model_parallel_world_size()} "
+            f"etp={mpu.get_expert_tensor_parallel_world_size()}"
+        )
 
     if torch.distributed.get_rank() == src_rank:
-        assert mp_group.rank() == 0, f"mp_rank:[{mp_group.rank}] != 0 on rank #0"
+        if mp_group is not None:
+            assert mp_group.rank() == 0, f"mp_rank:[{mp_group.rank}] != 0 on rank #0"
         assert pp_rank == 0, f"pp_rank:[{pp_rank}] != 0 on rank #0"
         assert dp_rank == 0, f"dp_rank:[{dp_rank}] != 0 on rank #0"
 
@@ -380,7 +411,143 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             if (i == tp_rank) and (tensor is not None):
                 tensor.data.copy_(sync_tensor)
 
-    if dp_rank == 0:
+    def _get_moe_post_attention_layernorm(sync_layer):
+        if hasattr(sync_layer, "pre_mlp_layernorm"):
+            return getattr(sync_layer.pre_mlp_layernorm, "weight", None)
+        linear_fc1 = getattr(getattr(sync_layer, "mlp", None), "linear_fc1", None)
+        return getattr(linear_fc1, "layer_norm_weight", None)
+
+    def _get_te_grouped_expert_param(sync_layer, linear_name, local_expert_idx):
+        experts = getattr(getattr(sync_layer, "mlp", None), "experts", None)
+        linear = getattr(experts, linear_name, None)
+        if linear is not None and hasattr(linear, f"weight{local_expert_idx}"):
+            return getattr(linear, f"weight{local_expert_idx}")
+        return None
+
+    def _get_legacy_grouped_expert_param(sync_layer, weight_name, local_expert_idx, expected_shape):
+        experts = getattr(getattr(sync_layer, "mlp", None), "experts", None)
+        packed_weight = getattr(experts, weight_name, None)
+        if packed_weight is None:
+            return None
+        if weight_name == "weight1":
+            view = packed_weight.view(packed_weight.shape[0], -1)
+            local_width = expected_shape[1]
+            start = local_expert_idx * local_width
+            return view[:, start : start + local_width]
+        view = packed_weight.view(-1, packed_weight.shape[-1])
+        local_height = expected_shape[0]
+        start = local_expert_idx * local_height
+        return view[start : start + local_height, :]
+
+    def _get_moe_expert_param(sync_layer, local_expert_idx, is_fc1, expected_shape):
+        if is_fc1:
+            param = _get_te_grouped_expert_param(sync_layer, "linear_fc1", local_expert_idx)
+            if param is not None:
+                return param
+            return _get_legacy_grouped_expert_param(sync_layer, "weight1", local_expert_idx, expected_shape)
+        param = _get_te_grouped_expert_param(sync_layer, "linear_fc2", local_expert_idx)
+        if param is not None:
+            return param
+        return _get_legacy_grouped_expert_param(sync_layer, "weight2", local_expert_idx, expected_shape)
+
+    def _copy_shard_to_param(param, shard, name):
+        if param.shape == shard.shape:
+            param.data.copy_(shard)
+            return
+        if param.shape == shard.t().shape:
+            param.data.copy_(shard.t())
+            return
+        raise AssertionError(
+            f"rank #{torch.distributed.get_rank()} tensor {name} shape {param.shape} "
+            f"!= shard {shard.shape} or transposed {shard.t().shape}"
+        )
+
+    def _broadcast_moe_expert_tensor(tensor, full_weight, name, chunk_dim, owner_ep_rank):
+        """Broadcast one global expert tensor shard; only its owner EP rank copies it."""
+        nonlocal mp_group
+        etp_rank = mpu.get_expert_tensor_parallel_rank()
+        etp_size = mpu.get_expert_tensor_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+
+        if torch.distributed.get_rank() == src_rank:
+            if full_weight is None:
+                chunk_shape = None
+            else:
+                tensor_chunk = torch.chunk(full_weight, etp_size, dim=chunk_dim)
+                chunk_shape = tensor_chunk[0].shape
+        else:
+            tensor_chunk = None
+            chunk_shape = None
+
+        obj_list = [chunk_shape]
+        dist.broadcast_object_list(obj_list, src=src_rank, group=mp_group)
+        chunk_shape = obj_list[0]
+        if chunk_shape is None:
+            print_rank_0(f"moe expert tensor:[{name}] not in state_dict, skip loading")
+            return
+
+        sync_tensor = torch.empty(chunk_shape, dtype=params_dtype, device=get_device_id(), requires_grad=False)
+        for i in range(etp_size):
+            if torch.distributed.get_rank() == src_rank:
+                sync_tensor.data.copy_(tensor_chunk[i])
+            dist.broadcast(sync_tensor, src=src_rank, group=mp_group)
+            if i == etp_rank and ep_rank == owner_ep_rank and tensor is not None:
+                _copy_shard_to_param(tensor, sync_tensor, name)
+
+    def _broadcast_moe_experts(sync_layer, layer_name, copy_to_this_pp_rank):
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        num_experts = getattr(config, "num_experts", None)
+        if num_experts is None:
+            num_experts = getattr(config, "n_routed_experts", None)
+        assert num_experts is not None, "MoE state_dict detected but HF config has no num_experts"
+        assert num_experts % ep_size == 0, f"num_experts={num_experts} must be divisible by ep_size={ep_size}"
+        num_local_experts = num_experts // ep_size
+        etp_size = mpu.get_expert_tensor_parallel_world_size()
+        moe_intermediate_size = getattr(config, "moe_intermediate_size", None)
+        if moe_intermediate_size is None:
+            moe_intermediate_size = getattr(config, "intermediate_size", None)
+        assert moe_intermediate_size is not None, "MoE state_dict detected but HF config has no MoE intermediate size"
+        assert (2 * moe_intermediate_size) % etp_size == 0
+        assert moe_intermediate_size % etp_size == 0
+        fc1_shape = (2 * moe_intermediate_size // etp_size, config.hidden_size)
+        fc2_shape = (config.hidden_size, moe_intermediate_size // etp_size)
+
+        for local_expert_idx in range(num_local_experts):
+            for owner_ep_rank in range(ep_size):
+                global_expert_idx = owner_ep_rank * num_local_experts + local_expert_idx
+                gate_name = f"{layer_name}.mlp.experts.{global_expert_idx}.gate_proj.weight"
+                up_name = f"{layer_name}.mlp.experts.{global_expert_idx}.up_proj.weight"
+                down_name = f"{layer_name}.mlp.experts.{global_expert_idx}.down_proj.weight"
+
+                if torch.distributed.get_rank() == src_rank:
+                    gate_weight = state_dict[gate_name]
+                    up_weight = state_dict[up_name]
+                    full_fc1_weight = torch.cat([gate_weight, up_weight], dim=0).to(dtype=params_dtype)
+                    full_fc2_weight = state_dict[down_name].to(dtype=params_dtype)
+                else:
+                    full_fc1_weight = None
+                    full_fc2_weight = None
+
+                fc1_target = None
+                fc2_target = None
+                if copy_to_this_pp_rank and ep_rank == owner_ep_rank:
+                    fc1_target = _get_moe_expert_param(sync_layer, local_expert_idx, is_fc1=True, expected_shape=fc1_shape)
+                    fc2_target = _get_moe_expert_param(
+                        sync_layer, local_expert_idx, is_fc1=False, expected_shape=fc2_shape
+                    )
+                    assert fc1_target is not None, f"{layer_name} local expert {local_expert_idx} fc1 target not found"
+                    assert fc2_target is not None, f"{layer_name} local expert {local_expert_idx} fc2 target not found"
+
+                _broadcast_moe_expert_tensor(fc1_target, full_fc1_weight, f"{gate_name}+{up_name}", 0, owner_ep_rank)
+                _broadcast_moe_expert_tensor(fc2_target, full_fc2_weight, down_name, 1, owner_ep_rank)
+
+        _stage_log(
+            f"moe_experts_done layer={layer_name} copy_pp={copy_to_this_pp_rank} ep_rank={ep_rank} "
+            f"num_local_experts={num_local_experts}"
+        )
+
+    if is_moe_state_dict or dp_rank == 0:
         # Embeddings
         # -------------------
         print_rank_0("loading embeddings...")
@@ -397,35 +564,37 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
         for layer in range(config.num_hidden_layers):
             layer_name = f"model.layers.{layer}"
             print_rank_0(f"loading layer #{layer}, with layer_name model.layers.{layer}...")
+            _stage_log(f"layer_start layer={layer}")
             dst_pp_rank, dst_virtual_pp_rank, dst_layer_idx = layer_map[layer]
 
             gpt_model_module = _get_gpt_model(models[dst_virtual_pp_rank])
             sync_layer = gpt_model_module.decoder.layers[dst_layer_idx]
+            copy_to_this_pp_rank = dst_pp_rank == pp_rank
 
             _broadcast_tensor(
-                sync_layer.self_attention.linear_qkv.layer_norm_weight if dst_pp_rank == pp_rank else None,
+                sync_layer.self_attention.linear_qkv.layer_norm_weight if copy_to_this_pp_rank else None,
                 f"{layer_name}.input_layernorm.weight",
             )
 
-            if f"{layer_name}.self_attn.q_norm.weight" in state_dict:
+            if f"{layer_name}.self_attn.q_norm.weight" in state_dict_keys:
                 _broadcast_tensor(
-                    sync_layer.self_attention.q_layernorm.weight if dst_pp_rank == pp_rank else None,
+                    sync_layer.self_attention.q_layernorm.weight if copy_to_this_pp_rank else None,
                     f"{layer_name}.self_attn.q_norm.weight",
                 )
                 _broadcast_tensor(
-                    sync_layer.self_attention.k_layernorm.weight if dst_pp_rank == pp_rank else None,
+                    sync_layer.self_attention.k_layernorm.weight if copy_to_this_pp_rank else None,
                     f"{layer_name}.self_attn.k_norm.weight",
                 )
 
             _broadcast_tp_shard_tensor_qkv(
-                sync_layer.self_attention.linear_qkv.weight if dst_pp_rank == pp_rank else None,
+                sync_layer.self_attention.linear_qkv.weight if copy_to_this_pp_rank else None,
                 f"{layer_name}.self_attn.q_proj.weight",
                 f"{layer_name}.self_attn.k_proj.weight",
                 f"{layer_name}.self_attn.v_proj.weight",
             )
-            if f"{layer_name}.self_attn.q_proj.bias" in state_dict:
+            if f"{layer_name}.self_attn.q_proj.bias" in state_dict_keys:
                 _broadcast_tp_shard_tensor_qkv(
-                    sync_layer.self_attention.linear_qkv.bias if dst_pp_rank == pp_rank else None,
+                    sync_layer.self_attention.linear_qkv.bias if copy_to_this_pp_rank else None,
                     f"{layer_name}.self_attn.q_proj.bias",
                     f"{layer_name}.self_attn.k_proj.bias",
                     f"{layer_name}.self_attn.v_proj.bias",
@@ -433,26 +602,44 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 )
 
             _broadcast_tp_shard_tensor(
-                sync_layer.self_attention.linear_proj.weight if dst_pp_rank == pp_rank else None,
+                sync_layer.self_attention.linear_proj.weight if copy_to_this_pp_rank else None,
                 f"{layer_name}.self_attn.o_proj.weight",
                 chunk_dim=1,
             )
-            _broadcast_tensor(
-                sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.post_attention_layernorm.weight",
-            )
 
-            _broadcast_tp_shard_tensor_gate_up(
-                sync_layer.mlp.linear_fc1.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.mlp.gate_proj.weight",
-                f"{layer_name}.mlp.up_proj.weight",
-            )
+            if is_moe_state_dict and f"{layer_name}.mlp.experts.0.gate_proj.weight" in state_dict_keys:
+                _broadcast_tensor(
+                    _get_moe_post_attention_layernorm(sync_layer) if copy_to_this_pp_rank else None,
+                    f"{layer_name}.post_attention_layernorm.weight",
+                )
+                _broadcast_tensor(
+                    sync_layer.mlp.router.weight if copy_to_this_pp_rank else None,
+                    f"{layer_name}.mlp.gate.weight",
+                )
+                if f"{layer_name}.mlp.gate.e_score_correction_bias" in state_dict_keys:
+                    _broadcast_tensor(
+                        getattr(sync_layer.mlp.router, "expert_bias", None) if copy_to_this_pp_rank else None,
+                        f"{layer_name}.mlp.gate.e_score_correction_bias",
+                    )
+                _broadcast_moe_experts(sync_layer, layer_name, copy_to_this_pp_rank)
+            else:
+                _broadcast_tensor(
+                    sync_layer.mlp.linear_fc1.layer_norm_weight if copy_to_this_pp_rank else None,
+                    f"{layer_name}.post_attention_layernorm.weight",
+                )
 
-            _broadcast_tp_shard_tensor(
-                sync_layer.mlp.linear_fc2.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.mlp.down_proj.weight",
-                chunk_dim=1,
-            )
+                _broadcast_tp_shard_tensor_gate_up(
+                    sync_layer.mlp.linear_fc1.weight if copy_to_this_pp_rank else None,
+                    f"{layer_name}.mlp.gate_proj.weight",
+                    f"{layer_name}.mlp.up_proj.weight",
+                )
+
+                _broadcast_tp_shard_tensor(
+                    sync_layer.mlp.linear_fc2.weight if copy_to_this_pp_rank else None,
+                    f"{layer_name}.mlp.down_proj.weight",
+                    chunk_dim=1,
+                )
+            _stage_log(f"layer_done layer={layer}")
         # Final Layernorm
         # -------------------
         print_rank_0("loading final layernorm...")
@@ -483,10 +670,17 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
 
         else:
             _broadcast_tp_shard_tensor(lm_head_weight, "lm_head.weight")
+    _stage_log("before_final_barrier")
     dist.barrier()
+    _stage_log("after_final_barrier")
     # Broadcast weights inside data parallel groups
-    for wrapped_model in wrapped_models:
-        broadcast_params(wrapped_model)
+    if os.environ.get("VERL_MEGATRON_SKIP_FINAL_BROADCAST", "0") == "1":
+        _stage_log("skip_final_data_parallel_broadcast")
+    else:
+        _stage_log("before_final_data_parallel_broadcast")
+        for wrapped_model in wrapped_models:
+            broadcast_params(wrapped_model)
+        _stage_log("after_final_data_parallel_broadcast")
     pass
     get_torch_device().empty_cache()
     print_rank_0(f"loading megatron ckpt done, time elapsed {time.time() - start_time}s")

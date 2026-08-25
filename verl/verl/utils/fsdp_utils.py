@@ -519,6 +519,19 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     return total_norm
 
 
+def get_shard_placement_fn(fsdp_size):
+    """Choose the dimension that can divide fsdp_size to avoid padding."""
+
+    def shard_placement_fn(param):
+        shape = list(param.shape)
+        for i in range(len(shape)):
+            if shape[i] % fsdp_size == 0:
+                return Shard(i)
+        return Shard(0)
+
+    return shard_placement_fn
+
+
 def layered_summon_lora_params(fsdp_module) -> OrderedDict:
     from peft.utils.save_and_load import get_peft_model_state_dict
 
@@ -557,3 +570,74 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
                     submodule._is_root = False
                 get_torch_device().empty_cache()
     return lora_params
+
+
+def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool) -> OrderedDict:
+    from peft.utils.save_and_load import get_peft_model_state_dict
+
+    lora_params = OrderedDict()
+    peft_model = getattr(module, "_fsdp_wrapped_module", module)
+    if fsdp_version(module) > 0:
+        if layered_summon:
+            if not base_sync_done:
+                raise ValueError(
+                    "To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let "
+                    "rollout.load_format=safetensors"
+                )
+            lora_params = layered_summon_lora_params(module)
+        else:
+            with FSDP.summon_full_params(module, writeback=False):
+                if base_sync_done:
+                    lora_params = get_peft_model_state_dict(peft_model)
+                    lora_params = {
+                        name: param.full_tensor().detach().cpu()
+                        if hasattr(param, "full_tensor")
+                        else param.detach().cpu()
+                        for name, param in lora_params.items()
+                    }
+                else:
+                    model = peft_model.base_model.model
+                    orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
+                    model = model.to("cpu")
+                    for name, param in model.state_dict().items():
+                        if any(x in name for x in ["_flat_param", "lora_"]):
+                            continue
+                        name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+                        lora_params[name] = (
+                            param.full_tensor().detach().cpu()
+                            if hasattr(param, "full_tensor")
+                            else param.detach().cpu()
+                        )
+                    model = model.to(orig_dev)
+            get_torch_device().empty_cache()
+    else:
+        if base_sync_done:
+            lora_params = get_peft_model_state_dict(peft_model)
+        else:
+            model = peft_model.base_model.model
+            orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
+            model = model.to("cpu")
+            for name, param in model.state_dict().items():
+                if any(x in name for x in ["_flat_param", "lora_"]):
+                    continue
+                name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+                lora_params[name] = param.detach().cpu()
+            model = model.to(orig_dev)
+    return lora_params
+
+
+def replace_lora_wrapper(k, peft_config):
+    stacked_params = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if k.endswith(".weight"):
+        module_k = k[: -len(".weight")]
+        if check_exclude_modules(peft_config, module_k):
+            return k
+        if any(module_k.endswith(s) for s in stacked_params) or check_target_modules(peft_config, module_k):
+            return f"{module_k}.base_layer.weight"
+    if k.endswith(".bias"):
+        module_k = k[: -len(".bias")]
+        if check_exclude_modules(peft_config, module_k):
+            return k
+        if any(module_k.endswith(s) for s in stacked_params) or check_target_modules(peft_config, module_k):
+            return f"{module_k}.base_layer.bias"
+    return k

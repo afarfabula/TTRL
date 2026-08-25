@@ -1214,6 +1214,307 @@ class RayPPOTrainer:
             **pollution_metrics,
         }
 
+    def _full_rollout_powerflow_guard_flags(self, response_str: str) -> dict:
+        cfg = self.config.ttrl
+        if not bool(cfg.get("full_rollout_powerflow_pollution_guard_enable", True)):
+            return {
+                "repeated_boxed": False,
+                "empty_boxed": False,
+                "assistant_marker": False,
+                "human_marker": False,
+                "document_marker": False,
+                "asy_repeat": False,
+                "ngram_repeat": False,
+                "prompt_copy": False,
+            }
+        max_boxed = int(cfg.get("full_rollout_powerflow_max_boxed_count", 4))
+        prompt_copy_enable = bool(cfg.get("full_rollout_powerflow_prompt_copy", True))
+        prompt_copy_min_count = int(cfg.get("full_rollout_powerflow_prompt_copy_min_count", 2))
+        return {
+            "repeated_boxed": max_boxed >= 0 and response_str.count("\\boxed") > max_boxed,
+            "empty_boxed": bool(cfg.get("full_rollout_powerflow_empty_boxed", True))
+            and bool(re.search(r"\\boxed\s*\{\s*\}", response_str)),
+            "assistant_marker": bool(cfg.get("full_rollout_powerflow_assistant_marker", True))
+            and bool(re.search(r"\b(assistant|user|system)\b\s*[:：]", response_str, re.IGNORECASE)),
+            "human_marker": bool(cfg.get("full_rollout_powerflow_human_marker", True))
+            and bool(re.search(r"\b(human|assistant)\b\s*:", response_str, re.IGNORECASE)),
+            "document_marker": bool(cfg.get("full_rollout_powerflow_document_marker", True))
+            and bool(re.search(r"\\(?:begin|end)\s*\{\s*document\s*\}", response_str, re.IGNORECASE)),
+            "asy_repeat": bool(cfg.get("full_rollout_powerflow_asy_repeat", True))
+            and (response_str.count("[asy]") > 1 or response_str.count("\\text{[asy]}") > 1),
+            "ngram_repeat": bool(cfg.get("full_rollout_powerflow_ngram_repeat", True))
+            and self._chunk_state_has_ngram_repeat(
+                response_str,
+                int(cfg.get("full_rollout_powerflow_ngram_size", 12)),
+                int(cfg.get("full_rollout_powerflow_ngram_max_count", 4)),
+            ),
+            "prompt_copy": prompt_copy_enable
+            and len(re.findall(r"(?:Please provide a step-by-step explanation|Please reason step by step)", response_str)) >= prompt_copy_min_count,
+        }
+
+    def _apply_full_rollout_powerflow_target(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+    ) -> dict:
+        from verl.utils.reward_score.ttrl_math import extract_answer, simplify_expression_string
+
+        cfg = self.config.ttrl
+        n = int(cfg.n_samples_per_prompt)
+        if len(batch) % n != 0:
+            raise ValueError(f"Expected full rollout batch length divisible by n={n}, got {len(batch)}")
+
+        mode = str(cfg.get("full_rollout_powerflow_mode", "posterior_sharpen"))
+        alpha = float(cfg.get("full_rollout_powerflow_alpha", 4.0))
+        beta = float(cfg.get("full_rollout_powerflow_beta", 4.0))
+        slack = float(cfg.get("full_rollout_powerflow_slack", 0.02))
+        margin_tau = max(float(cfg.get("full_rollout_powerflow_margin_tau", 0.25)), 1e-12)
+        soft_prompt_weight_enable = bool(cfg.get("full_rollout_powerflow_soft_prompt_weight_enable", False))
+        prompt_weight_floor = float(cfg.get("full_rollout_powerflow_prompt_weight_floor", 0.2))
+        eps = float(cfg.get("full_rollout_powerflow_eps", 0.0))
+        invalid_weight = float(cfg.get("full_rollout_powerflow_invalid_weight", 0.0))
+        quality_gate_enable = bool(cfg.get("full_rollout_powerflow_quality_gate_enable", False))
+        min_valid_coverage = float(cfg.get("full_rollout_powerflow_min_valid_answer_coverage", 0.0))
+        min_top_mass = float(cfg.get("full_rollout_powerflow_min_top_mass", 0.0))
+        min_margin = float(cfg.get("full_rollout_powerflow_min_margin", 0.0))
+        top_k_answers = max(1, int(cfg.get("full_rollout_powerflow_top_k_answers", 2)))
+        reps_per_answer = max(1, int(cfg.get("full_rollout_powerflow_representatives_per_answer", 2)))
+
+        response_mask = batch.batch["response_mask"].bool()
+        decoded_answers = []
+        clean_mask = []
+        response_lens = []
+        pollution_counts = Counter()
+        for idx in range(len(batch)):
+            response_len = int(response_mask[idx].sum().item())
+            response_lens.append(response_len)
+            response_ids = batch.batch["responses"][idx, :response_len]
+            response_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            pollution_flags = self._full_rollout_powerflow_guard_flags(response_str)
+            is_clean = not any(pollution_flags.values())
+            for key, value in pollution_flags.items():
+                if value:
+                    pollution_counts[key] += 1
+            clean_mask.append(1.0 if is_clean else 0.0)
+            answer = extract_answer(response_str)
+            if answer is not None:
+                answer = simplify_expression_string(answer)
+            decoded_answers.append(answer if answer is not None and is_clean else "None")
+
+        sequence_reward = reward_tensor.sum(dim=-1).detach().float().cpu()
+        weights = torch.zeros(len(batch), dtype=torch.float32)
+        prompt_weights = []
+        valid_coverages = []
+        top_masses = []
+        second_masses = []
+        margins = []
+        entropies = []
+        support_coverages = []
+        oov_ratios = []
+        nonzero_ratios = []
+        representative_ratios = []
+        oracle_mean = []
+
+        for prompt_idx in range(len(batch) // n):
+            start = prompt_idx * n
+            end = start + n
+            prompt_answers = decoded_answers[start:end]
+            valid_indices = [idx for idx, answer in enumerate(prompt_answers) if answer != "None"]
+            counts = Counter(prompt_answers[idx] for idx in valid_indices)
+            valid_count = max(len(valid_indices), 1)
+            mass_map = {answer: count / valid_count for answer, count in counts.items()}
+            ranked_answers = sorted(mass_map.items(), key=lambda item: (-item[1], item[0]))
+            top_mass = float(ranked_answers[0][1]) if ranked_answers else 0.0
+            second_mass = float(ranked_answers[1][1]) if len(ranked_answers) > 1 else 0.0
+            margin = top_mass - second_mass
+            valid_coverage = len(valid_indices) / max(n, 1)
+            entropy = float(-sum(mass * math.log(max(mass, 1e-12)) for mass in mass_map.values()))
+            gate_pass = (
+                (not quality_gate_enable)
+                or (
+                    valid_coverage >= min_valid_coverage
+                    and top_mass >= min_top_mass
+                    and margin >= min_margin
+                )
+            )
+
+            prompt_weight = 1.0
+            if mode == "margin_aware" or soft_prompt_weight_enable:
+                prompt_weight = max(prompt_weight_floor, min(1.0, margin / margin_tau))
+            if not gate_pass:
+                prompt_weight = 0.0
+
+            raw = torch.full((n,), invalid_weight, dtype=torch.float32)
+            if ranked_answers and prompt_weight > 0.0:
+                if mode in {"posterior_sharpen", "margin_aware"}:
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer != "None":
+                            raw[local_idx] = math.exp(alpha * mass_map.get(answer, 0.0))
+                elif mode == "posterior_gain":
+                    baseline = 1.0 / max(len(ranked_answers), 1)
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer != "None":
+                            score = max(mass_map.get(answer, 0.0) - baseline + slack, 0.0)
+                            raw[local_idx] = math.exp(alpha * score)
+                elif mode == "self_consistency_advantage":
+                    prompt_mass_values = [mass_map.get(answer, 0.0) for answer in prompt_answers if answer != "None"]
+                    baseline = float(np.mean(prompt_mass_values)) if prompt_mass_values else 0.0
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer != "None":
+                            raw[local_idx] = math.exp(beta * (mass_map.get(answer, 0.0) - baseline))
+                elif mode == "topk_representative":
+                    selected = set(answer for answer, _ in ranked_answers[:top_k_answers])
+                    for answer, mass in ranked_answers[:top_k_answers]:
+                        candidate_locals = [
+                            local_idx
+                            for local_idx, candidate_answer in enumerate(prompt_answers)
+                            if candidate_answer == answer
+                        ]
+                        candidate_locals = sorted(
+                            candidate_locals,
+                            key=lambda local_idx: (
+                                int(response_lens[start + local_idx]),
+                                local_idx,
+                            ),
+                        )
+                        for local_idx in candidate_locals[:reps_per_answer]:
+                            raw[local_idx] = math.exp(alpha * mass)
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer != "None" and answer not in selected:
+                            raw[local_idx] = invalid_weight
+                elif mode == "top1_answer_cluster":
+                    top_answer, top_mass_for_answer = ranked_answers[0]
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer == top_answer:
+                            raw[local_idx] = math.exp(alpha * top_mass_for_answer)
+                        elif answer != "None":
+                            raw[local_idx] = invalid_weight
+                elif mode == "topk_answer_cluster":
+                    selected_mass = dict(ranked_answers[:top_k_answers])
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer in selected_mass:
+                            raw[local_idx] = math.exp(alpha * selected_mass[answer])
+                        elif answer != "None":
+                            raw[local_idx] = invalid_weight
+                elif mode == "oracle_correctness":
+                    for local_idx, answer in enumerate(prompt_answers):
+                        if answer != "None":
+                            raw[local_idx] = math.exp(alpha * float(sequence_reward[start + local_idx].item()))
+                else:
+                    raise ValueError(f"Unsupported ttrl.full_rollout_powerflow_mode={mode!r}")
+
+            if eps > 0.0 and prompt_weight > 0.0:
+                valid_mask = torch.tensor([answer != "None" for answer in prompt_answers], dtype=torch.bool)
+                if bool(valid_mask.any()):
+                    uniform_valid = valid_mask.float() / valid_mask.float().sum().clamp(min=1.0)
+                    normalized = raw / raw.sum().clamp(min=1e-12)
+                    raw = (1.0 - eps) * normalized + eps * uniform_valid
+
+            raw = raw * prompt_weight
+            raw_sum = raw.sum()
+            if raw_sum > 0:
+                normalized = raw / raw_sum * n
+            else:
+                normalized = raw
+            weights[start:end] = normalized
+
+            nonzero = (normalized > 0.0).float()
+            valid_weighted = [
+                local_idx
+                for local_idx, answer in enumerate(prompt_answers)
+                if answer != "None" and float(normalized[local_idx].item()) > 0.0
+            ]
+            support_coverages.append(len(valid_weighted) / max(len(valid_indices), 1))
+            oov_ratios.append(1.0 - support_coverages[-1])
+            nonzero_ratios.append(float(nonzero.mean().item()))
+            representative_ratios.append(len(valid_weighted) / max(n, 1))
+            prompt_weights.append(prompt_weight)
+            valid_coverages.append(valid_coverage)
+            top_masses.append(top_mass)
+            second_masses.append(second_mass)
+            margins.append(margin)
+            entropies.append(entropy)
+            oracle_mean.append(float(sequence_reward[start:end].mean().item()))
+
+        weight_before_clip = weights.clone()
+        weight_clip = float(cfg.get("full_rollout_powerflow_weight_clip", 4.0))
+        weight_clip_renorm = bool(cfg.get("full_rollout_powerflow_weight_clip_renorm", True))
+        if weight_clip > 0.0 and len(weights) > 0:
+            weights = weights.clamp(max=weight_clip)
+            if weight_clip_renorm:
+                nonzero = weights > 0.0
+                if bool(nonzero.any()):
+                    weights = weights / weights[nonzero].mean().clamp(min=1e-12)
+                    weights = weights.clamp(max=weight_clip)
+
+        response_lengths = response_mask.sum(dim=-1).clamp(min=1)
+        boxed_reward = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        boxed_reward[torch.arange(len(batch), device=boxed_reward.device), response_lengths - 1] = sequence_reward.to(
+            boxed_reward.device
+        )
+        batch.batch["boxed_reward"] = boxed_reward
+        batch.batch["chunk_weights"] = weights.to(batch.batch["responses"].device)
+        batch.batch["powerflow_chunk_weights"] = weights.to(batch.batch["responses"].device)
+
+        metrics = {
+            "full_rollout_target/enabled": 1.0,
+            f"full_rollout_target/mode_{mode}": 1.0,
+            "full_rollout_target/alpha": alpha,
+            "full_rollout_target/beta": beta,
+            "full_rollout_target/slack": slack,
+            "full_rollout_target/eps": eps,
+            "full_rollout_target/support_coverage": float(np.mean(support_coverages)) if support_coverages else 0.0,
+            "full_rollout_target/oov_ratio": float(np.mean(oov_ratios)) if oov_ratios else 0.0,
+            "full_rollout_target/top1_mass": float(np.mean(top_masses)) if top_masses else 0.0,
+            "full_rollout_target/top2_mass": float(np.mean(second_masses)) if second_masses else 0.0,
+            "full_rollout_target/margin": float(np.mean(margins)) if margins else 0.0,
+            "full_rollout_target/target_entropy": (
+                float(
+                    (
+                        -(
+                            (weights.reshape(-1, n) / weights.reshape(-1, n).sum(dim=-1, keepdim=True).clamp(min=1e-12))
+                            * torch.log(
+                                (weights.reshape(-1, n) / weights.reshape(-1, n).sum(dim=-1, keepdim=True).clamp(min=1e-12)).clamp(
+                                    min=1e-12
+                                )
+                            )
+                        ).sum(dim=-1)
+                    )
+                    .mean()
+                    .item()
+                )
+                if len(weights) > 0
+                else 0.0
+            ),
+            "full_rollout_target/valid_answer_coverage": float(np.mean(valid_coverages)) if valid_coverages else 0.0,
+            "full_rollout_target/prompt_weight_mean": float(np.mean(prompt_weights)) if prompt_weights else 0.0,
+            "full_rollout_target/nonzero_ratio": float((weights > 0.0).float().mean().item()) if len(weights) else 0.0,
+            "full_rollout_target/representative_ratio": float(np.mean(representative_ratios)) if representative_ratios else 0.0,
+            "full_rollout_target/weight_mean": float(weights.mean().item()) if len(weights) else 0.0,
+            "full_rollout_target/weight_max": float(weights.max().item()) if len(weights) else 0.0,
+            "full_rollout_target/weight_min": float(weights.min().item()) if len(weights) else 0.0,
+            "full_rollout_target/weight_before_clip_max": float(weight_before_clip.max().item()) if len(weight_before_clip) else 0.0,
+            "full_rollout_target/weight_before_clip_mean": float(weight_before_clip.mean().item()) if len(weight_before_clip) else 0.0,
+            "full_rollout_target/weight_clip": weight_clip,
+            "full_rollout_target/weight_clip_renorm": float(weight_clip_renorm),
+            "full_rollout_target/num_actor_samples": float(len(batch)),
+            "full_rollout_target/observed_reward_mean": float(np.mean(oracle_mean)) if oracle_mean else 0.0,
+            "full_rollout_target/clean_rollout_ratio": float(np.mean(clean_mask)) if clean_mask else 0.0,
+        }
+        total_rollouts = max(len(batch), 1)
+        for key in [
+            "repeated_boxed",
+            "empty_boxed",
+            "assistant_marker",
+            "human_marker",
+            "document_marker",
+            "asy_repeat",
+            "ngram_repeat",
+            "prompt_copy",
+        ]:
+            metrics[f"full_rollout_target/{key}_ratio"] = pollution_counts[key] / total_rollouts
+        return metrics
+
     def _make_chunk_state_prompts(
         self,
         batch: DataProto,
@@ -6222,6 +6523,10 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         powerflow_enabled = self.config.actor_rollout_ref.actor.get("powerflow_enable", False)
+                        full_rollout_powerflow_enabled = (
+                            self.config.get("ttrl", {}).get("enable", False)
+                            and self.config.ttrl.get("full_rollout_powerflow_enable", False)
+                        )
                         if powerflow_enabled:
                             batch.batch["boxed_reward"] = reward_tensor
                             batch.batch["token_level_scores"] = torch.zeros_like(reward_tensor)
@@ -6258,6 +6563,15 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if full_rollout_powerflow_enabled:
+                            if self.config.trainer.get("balance_batch", False):
+                                metrics["full_rollout_target/requires_balance_batch_off"] = 1.0
+                                raise ValueError(
+                                    "full_rollout_powerflow_enable expects contiguous prompt groups; "
+                                    "set trainer.balance_batch=False for these pilots"
+                                )
+                            metrics.update(self._apply_full_rollout_powerflow_target(batch, reward_tensor))
 
                         if not powerflow_enabled:
                             # compute rewards. apply_kl_penalty if available

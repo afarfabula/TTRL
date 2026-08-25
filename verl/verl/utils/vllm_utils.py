@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import inspect
 from typing import List
 
 from msgspec import field
@@ -100,11 +101,14 @@ def patch_vllm_moe_model_weight_loader(model):
     for layer in model.layers:
         mlp_attr = MLP_ATTR_MAPPING.get(type(model), DEFAULT_MLP_ATTR)
         mlp = getattr(layer, mlp_attr)
+        experts_weight_loader = getattr(getattr(mlp, "experts", None), "weight_loader", None)
+        if experts_weight_loader is None:
+            continue
 
         param_dict = dict(mlp.named_parameters())
         for name, param in param_dict.items():
             if "w13_weight" in name or "w2_weight" in name:
-                param.weight_loader = mlp.experts.weight_loader
+                param.weight_loader = experts_weight_loader
 
 
 class TensorLoRARequest(LoRARequest):
@@ -116,7 +120,10 @@ class VLLMHijack:
     @staticmethod
     def hijack():
         try:
-            from vllm.lora.models import LoRAModel
+            try:
+                from vllm.lora.models import LoRAModel
+            except ModuleNotFoundError:
+                from vllm.lora.lora_model import LoRAModel
             from vllm.lora.utils import get_adapter_absolute_path
             from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
         except ModuleNotFoundError as exc:
@@ -140,8 +147,10 @@ class VLLMHijack:
                         expected_lora_modules.extend(packed_modules_mapping[module])
                     else:
                         expected_lora_modules.append(module)
+                    if module == "experts":
+                        expected_lora_modules.append(module)
 
-                expected_lora_modules = list(set(expected_lora_modules))
+                expected_lora_modules = set(expected_lora_modules)
 
                 lora_tensors = None
                 from vllm.lora.peft_helper import PEFTHelper
@@ -167,38 +176,52 @@ class VLLMHijack:
                     hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
                 if isinstance(lora_request, TensorLoRARequest):
+                    lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
+                    lora_tensor_kwargs = {
+                        "lora_model_id": lora_request.lora_int_id,
+                        "tensors": lora_tensors,
+                        "peft_helper": peft_helper,
+                        "device": "cpu",
+                        "dtype": self.lora_config.lora_dtype,
+                        "model_vocab_size": self.vocab_size,
+                        "embeddings": None,
+                        "target_embedding_padding": self.vocab_size + lora_extra_vocab_size,
+                        "embedding_modules": getattr(self, "embedding_modules", {}),
+                        "embedding_padding_modules": getattr(self, "embedding_padding_modules", []),
+                        "weights_mapper": hf_to_vllm_mapper,
+                    }
+                    accepted = inspect.signature(self._lora_model_cls.from_lora_tensors).parameters
                     lora = self._lora_model_cls.from_lora_tensors(
-                        lora_model_id=lora_request.lora_int_id,
-                        tensors=lora_tensors,
-                        peft_helper=peft_helper,
-                        device="cpu",
-                        dtype=self.lora_config.lora_dtype,
-                        embeddings=None,
-                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                        embedding_modules=self.embedding_modules,
-                        embedding_padding_modules=self.embedding_padding_modules,
-                        weights_mapper=hf_to_vllm_mapper,
+                        **{k: v for k, v in lora_tensor_kwargs.items() if k in accepted}
                     )
                 else:
+                    lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
+                    local_checkpoint_kwargs = {
+                        "lora_dir": lora_path,
+                        "expected_lora_modules": expected_lora_modules,
+                        "peft_helper": peft_helper,
+                        "lora_model_id": lora_request.lora_int_id,
+                        "device": "cpu",
+                        "dtype": self.lora_config.lora_dtype,
+                        "model_vocab_size": self.vocab_size,
+                        "target_embedding_padding": self.vocab_size + lora_extra_vocab_size,
+                        "embedding_modules": getattr(self, "embedding_modules", {}),
+                        "embedding_padding_modules": getattr(self, "embedding_padding_modules", []),
+                        "weights_mapper": hf_to_vllm_mapper,
+                    }
+                    accepted = inspect.signature(self._lora_model_cls.from_local_checkpoint).parameters
                     lora = self._lora_model_cls.from_local_checkpoint(
-                        lora_path,
-                        expected_lora_modules,
-                        peft_helper=peft_helper,
-                        lora_model_id=lora_request.lora_int_id,
-                        device="cpu",
-                        dtype=self.lora_config.lora_dtype,
-                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                        embedding_modules=self.embedding_modules,
-                        embedding_padding_modules=self.embedding_padding_modules,
-                        weights_mapper=hf_to_vllm_mapper,
+                        **{k: v for k, v in local_checkpoint_kwargs.items() if k in accepted}
                     )
             except Exception as e:
                 raise e
 
-            if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
+            lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
+            extra_vocab_size = getattr(lora, "extra_vocab_size", 0)
+            if extra_vocab_size > lora_extra_vocab_size:
                 raise ValueError(
-                    f"LoRA added vocab size {lora.extra_vocab_size} is greater than lora_extra_vocab_size "
-                    f"{self.lora_config.lora_extra_vocab_size}."
+                    f"LoRA added vocab size {extra_vocab_size} is greater than lora_extra_vocab_size "
+                    f"{lora_extra_vocab_size}."
                 )
             return lora
 

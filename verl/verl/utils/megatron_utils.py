@@ -40,6 +40,12 @@ from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
 
 
+def _megatron_stage_log(message: str):
+    rank = os.getenv("RANK", "?")
+    local_rank = os.getenv("LOCAL_RANK", "?")
+    print(f"[megatron-utils-stage rank={rank} local_rank={local_rank}] {message}", flush=True)
+
+
 def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
@@ -119,18 +125,26 @@ def get_model(
     # GPU allocation.
     if transformer_config is None or (not transformer_config.use_cpu_initialization):
         for model_module in model:
+            _megatron_stage_log("get_model:to_device:start")
             model_module.to(f"{get_device_name()}:{get_device_id()}")
+            _megatron_stage_log("get_model:to_device:done")
 
     # Fp16 conversion.
     config: TransformerConfig = get_model_config(model[0])
     config.fp8 = None
     tfconfig: TransformerConfig = model[0].config
     if config.fp16 or config.bf16:  # the ModelParallelConfig in GPTModel
+        _megatron_stage_log("get_model:float16_module:start")
         model = [Float16Module(config, model_module) for model_module in model]
+        _megatron_stage_log("get_model:float16_module:done")
 
     if wrap_with_ddp:
         ddp_models = []
         for model_chunk_idx, model_chunk in enumerate(model):
+            _megatron_stage_log(
+                f"get_model:ddp_wrap:start chunk={model_chunk_idx} "
+                f"use_distributed_optimizer={use_distributed_optimizer}"
+            )
             ddp_model = DDP(
                 config=tfconfig,
                 module=model_chunk,
@@ -141,12 +155,18 @@ def get_model(
                     grad_reduce_in_fp32=True,  # [old] accumulate_allreduce_grads_in_fp32=True,
                 ),
             )
+            _megatron_stage_log(f"get_model:ddp_wrap:done chunk={model_chunk_idx}")
             ddp_models.append(ddp_model)
         model = ddp_models
         # # Broadcast params from data parallel src rank to other data parallel ranks.
         # # if args.data_parallel_random_init:
         for model_module in model:
-            model_module.broadcast_params()
+            if os.getenv("VERL_MEGATRON_SKIP_INITIAL_BROADCAST", "0") == "1":
+                _megatron_stage_log("get_model:broadcast_params:skipped")
+            else:
+                _megatron_stage_log("get_model:broadcast_params:start")
+                model_module.broadcast_params()
+                _megatron_stage_log("get_model:broadcast_params:done")
     return model
 
 

@@ -373,7 +373,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
-                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                gradient_checkpointing_kwargs = self.config.model.get("gradient_checkpointing_kwargs", {})
+                gradient_checkpointing_kwargs = {"use_reentrant": False, **gradient_checkpointing_kwargs}
+                actor_module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+                )
             if self._is_lora:
                 print("Applying LoRA to actor module")
                 actor_module.enable_input_require_grads()
@@ -1135,7 +1139,11 @@ class CriticWorker(Worker, DistProfilerExtension):
             critic_module.to(torch_dtype)
 
             if config.model.get("enable_gradient_checkpointing", False):
-                critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                gradient_checkpointing_kwargs = config.model.get("gradient_checkpointing_kwargs", {})
+                gradient_checkpointing_kwargs = {"use_reentrant": False, **gradient_checkpointing_kwargs}
+                critic_module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+                )
 
         if self._is_lora:
             print("Applying LoRA to critic module")

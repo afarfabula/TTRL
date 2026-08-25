@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer import get_megatron_optimizer as get_megatron_optimizer_native
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -26,13 +28,16 @@ def get_megatron_optimizer(
     lr_mult=1.0,
 ):
     # Base optimizer.
-    return get_megatron_optimizer_native(
-        config=config,
-        model_chunks=model,
-        no_weight_decay_cond=no_weight_decay_cond,
-        scale_lr_cond=scale_lr_cond,
-        lr_mult=lr_mult,
-    )
+    kwargs = {
+        "config": config,
+        "model_chunks": model,
+        "no_weight_decay_cond": no_weight_decay_cond,
+        "scale_lr_cond": scale_lr_cond,
+        "lr_mult": lr_mult,
+    }
+    signature = inspect.signature(get_megatron_optimizer_native)
+    kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    return get_megatron_optimizer_native(**kwargs)
 
 
 def get_megatron_optimizer_param_scheduler(

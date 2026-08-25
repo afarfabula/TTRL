@@ -45,10 +45,13 @@ def run_ppo(config) -> None:
 
         # Initialize Ray with a local cluster configuration. `num_cpus` specifies the
         # number of CPU cores Ray can use, obtained from the configuration.
-        ray.init(
-            num_cpus=config.ray_init.num_cpus,
-            include_dashboard=False,
-        )
+        ray_init_kwargs = {
+            "num_cpus": config.ray_init.num_cpus,
+            "include_dashboard": False,
+        }
+        if os.environ.get("RAY_SKIP_ENV_HOOK", "0") == "1":
+            ray_init_kwargs["_skip_env_hook"] = True
+        ray.init(**ray_init_kwargs)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -184,7 +187,7 @@ class TaskRunner:
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

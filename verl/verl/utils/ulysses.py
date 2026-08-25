@@ -269,6 +269,10 @@ def gather_outpus_and_unpad(
     return x
 
 
+def gather_outputs_and_unpad(*args, **kwargs):
+    return gather_outpus_and_unpad(*args, **kwargs)
+
+
 def ulysses_pad(input_ids_rmpad: torch.Tensor, position_ids_rmpad: Optional[torch.Tensor] = None, sp_size: int = 1):
     if position_ids_rmpad is not None:
         assert position_ids_rmpad.size(-2) == 1

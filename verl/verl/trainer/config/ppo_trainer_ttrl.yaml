@@ -24,6 +24,44 @@ ttrl:
   # experiments. This keeps validation unchanged and only affects training.
   powerflow_no_majority: false
 
+  # Full-rollout search-improvement PowerFlow experiments. These modes keep
+  # complete prompt->response rollouts as the training unit and build
+  # sequence-level PowerFlow weights from the answer posterior within each
+  # prompt group. They are independent from chunk-state experiments.
+  full_rollout_powerflow_enable: false
+  # Supported modes: posterior_sharpen, posterior_gain, margin_aware,
+  # self_consistency_advantage, topk_representative, top1_answer_cluster,
+  # topk_answer_cluster, oracle_correctness.
+  full_rollout_powerflow_mode: posterior_sharpen
+  full_rollout_powerflow_alpha: 4.0
+  full_rollout_powerflow_beta: 4.0
+  full_rollout_powerflow_slack: 0.02
+  full_rollout_powerflow_margin_tau: 0.25
+  full_rollout_powerflow_soft_prompt_weight_enable: false
+  full_rollout_powerflow_prompt_weight_floor: 0.2
+  full_rollout_powerflow_eps: 0.0
+  full_rollout_powerflow_weight_clip: 4.0
+  full_rollout_powerflow_weight_clip_renorm: true
+  full_rollout_powerflow_invalid_weight: 0.0
+  full_rollout_powerflow_quality_gate_enable: false
+  full_rollout_powerflow_min_valid_answer_coverage: 0.0
+  full_rollout_powerflow_min_top_mass: 0.0
+  full_rollout_powerflow_min_margin: 0.0
+  full_rollout_powerflow_top_k_answers: 2
+  full_rollout_powerflow_representatives_per_answer: 2
+  full_rollout_powerflow_pollution_guard_enable: true
+  full_rollout_powerflow_max_boxed_count: 4
+  full_rollout_powerflow_empty_boxed: true
+  full_rollout_powerflow_assistant_marker: true
+  full_rollout_powerflow_human_marker: true
+  full_rollout_powerflow_document_marker: true
+  full_rollout_powerflow_asy_repeat: true
+  full_rollout_powerflow_ngram_repeat: true
+  full_rollout_powerflow_ngram_size: 12
+  full_rollout_powerflow_ngram_max_count: 4
+  full_rollout_powerflow_prompt_copy: true
+  full_rollout_powerflow_prompt_copy_min_count: 2
+
   # Experimental GRPO-compatible sharpened answer posterior reward. When
   # enabled, majority voting is still used to keep logging compatible, but the
   # training reward is replaced by a selective sharpened answer distribution.
