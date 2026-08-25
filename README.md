@@ -4,39 +4,56 @@ experiment/ttrl-workspace-history-20260807. The original upstream TTRL README
 is kept below for paper/project context.
 -->
 
-# 本分支 Claims：TTRL / Reasoning Test-Time RL 工程复现与方法探索
+# 本分支 Claims：Qwen2.5-Math TTRL 主闭环与 Qwen3 扩展探索
 
-本分支围绕 TTRL（Test-Time Reinforcement Learning）在数学推理上的复现、扩展和大模型工程化展开。核心目标不是只跑通论文脚本，而是把“无 GT 测试时强化学习 / GRPO / self-consistency reward / reasoning test-time scaling”这条链路拆成可验证的工程 claim：哪些结果可以写进简历，哪些只是负结果或基础设施经验。
+本分支围绕 TTRL（Test-Time Reinforcement Learning）在数学推理上的复现、算法改造和大模型工程化展开。主线不是只跑通论文脚本，而是在 Qwen2.5-Math-7B + MATH-TTT/MATH500 上建立一条可复跑、可诊断、可对照的无 GT Test-Time RL 实验闭环；Qwen3-30B-A3B 相关内容作为后续 MoE 扩展探索单独记录。
 
-## Claim 1：在 8xB200 上复现并稳定化 Qwen2.5-Math-7B 的 TTRL/MATH500 训练链路
+## Claim 1：构建 Qwen2.5-Math-7B / MATH500 无 GT TTRL 实验闭环，并验证 sharpened MV-anchor reward
 
-本分支完成了 MATH-TTT/MATH500 数据、verl 训练、vLLM rollout、reference logprob、actor update 和 validation 的端到端链路整理，并保留了可复跑脚本与日志。
+本分支在 8xB200 上围绕 Qwen2.5-Math-7B 建立了完整 TTRL 实验闭环：MATH-TTT/MATH500 数据、vLLM rollout、majority pseudo-label、reference logprob、GRPO actor update、validation@16、step-time 分解和诊断日志均可追溯。实验不是单次跑通，而是围绕无 GT reward 设计做了持续迭代：paper-style majority-vote baseline、sharpened MV-anchor、full-rollout posterior target、weighted NLL / PowerFlow objective、chunk-level search-state 和 suffix-level counterfactual 都保留了脚本、日志和阶段性结论。
 
-Evidence：
+### 算法设计：sharpened MV-anchor reward
+
+原始 TTRL 依赖同一 prompt 下多条 rollout 的 majority answer 作为 pseudo-label。这个 hard majority reward 稳定，但信息利用率低：非 majority 的候选即使有一定 self-consistency posterior support，也不会贡献训练信号。
+
+本分支实现的 sharpened MV-anchor reward 保持 TTRL/GRPO 主训练路径不变，只替换 reward construction：
+
+- 对每个 prompt 的 `n=32` 条 rollout 抽取答案并做规范化，按答案聚合成 answer posterior。
+- 当存在 `rollout_log_probs` 时，用 response 平均 logprob 作为 confidence，对同一答案的 rollout 做加权聚合。
+- 用 `top_prob >= tau_pos` 和 `margin >= tau_marg` 过滤低置信 prompt，避免把分歧过大的 answer posterior 注入 actor update。
+- 对 accepted posterior 做 alpha sharpening，放大高置信答案和低置信答案之间的差异。
+- `mv_anchor` 模式下，majority-vote 命中的样本保持 reward=1；非 majority 但 posterior 支持的样本只获得 `soft_coef` 量级的小正 reward。
+- 最佳 run 关闭 negative reward，避免过早压制探索 diversity。
+
+这条设计的核心取舍是：用 majority-vote answer 保住 TTRL 的稳定 anchor，同时把 answer posterior 中的软支持作为额外学习信号注入 GRPO。它比纯 hard pseudo-label 更充分利用同组 rollout，也比直接用完整 posterior 替代 majority reward 更保守。
+
+实现位置：
+
+- reward 构造：`verl/verl/trainer/ppo/ttrl_utils.py`
+- 训练接入：`verl/verl/trainer/ppo/ray_trainer.py`
+- 配置项：`verl/verl/trainer/config/ppo_trainer_ttrl.yaml`
+- 最优 run 脚本：`verl/run_records/ttrl_sharpened_grpo_b32_r32_v64_150step_paperstyle_seedfix_mvanchor_soft002_20260731.sh`
+
+### 主结果
 
 | Run | Setting | Step | mean@16 | maj@16 | best@16 |
 | --- | --- | ---: | ---: | ---: | ---: |
 | Paper-style MV baseline | Qwen2.5-Math-7B, B32/R32/V64, val_n=16 | 80 | `0.8240` | `0.852` | `0.889` |
 | Paper-style MV baseline | Qwen2.5-Math-7B, B32/R32/V64, val_n=16 | 150 | `0.8275` | `0.853` | `0.885` |
+| Sharpened MV-anchor soft0.02 | Qwen2.5-Math-7B, B32/R32/V64, val_n=16 | 80 | `0.836` | `0.864` | `0.892` |
 | Sharpened MV-anchor soft0.02 | Qwen2.5-Math-7B, B32/R32/V64, val_n=16 | 140 | `0.844` | `0.864` | `0.888` |
 | Sharpened MV-anchor soft0.02 | Qwen2.5-Math-7B, B32/R32/V64, val_n=16 | 150 | `0.842125` | `0.866578` | `0.881822` |
 
 结论：
 
-- `sharpened mv-anchor soft0.02` 在 mean@16 和 maj@16 上超过当前 MV baseline，step80 相比历史 MV 约 `+0.012 / +0.012 / +0.003`。
-- 最终 step150 达到 `mean@16=0.842125`、`maj@16=0.866578`，是当前 TTRL-native 线中最强的稳定结果之一。
-- 8xB200 训练链路中保留了 validation every 20 steps、rollout old-logprob diff monitor、static batch 语义等 guardrail。
+- `sharpened MV-anchor soft0.02` 在同一 Qwen2.5-Math-7B / MATH500 设置下稳定超过当前 paper-style MV baseline 的 mean@16 和 maj@16。
+- step80 相比 historical MV step80 提升约 `+0.012 mean@16 / +0.012 maj@16 / +0.003 best@16`。
+- step140 mean@16 peak 到 `0.844`，step150 保持 `mean@16=0.842125`、`maj@16=0.866578`，是当前 TTRL-native 线中最强的稳定结果之一。
+- 边界是明确的：没有达到预设 `mean@16 >= 0.85`，且 best@16 后期下降，说明该 reward 更偏向提升 mean/majority consistency，可能牺牲部分探索多样性。
 
-边界：
+### Ablation evidence：full-rollout target 与 actor objective 诊断
 
-- 该 run 没达到预设 `mean@16 >= 0.85` 目标，不能写成突破性 SOTA。
-- `best@16` 后期下降，说明 sharpened reward 在提升 majority/mean 的同时可能压缩了探索多样性。
-
-## Claim 2：full-rollout posterior target + weighted NLL 是有效训练路径，PowerFlow squared-delta 在 full-response 上不稳定
-
-本分支对 full-rollout target 的 actor objective 做了诊断。结果显示，同一类无 GT posterior target 在 weighted NLL 下能稳定传递训练信号，而直接用 full-response PowerFlow squared-delta 会显著拉低验证指标。
-
-Evidence：
+full-rollout 方向用于验证“能否从完整 rollout 的 answer posterior 构造无 GT 训练 target”。实验记录在 `important_experiment_logs/full_rollout_ttrl_12h_progress_20260802.md`，其中每轮都保留了算法假设、配置、结果、target health、性能分解和下一步决策。
 
 | Run | Target | Actor objective | mean@16 | maj@16 | best@16 |
 | --- | --- | --- | ---: | ---: | ---: |
@@ -46,42 +63,51 @@ Evidence：
 | FR-B0-NLL | posterior sharpen, no GT | weighted NLL | `0.68800` | `0.793828` | `0.908718` |
 | FR-B2-NLL | margin-aware posterior, no GT | weighted NLL | `0.692875` | `0.794484` | `0.899186` |
 
-结论：
+诊断结论：
 
 - full-rollout target 构造链路本身可用，oracle-NLL 和无 GT posterior-NLL 能恢复到接近的指标区间。
 - 失败点主要在 full-response PowerFlow squared-delta objective，而不是 reward estimation 或 rollout 数据链路完全不可用。
-- 后续方法应优先围绕 weighted NLL / distribution matching 改 target，而不是继续扩大这版 squared-delta。
+- 后续算法设计应优先围绕 weighted NLL / distribution matching / 更可靠的 target construction，而不是继续扩大这版 full-response squared-delta。
+- Oracle correctness 只用于定位问题，不属于正式无 GT 结果。
 
-边界：
+### Ablation evidence：chunk-level / suffix-level search-state 诊断
 
-- FR-B0-NLL / FR-B2-NLL 仍低于强 MV-anchor TTRL 主线，不能作为最终主结果。
-- Oracle correctness 只用于诊断，不属于正式无 GT 方法。
-
-## Claim 3：chunk-level search-state TTRL 的工程链路已打通，但当前 target 质量不足
-
-本分支实现了 chunk-level search-state 方向，包括 mid-state 构造、candidate generation、support mass / future gain / TV transport / support-anchor 等 scorer，并把 chunk target 接入 actor update。
-
-Evidence：
+chunk-level 和 suffix-level 方向用于探索“能否把完整 rollout 的 future improvement 分解到中间推理状态”。这一方向实现了 mid-state 构造、candidate generation、support mass / future gain / TV transport / support-anchor、suffix-to-EOS counterfactual 等 scorer，并把 chunk target 接入 actor update。
 
 | Direction | Evidence | Result |
 | --- | --- | --- |
 | chunk-state pipeline | `_make_chunk_state_prompts`、boundary/source metadata、diag JSONL、chunk actor batch 写入 `powerflow_flat_weights` | 多轮 3-step smoke 和 20-step pilot 可运行 |
 | support-anchor no-probe | 不依赖 short-probe teacher，score 来自 full rollout support mass | `chunk_state_probe/skipped_for_support_anchor=1.0` |
 | support-anchor 20-step | B32/R32/V64, val_n=16 | `mean@16=0.43725` / `maj@16=0.558596` / `best@16=0.83514` |
-| infra overhead | stable steps 2-19 | chunk score 约 `0.001s`，chunk ref 约 `0.965s`，update_actor 约 `3.057s` |
+| suffix-level v28 | suffix-to-EOS + answer-dedup target | `mean@16=0.529875` / `maj@16=0.667382` / `best@16=0.882996` |
+| infra overhead | stable chunk-state steps | chunk score 约 `0.001s`，chunk ref 约 `0.965s`，update_actor 约 `3.057s` |
 
-结论：
+诊断结论：
 
-- chunk-level TTRL 的基础设施是正结果：状态构造、candidate、scoring、actor batch 和诊断日志都已经可跑。
-- `hardfilter + clip4` 可以稳定权重并降低 actor update 开销。
-- 但当前 support-anchor / local-probe / gate 堆叠没有形成有效的 search-improvement signal，不应扩到 80-step 或包装成最终算法收益。
+- 工程链路是正结果：状态构造、candidate、scoring、actor batch、diag JSONL 和多轮 smoke/pilot 已闭环。
+- 方法效果是负结果：local-probe / support-anchor / suffix-target 目前没有形成足够可靠的 search-improvement signal，不能声称 chunk-level TTRL 已提升 MATH500。
+- 这些负结果仍有价值：它们把下一步问题收敛到 long-horizon target quality、answer duplicate、candidate/anchor selection 和 distribution matching，而不是简单归因于 infra 没跑通。
 
-边界：
+### AI infra 闭环
 
-- 当前 chunk-level 结果是负结果定位：主矛盾是 target 没有表达 full-rollout future distribution improvement，而不是纯工程吞吐。
-- 不应声称“chunk-level TTRL 已提升 MATH500”，只能声称“完成了工程闭环并定位了 target quality 问题”。
+为了让算法比较可解释，本分支把 infra 约束显式写入实验语义：
 
-## Claim 4：Qwen3-30B-A3B MoE 的本地评测和 Expert-Sample 复现完成了可追问的负结果验证
+- 固定 B32/R32/V64、`VAL_N=16`、150-step scheduler 和 validation every 20 steps，避免用不同 scheduler phase 的 20-step run 对比 baseline。
+- 默认关闭 actor dynamic batch，因为代码审计发现其 microbatch scalar loss 按 sample count 缩放，在 response length 不同时可能改变 token-level GRPO loss 权重。
+- 通过 rollout old-logprob diff monitor 验证复用 rollout logprob 的语义安全性，日志中 `training/rollout_probs_diff_*` 保持 `0.000` 时才作为 guardrail。
+- 保留 `timing_s/gen`、`timing_s/reward`、`timing_s/ref`、`timing_s/update_actor`、`timing_s/testing` 和 throughput，用于区分算法退化、target 质量问题和系统瓶颈。
+
+### 已同步证据
+
+- 主实验进展：`important_experiment_logs/full_rollout_ttrl_12h_progress_20260802.md`
+- chunk/suffix 长实验记录：`important_experiment_logs/chunk_level_search_state_ttrl_20260731.md`
+- chunk 24h 审计：`important_experiment_logs/chunk_level_search_state_ttrl_24h_audit_20260801.md`
+- MV baseline infra 语义审计：`important_experiment_logs/mv_b32_r32_v64_infra_semantics_20260731.md`
+- sharpened MV-anchor 最优 run：`important_experiment_logs/sharpened_mvanchor_soft002_seedfix_20260731.md`
+- PowerFlow 对比：`important_experiment_logs/powerflow_80step_trajectory_comparison_20260719.md`
+- 原始日志与可复跑脚本：`important_experiment_logs/`、`verl/run_records/`
+
+## Claim 2：Qwen3-30B-A3B MoE 的本地评测和 Expert-Sample 复现完成了可追问的负结果验证
 
 本分支在本地可用的 `/tmp/Qwen3-30B-A3B-Base` 上完成了 MATH500 和 GPQA-Diamond 的 n=16 评测，并实现了 vLLM router 侧 Expert-Sample 环境变量开关。
 
@@ -106,7 +132,7 @@ Evidence：
 - 论文 headline 使用 `Qwen3-30B-A3B-Instruct`、`GPQA-Diamond pass@32` 和 verifier Best-of-N；本地只有 Base checkpoint，因此不能声称严格复现失败。
 - 该部分应写成“本地可用条件下的复现审计和负结果”，不是论文结论否定。
 
-## Claim 5：Qwen3-30B-A3B TTRL 大模型训练链路完成 smoke，但全参高吞吐训练仍受 sharding/offload 约束
+## Claim 3：Qwen3-30B-A3B TTRL 大模型训练链路完成 smoke，但全参高吞吐训练仍受 sharding/offload 约束
 
 本分支把 Qwen3-30B-A3B MoE 接入 TTRL/verl 训练链路，完成权重、vLLM、rollout、ref logprob 和 actor update 的 2xB200 smoke。
 
@@ -140,9 +166,9 @@ Evidence：
 ```text
 Test-Time RL / GRPO 数学推理后训练：基于 TTRL/verl 构建无 GT 测试时强化学习实验链路，在 8xB200 上复现 Qwen2.5-Math-7B + MATH-TTT/MATH500 的 rollout、majority-vote reward、reference logprob、actor update 和 val@16 评估流程；稳定运行 B32/R32/V64 配置，并通过日志化脚本记录 step time、target health、rollout diff 和验证指标。
 
-设计并验证 sharpened MV-anchor reward：在 150-step pilot 中达到 mean@16=0.8421、maj@16=0.8666，相比 paper-style MV baseline 在 mean/majority 指标上取得稳定增益；同时保留 best@16 下降和未达 0.85 mean@16 目标的边界，形成可复盘的实验结论。
+设计并验证 sharpened MV-anchor reward：基于同 prompt 多 rollout 的 answer posterior 和 rollout logprob confidence 做 selective sharpening，以 majority-vote answer 作为 reward=1 的稳定 anchor，同时给非 majority 但 posterior 支持的答案小权重软奖励；150-step pilot 达到 mean@16=0.8421、maj@16=0.8666，相比 paper-style MV baseline 在 mean/majority 指标上取得稳定增益。
 
-系统排查 full-rollout PowerFlow 与 chunk-level search-state TTRL：通过 oracle target、posterior target、weighted NLL、PowerFlow squared-delta、support-anchor、future-support gain 等 ablation，定位 full-response squared-delta 和 chunk target quality 是主要瓶颈；将失败路径转化为后续 distribution matching / long-horizon target 设计依据。
+系统排查 full-rollout PowerFlow 与 chunk-level / suffix-level search-state TTRL：通过 oracle target、posterior target、weighted NLL、PowerFlow squared-delta、support-anchor、future-support gain、suffix-to-EOS counterfactual 等 ablation，定位 full-response squared-delta 和 search-state target quality 是主要瓶颈；将失败路径转化为后续 distribution matching / long-horizon target 设计依据。
 
 扩展到 Qwen3-30B-A3B MoE：完成 Base checkpoint 的 MATH500/GPQA n=16 评测与 vLLM Expert-Sample router patch，验证本地 Base 模型下 Expert-Sample 未复现 headline gain；同时打通 2xB200 Qwen3-30B-A3B TTRL smoke，定位 FSDP1 optimizer offload 不足与 FSDP2 offload 的可行边界。
 ```
@@ -153,9 +179,10 @@ Test-Time RL / GRPO 数学推理后训练：基于 TTRL/verl 构建无 GT 测试
 Built a TTRL/verl-based test-time RL pipeline for mathematical reasoning,
 covering rollout generation, majority-vote reward construction, reference
 log-prob computation, actor updates, and val@16 evaluation on 8xB200; developed
-a sharpened MV-anchor GRPO variant that reached 84.2% mean@16 and 86.7% maj@16
-on MATH500, while systematically auditing full-rollout PowerFlow, chunk-level
-search-state targets, and Qwen3-30B-A3B MoE scaling failure modes.
+a sharpened MV-anchor GRPO reward that combines majority-vote anchoring with
+answer-posterior soft support, reaching 84.2% mean@16 and 86.7% maj@16 on
+MATH500; preserved scripts/logs for full-rollout PowerFlow, chunk/suffix
+search-state ablations, and Qwen3-30B-A3B MoE scaling audits.
 ```
 
 ## 代码与证据索引
@@ -164,7 +191,10 @@ search-state targets, and Qwen3-30B-A3B MoE scaling failure modes.
 - 中文实验记录：`important_experiment_logs/`
 - Qwen3-30B-A3B 评测 summary：`important_experiment_logs/qwen3_30b_a3b_*_summary.json`
 - B200 环境与稳定运行配置：`important_experiment_logs/B200_ENV_USAGE.md`
+- Qwen2.5-Math MV 语义审计：`important_experiment_logs/mv_b32_r32_v64_infra_semantics_20260731.md`
+- sharpened MV-anchor 最优结果：`important_experiment_logs/sharpened_mvanchor_soft002_seedfix_20260731.md`
 - chunk-level 审计：`important_experiment_logs/chunk_level_search_state_ttrl_24h_audit_20260801.md`
+- chunk/suffix 长实验记录：`important_experiment_logs/chunk_level_search_state_ttrl_20260731.md`
 - full-rollout TTRL 审计：`important_experiment_logs/full_rollout_ttrl_12h_progress_20260802.md`
 
 ---
