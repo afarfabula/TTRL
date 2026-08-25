@@ -161,6 +161,18 @@ Evidence：
 
 ## 简历写法
 
+围绕 Claim 1 的项目文段：
+
+```text
+Qwen2.5-Math-7B Test-Time RL 数学推理优化：基于 TTRL/verl 在 8xB200 上构建 MATH-TTT/MATH500 无 GT 强化学习实验闭环，打通 vLLM rollout、self-consistency majority pseudo-label、reference logprob、GRPO actor update、val@16 评测、step-time/target-health 日志与可复跑 run records。针对原始 TTRL majority-vote reward 信号过硬、非 majority 但高置信候选利用不足的问题，设计 sharpened MV-anchor reward：对同 prompt 的 32 条 rollout 抽取答案并构建 answer posterior，引入 rollout logprob 作为 confidence weight，通过 top-prob/margin gate 过滤低置信 prompt，再做 alpha sharpening；训练时保持 majority answer reward=1 作为稳定 anchor，同时给 posterior 支持的非 majority 答案小权重 soft reward，兼顾 self-consistency 稳定性和软分布学习信号。该方法在 Qwen2.5-Math-7B + MATH500、B32/R32/V64、val_n=16 的 150-step pilot 中达到 mean@16=0.8421、maj@16=0.8666；相较 paper-style MV baseline step80 的 0.8240/0.852/0.889，sharpened MV-anchor step80 达到 0.836/0.864/0.892，mean@16 和 maj@16 均提升约 +1.2pt，并保留 best@16 后期下降、未达 0.85 mean@16 目标等边界分析。围绕该主线进一步完成 full-rollout posterior target、weighted NLL、PowerFlow squared-delta、chunk/suffix search-state target 等 ablation，定位 full-response squared-delta 和 search-state target quality 是主要瓶颈，沉淀为后续 distribution matching / long-horizon target 设计依据。
+```
+
+更短的 Claim 1 bullet：
+
+```text
+基于 TTRL/verl 构建 Qwen2.5-Math-7B 在 MATH500 上的无 GT Test-Time RL 闭环，设计 sharpened MV-anchor reward，将 majority-vote hard pseudo-label 扩展为 majority anchor + answer-posterior soft support；在 8xB200、B32/R32/V64、val_n=16 设置下，150-step pilot 达到 mean@16=0.8421、maj@16=0.8666，step80 相比 paper-style MV baseline 的 mean@16/maj@16 均提升约 +1.2pt，并通过 full-rollout、PowerFlow、weighted NLL、chunk/suffix search-state ablation 定位后续优化瓶颈。
+```
+
 可以直接使用的中文项目经历：
 
 ```text
